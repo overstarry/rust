@@ -1,14 +1,15 @@
 use crate::utils::paths;
 use crate::utils::sugg::DiagnosticBuilderExt;
-use crate::utils::{get_trait_def_id, return_ty, same_tys, span_lint_hir_and_then};
+use crate::utils::{get_trait_def_id, return_ty, span_lint_hir_and_then};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir::HirIdSet;
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
-use rustc_middle::ty::Ty;
+use rustc_middle::ty::{Ty, TyS};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_span::sym;
 
 declare_clippy_lint! {
     /// **What it does:** Checks for types with a `fn new() -> Self` method and no
@@ -33,7 +34,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     ///
-    /// To fix the lint, and a `Default` implementation that delegates to `new`:
+    /// To fix the lint, add a `Default` implementation that delegates to `new`:
     ///
     /// ```ignore
     /// struct Foo(Bar);
@@ -56,9 +57,9 @@ pub struct NewWithoutDefault {
 
 impl_lint_pass!(NewWithoutDefault => [NEW_WITHOUT_DEFAULT]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NewWithoutDefault {
+impl<'tcx> LateLintPass<'tcx> for NewWithoutDefault {
     #[allow(clippy::too_many_lines)]
-    fn check_item(&mut self, cx: &LateContext<'a, 'tcx>, item: &'tcx hir::Item<'_>) {
+    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item<'_>) {
         if let hir::ItemKind::Impl {
             of_trait: None, items, ..
         } = item.kind
@@ -80,20 +81,22 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NewWithoutDefault {
                             // can't be implemented for unsafe new
                             return;
                         }
-                        if impl_item.generics.params.iter().any(|gen| match gen.kind {
-                            hir::GenericParamKind::Type { .. } => true,
-                            _ => false,
-                        }) {
+                        if impl_item
+                            .generics
+                            .params
+                            .iter()
+                            .any(|gen| matches!(gen.kind, hir::GenericParamKind::Type { .. }))
+                        {
                             // when the result of `new()` depends on a type parameter we should not require
                             // an
                             // impl of `Default`
                             return;
                         }
-                        if sig.decl.inputs.is_empty() && name == sym!(new) && cx.access_levels.is_reachable(id) {
+                        if sig.decl.inputs.is_empty() && name == sym::new && cx.access_levels.is_reachable(id) {
                             let self_def_id = cx.tcx.hir().local_def_id(cx.tcx.hir().get_parent_item(id));
                             let self_ty = cx.tcx.type_of(self_def_id);
                             if_chain! {
-                                if same_tys(cx, self_ty, return_ty(cx, id));
+                                if TyS::same_type(self_ty, return_ty(cx, id));
                                 if let Some(default_trait_id) = get_trait_def_id(cx, &paths::DEFAULT_TRAIT);
                                 then {
                                     if self.impling_types.is_none() {
@@ -101,7 +104,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NewWithoutDefault {
                                         cx.tcx.for_each_impl(default_trait_id, |d| {
                                             if let Some(ty_def) = cx.tcx.type_of(d).ty_adt_def() {
                                                 if let Some(local_def_id) = ty_def.did.as_local() {
-                                                    impls.insert(cx.tcx.hir().as_local_hir_id(local_def_id));
+                                                    impls.insert(cx.tcx.hir().local_def_id_to_hir_id(local_def_id));
                                                 }
                                             }
                                         });

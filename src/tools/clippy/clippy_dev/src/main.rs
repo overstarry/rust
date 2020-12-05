@@ -1,7 +1,7 @@
 #![cfg_attr(feature = "deny-warnings", deny(warnings))]
 
 use clap::{App, Arg, SubCommand};
-use clippy_dev::{fmt, new_lint, stderr_length_check, update_lints};
+use clippy_dev::{fmt, new_lint, ra_setup, serve, stderr_length_check, update_lints};
 
 fn main() {
     let matches = App::new("Clippy developer tooling")
@@ -87,6 +87,32 @@ fn main() {
             SubCommand::with_name("limit_stderr_length")
                 .about("Ensures that stderr files do not grow longer than a certain amount of lines."),
         )
+        .subcommand(
+            SubCommand::with_name("ra-setup")
+                .about("Alter dependencies so rust-analyzer can find rustc internals")
+                .arg(
+                    Arg::with_name("rustc-repo-path")
+                        .long("repo-path")
+                        .short("r")
+                        .help("The path to a rustc repo that will be used for setting the dependencies")
+                        .takes_value(true)
+                        .value_name("path")
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            SubCommand::with_name("serve")
+                .about("Launch a local 'ALL the Clippy Lints' website in a browser")
+                .arg(
+                    Arg::with_name("port")
+                        .long("port")
+                        .short("p")
+                        .help("Local port for the http server")
+                        .default_value("8000")
+                        .validator_os(serve::validate_port),
+                )
+                .arg(Arg::with_name("lint").help("Which lint's page to load initially (optional)")),
+        )
         .get_matches();
 
     match matches.subcommand() {
@@ -114,6 +140,12 @@ fn main() {
         },
         ("limit_stderr_length", _) => {
             stderr_length_check::check();
+        },
+        ("ra-setup", Some(matches)) => ra_setup::run(matches.value_of("rustc-repo-path")),
+        ("serve", Some(matches)) => {
+            let port = matches.value_of("port").unwrap().parse().unwrap();
+            let lint = matches.value_of("lint");
+            serve::run(port, lint);
         },
         _ => {},
     }

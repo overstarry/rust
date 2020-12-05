@@ -1,6 +1,6 @@
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
-use rustc_hir::lang_items;
+use rustc_hir::lang_items::LangItem;
 use rustc_middle::ty::{self, Region, RegionVid, TypeFoldable};
 use rustc_trait_selection::traits::auto_trait::{self, AutoTraitResult};
 
@@ -20,13 +20,13 @@ struct RegionDeps<'tcx> {
     smaller: FxHashSet<RegionTarget<'tcx>>,
 }
 
-pub struct AutoTraitFinder<'a, 'tcx> {
-    pub cx: &'a core::DocContext<'tcx>,
-    pub f: auto_trait::AutoTraitFinder<'tcx>,
+crate struct AutoTraitFinder<'a, 'tcx> {
+    crate cx: &'a core::DocContext<'tcx>,
+    crate f: auto_trait::AutoTraitFinder<'tcx>,
 }
 
 impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
-    pub fn new(cx: &'a core::DocContext<'tcx>) -> Self {
+    crate fn new(cx: &'a core::DocContext<'tcx>) -> Self {
         let f = auto_trait::AutoTraitFinder::new(cx.tcx);
 
         AutoTraitFinder { cx, f }
@@ -34,7 +34,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
 
     // FIXME(eddyb) figure out a better way to pass information about
     // parametrization of `ty` than `param_env_def_id`.
-    pub fn get_auto_trait_impls(&self, ty: Ty<'tcx>, param_env_def_id: DefId) -> Vec<Item> {
+    crate fn get_auto_trait_impls(&self, ty: Ty<'tcx>, param_env_def_id: DefId) -> Vec<Item> {
         let param_env = self.cx.tcx.param_env(param_env_def_id);
 
         debug!("get_auto_trait_impls({:?})", ty);
@@ -124,8 +124,9 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                     visibility: Inherited,
                     def_id: self.cx.next_def_id(param_env_def_id.krate),
                     stability: None,
+                    const_stability: None,
                     deprecation: None,
-                    inner: ImplItem(Impl {
+                    kind: ImplItem(Impl {
                         unsafety: hir::Unsafety::Normal,
                         generics: new_generics,
                         provided_trait_methods: Default::default(),
@@ -315,12 +316,13 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
         pred: ty::Predicate<'tcx>,
     ) -> FxHashSet<GenericParamDef> {
-        let regions = match pred.kind() {
-            ty::PredicateKind::Trait(poly_trait_pred, _) => {
-                tcx.collect_referenced_late_bound_regions(&poly_trait_pred)
+        let bound_predicate = pred.bound_atom();
+        let regions = match bound_predicate.skip_binder() {
+            ty::PredicateAtom::Trait(poly_trait_pred, _) => {
+                tcx.collect_referenced_late_bound_regions(&bound_predicate.rebind(poly_trait_pred))
             }
-            ty::PredicateKind::Projection(poly_proj_pred) => {
-                tcx.collect_referenced_late_bound_regions(&poly_proj_pred)
+            ty::PredicateAtom::Projection(poly_proj_pred) => {
+                tcx.collect_referenced_late_bound_regions(&bound_predicate.rebind(poly_proj_pred))
             }
             _ => return FxHashSet::default(),
         };
@@ -430,14 +432,14 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
     }
 
     // Converts the calculated ParamEnv and lifetime information to a clean::Generics, suitable for
-    // display on the docs page. Cleaning the Predicates produces sub-optimal WherePredicate's,
+    // display on the docs page. Cleaning the Predicates produces sub-optimal `WherePredicate`s,
     // so we fix them up:
     //
     // * Multiple bounds for the same type are coalesced into one: e.g., 'T: Copy', 'T: Debug'
     // becomes 'T: Copy + Debug'
     // * Fn bounds are handled specially - instead of leaving it as 'T: Fn(), <T as Fn::Output> =
     // K', we use the dedicated syntax 'T: Fn() -> K'
-    // * We explcitly add a '?Sized' bound if we didn't find any 'Sized' predicates for a type
+    // * We explicitly add a '?Sized' bound if we didn't find any 'Sized' predicates for a type
     fn param_env_to_generics(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -454,19 +456,19 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
 
         // The `Sized` trait must be handled specially, since we only display it when
         // it is *not* required (i.e., '?Sized')
-        let sized_trait = self.cx.tcx.require_lang_item(lang_items::SizedTraitLangItem, None);
+        let sized_trait = self.cx.tcx.require_lang_item(LangItem::Sized, None);
 
         let mut replacer = RegionReplacer { vid_to_region: &vid_to_region, tcx };
 
         let orig_bounds: FxHashSet<_> =
-            self.cx.tcx.param_env(param_env_def_id).caller_bounds.iter().collect();
+            self.cx.tcx.param_env(param_env_def_id).caller_bounds().iter().collect();
         let clean_where_predicates = param_env
-            .caller_bounds
+            .caller_bounds()
             .iter()
             .filter(|p| {
                 !orig_bounds.contains(p)
-                    || match p.kind() {
-                        ty::PredicateKind::Trait(pred, _) => pred.def_id() == sized_trait,
+                    || match p.skip_binders() {
+                        ty::PredicateAtom::Trait(pred, _) => pred.def_id() == sized_trait,
                         _ => false,
                     }
             })
@@ -479,6 +481,11 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
             (tcx.generics_of(param_env_def_id), tcx.explicit_predicates_of(param_env_def_id))
                 .clean(self.cx)
                 .params;
+
+        debug!(
+            "param_env_to_generics({:?}): generic_params={:?}",
+            param_env_def_id, generic_params
+        );
 
         let mut has_sized = FxHashSet::default();
         let mut ty_to_bounds: FxHashMap<_, FxHashSet<_>> = Default::default();
@@ -588,7 +595,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                                         .args;
 
                                     match args {
-                                        // Convert somethiung like '<T as Iterator::Item> = u8'
+                                        // Convert something like '<T as Iterator::Item> = u8'
                                         // to 'T: Iterator<Item=u8>'
                                         GenericArgs::AngleBracketed {
                                             ref mut bindings, ..
@@ -712,7 +719,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
     // since FxHasher has different behavior for 32-bit and 64-bit platforms.
     //
     // Obviously, it's extremely undesirable for documentation rendering
-    // to be depndent on the platform it's run on. Apart from being confusing
+    // to be dependent on the platform it's run on. Apart from being confusing
     // to end users, it makes writing tests much more difficult, as predicates
     // can appear in any order in the final result.
     //
@@ -737,9 +744,9 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
     fn is_fn_ty(&self, tcx: TyCtxt<'_>, ty: &Type) -> bool {
         match &ty {
             &&Type::ResolvedPath { ref did, .. } => {
-                *did == tcx.require_lang_item(lang_items::FnTraitLangItem, None)
-                    || *did == tcx.require_lang_item(lang_items::FnMutTraitLangItem, None)
-                    || *did == tcx.require_lang_item(lang_items::FnOnceTraitLangItem, None)
+                *did == tcx.require_lang_item(LangItem::Fn, None)
+                    || *did == tcx.require_lang_item(LangItem::FnMut, None)
+                    || *did == tcx.require_lang_item(LangItem::FnOnce, None)
             }
             _ => false,
         }

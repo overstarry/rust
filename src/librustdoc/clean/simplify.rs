@@ -12,7 +12,6 @@
 //! bounds by special casing scenarios such as these. Fun!
 
 use std::collections::BTreeMap;
-use std::mem;
 
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty;
@@ -22,7 +21,7 @@ use crate::clean::GenericArgs as PP;
 use crate::clean::WherePredicate as WP;
 use crate::core::DocContext;
 
-pub fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> Vec<WP> {
+crate fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> Vec<WP> {
     // First, partition the where clause into its separate components
     let mut params: BTreeMap<_, Vec<_>> = BTreeMap::new();
     let mut lifetimes = Vec::new();
@@ -75,7 +74,7 @@ pub fn where_clauses(cx: &DocContext<'_>, clauses: Vec<WP>) -> Vec<WP> {
     clauses
 }
 
-pub fn merge_bounds(
+crate fn merge_bounds(
     cx: &clean::DocContext<'_>,
     bounds: &mut Vec<clean::GenericBound>,
     trait_did: DefId,
@@ -118,18 +117,6 @@ pub fn merge_bounds(
     })
 }
 
-pub fn ty_params(mut params: Vec<clean::GenericParamDef>) -> Vec<clean::GenericParamDef> {
-    for param in &mut params {
-        match param.kind {
-            clean::GenericParamDefKind::Type { ref mut bounds, .. } => {
-                *bounds = mem::take(bounds);
-            }
-            _ => panic!("expected only type parameters"),
-        }
-    }
-    params
-}
-
 fn trait_is_same_or_supertrait(cx: &DocContext<'_>, child: DefId, trait_: DefId) -> bool {
     if child == trait_ {
         return true;
@@ -141,12 +128,8 @@ fn trait_is_same_or_supertrait(cx: &DocContext<'_>, child: DefId, trait_: DefId)
         .predicates
         .iter()
         .filter_map(|(pred, _)| {
-            if let ty::PredicateKind::Trait(ref pred, _) = pred.kind() {
-                if pred.skip_binder().trait_ref.self_ty() == self_ty {
-                    Some(pred.def_id())
-                } else {
-                    None
-                }
+            if let ty::PredicateAtom::Trait(pred, _) = pred.skip_binders() {
+                if pred.trait_ref.self_ty() == self_ty { Some(pred.def_id()) } else { None }
             } else {
                 None
             }

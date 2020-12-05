@@ -3,7 +3,9 @@
 //! This lint is **warn** by default
 
 use crate::utils::sugg::Sugg;
-use crate::utils::{higher, parent_node_is_if_expr, snippet_with_applicability, span_lint, span_lint_and_sugg};
+use crate::utils::{
+    higher, is_expn_of, parent_node_is_if_expr, snippet_with_applicability, span_lint, span_lint_and_sugg,
+};
 use if_chain::if_chain;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
@@ -15,8 +17,7 @@ use rustc_span::Span;
 
 declare_clippy_lint! {
     /// **What it does:** Checks for expressions of the form `if c { true } else {
-    /// false }`
-    /// (or vice versa) and suggest using the condition directly.
+    /// false }` (or vice versa) and suggests using the condition directly.
     ///
     /// **Why is this bad?** Redundant code.
     ///
@@ -68,8 +69,8 @@ declare_clippy_lint! {
 
 declare_lint_pass!(NeedlessBool => [NEEDLESS_BOOL]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NeedlessBool {
-    fn check_expr(&mut self, cx: &LateContext<'a, 'tcx>, e: &'tcx Expr<'_>) {
+impl<'tcx> LateLintPass<'tcx> for NeedlessBool {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) {
         use self::Expression::{Bool, RetBool};
         if let Some((ref pred, ref then_block, Some(ref else_expr))) = higher::if_block(&e) {
             let reduce = |ret, not| {
@@ -128,8 +129,8 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NeedlessBool {
 
 declare_lint_pass!(BoolComparison => [BOOL_COMPARISON]);
 
-impl<'a, 'tcx> LateLintPass<'a, 'tcx> for BoolComparison {
-    fn check_expr(&mut self, cx: &LateContext<'a, 'tcx>, e: &'tcx Expr<'_>) {
+impl<'tcx> LateLintPass<'tcx> for BoolComparison {
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) {
         if e.span.from_expansion() {
             return;
         }
@@ -219,7 +220,7 @@ fn one_side_is_unary_not<'tcx>(left_side: &'tcx Expr<'_>, right_side: &'tcx Expr
 }
 
 fn check_comparison<'a, 'tcx>(
-    cx: &LateContext<'a, 'tcx>,
+    cx: &LateContext<'tcx>,
     e: &'tcx Expr<'_>,
     left_true: Option<(impl FnOnce(Sugg<'a>) -> Sugg<'a>, &str)>,
     left_false: Option<(impl FnOnce(Sugg<'a>) -> Sugg<'a>, &str)>,
@@ -230,7 +231,13 @@ fn check_comparison<'a, 'tcx>(
     use self::Expression::{Bool, Other};
 
     if let ExprKind::Binary(op, ref left_side, ref right_side) = e.kind {
-        let (l_ty, r_ty) = (cx.tables.expr_ty(left_side), cx.tables.expr_ty(right_side));
+        let (l_ty, r_ty) = (
+            cx.typeck_results().expr_ty(left_side),
+            cx.typeck_results().expr_ty(right_side),
+        );
+        if is_expn_of(left_side.span, "cfg").is_some() || is_expn_of(right_side.span, "cfg").is_some() {
+            return;
+        }
         if l_ty.is_bool() && r_ty.is_bool() {
             let mut applicability = Applicability::MachineApplicable;
 
@@ -241,7 +248,7 @@ fn check_comparison<'a, 'tcx>(
                         cx,
                         BOOL_COMPARISON,
                         e.span,
-                        "This comparison might be written more concisely",
+                        "this comparison might be written more concisely",
                         "try simplifying it as shown",
                         format!(
                             "{} != {}",
@@ -286,14 +293,21 @@ fn check_comparison<'a, 'tcx>(
 }
 
 fn suggest_bool_comparison<'a, 'tcx>(
-    cx: &LateContext<'a, 'tcx>,
+    cx: &LateContext<'tcx>,
     e: &'tcx Expr<'_>,
     expr: &Expr<'_>,
     mut applicability: Applicability,
     message: &str,
     conv_hint: impl FnOnce(Sugg<'a>) -> Sugg<'a>,
 ) {
-    let hint = Sugg::hir_with_applicability(cx, expr, "..", &mut applicability);
+    let hint = if expr.span.from_expansion() {
+        if applicability != Applicability::Unspecified {
+            applicability = Applicability::MaybeIncorrect;
+        }
+        Sugg::hir_with_macro_callsite(cx, expr, "..")
+    } else {
+        Sugg::hir_with_applicability(cx, expr, "..", &mut applicability)
+    };
     span_lint_and_sugg(
         cx,
         BOOL_COMPARISON,
