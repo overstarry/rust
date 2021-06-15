@@ -142,6 +142,7 @@ mod native;
 mod run;
 mod sanity;
 mod setup;
+mod tarball;
 mod test;
 mod tool;
 mod toolstate;
@@ -443,8 +444,13 @@ impl Build {
 
         build.verbose("finding compilers");
         cc_detect::find(&mut build);
-        build.verbose("running sanity check");
-        sanity::check(&mut build);
+        // When running `setup`, the profile is about to change, so any requirements we have now may
+        // be different on the next invocation. Don't check for them until the next time x.py is
+        // run. This is ok because `setup` never runs any build commands, so it won't fail if commands are missing.
+        if !matches!(build.config.cmd, Subcommand::Setup { .. }) {
+            build.verbose("running sanity check");
+            sanity::check(&mut build);
+        }
 
         // If local-rust is the same major.minor as the current version, then force a
         // local-rebuild
@@ -477,8 +483,8 @@ impl Build {
             job::setup(self);
         }
 
-        if let Subcommand::Format { check } = self.config.cmd {
-            return format::format(self, check);
+        if let Subcommand::Format { check, paths } = &self.config.cmd {
+            return format::format(self, *check, &paths);
         }
 
         if let Subcommand::Clean { all } = self.config.cmd {
@@ -546,7 +552,7 @@ impl Build {
     fn std_features(&self, target: TargetSelection) -> String {
         let mut features = "panic-unwind".to_string();
 
-        match self.config.llvm_libunwind.unwrap_or_default() {
+        match self.config.llvm_libunwind {
             LlvmLibunwind::InTree => features.push_str(" llvm-libunwind"),
             LlvmLibunwind::System => features.push_str(" system-llvm-libunwind"),
             LlvmLibunwind::No => {}
@@ -634,6 +640,10 @@ impl Build {
     /// Output directory for all documentation for a target
     fn doc_out(&self, target: TargetSelection) -> PathBuf {
         self.out.join(&*target.triple).join("doc")
+    }
+
+    fn test_out(&self, target: TargetSelection) -> PathBuf {
+        self.out.join(&*target.triple).join("test")
     }
 
     /// Output directory for all documentation for a target
@@ -913,6 +923,21 @@ impl Build {
         self.config.use_lld && !target.contains("msvc")
     }
 
+    fn lld_flags(&self, target: TargetSelection) -> impl Iterator<Item = String> {
+        let mut options = [None, None];
+
+        if self.config.use_lld {
+            if self.is_fuse_ld_lld(target) {
+                options[0] = Some("-Clink-arg=-fuse-ld=lld".to_string());
+            }
+
+            let threads = if target.contains("windows") { "/threads:1" } else { "--threads=1" };
+            options[1] = Some(format!("-Clink-arg=-Wl,{}", threads));
+        }
+
+        std::array::IntoIter::new(options).flatten()
+    }
+
     /// Returns if this target should statically link the C runtime, if specified
     fn crt_static(&self, target: TargetSelection) -> Option<bool> {
         if target.contains("pc-windows-msvc") {
@@ -1068,10 +1093,6 @@ impl Build {
         self.package_vers(&self.version)
     }
 
-    fn llvm_tools_vers(&self) -> String {
-        self.rust_version()
-    }
-
     fn llvm_link_tools_dynamically(&self, target: TargetSelection) -> bool {
         target.contains("linux-gnu") || target.contains("apple-darwin")
     }
@@ -1086,7 +1107,7 @@ impl Build {
         if let Some(ref s) = self.config.description {
             version.push_str(" (");
             version.push_str(s);
-            version.push_str(")");
+            version.push(')');
         }
         version
     }
@@ -1147,7 +1168,7 @@ impl Build {
                     && (dep != "profiler_builtins"
                         || target
                             .map(|t| self.config.profiler_enabled(t))
-                            .unwrap_or(self.config.any_profiler_enabled()))
+                            .unwrap_or_else(|| self.config.any_profiler_enabled()))
                     && (dep != "rustc_codegen_llvm" || self.config.llvm_enabled())
                 {
                     list.push(*dep);
@@ -1180,27 +1201,6 @@ impl Build {
             paths.push((path, dependency_type));
         }
         paths
-    }
-
-    /// Copies a file from `src` to `dst` and doesn't use links, so
-    /// that the copy can be modified without affecting the original.
-    pub fn really_copy(&self, src: &Path, dst: &Path) {
-        if self.config.dry_run {
-            return;
-        }
-        self.verbose_than(1, &format!("Copy {:?} to {:?}", src, dst));
-        if src == dst {
-            return;
-        }
-        let _ = fs::remove_file(&dst);
-        let metadata = t!(src.symlink_metadata());
-        if let Err(e) = fs::copy(src, dst) {
-            panic!("failed to copy `{}` to `{}`: {}", src.display(), dst.display(), e)
-        }
-        t!(fs::set_permissions(dst, metadata.permissions()));
-        let atime = FileTime::from_last_access_time(&metadata);
-        let mtime = FileTime::from_last_modification_time(&metadata);
-        t!(filetime::set_file_times(dst, atime, mtime));
     }
 
     /// Copies a file from `src` to `dst`
@@ -1386,7 +1386,7 @@ impl Build {
                 eprintln!(
                     "
 Couldn't find required command: ninja
-You should install ninja, or set ninja=false in config.toml
+You should install ninja, or set `ninja=false` in config.toml in the `[llvm]` section.
 "
                 );
                 std::process::exit(1);

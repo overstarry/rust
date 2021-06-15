@@ -32,6 +32,12 @@ pub fn is_dylib(name: &str) -> bool {
     name.ends_with(".dylib") || name.ends_with(".so") || name.ends_with(".dll")
 }
 
+/// Returns `true` if the file name given looks like a debug info file
+pub fn is_debug_info(name: &str) -> bool {
+    // FIXME: consider split debug info on other platforms (e.g., Linux, macOS)
+    name.ends_with(".pdb")
+}
+
 /// Returns the corresponding relative library directory that the compiler's
 /// dylibs will be found in.
 pub fn libdir(target: TargetSelection) -> &'static str {
@@ -39,6 +45,7 @@ pub fn libdir(target: TargetSelection) -> &'static str {
 }
 
 /// Adds a list of lookup paths to `cmd`'s dynamic library lookup path.
+/// If The dylib_path_par is already set for this cmd, the old value will be overwritten!
 pub fn add_dylib_path(path: Vec<PathBuf>, cmd: &mut Command) {
     let mut list = dylib_path();
     for path in path {
@@ -300,5 +307,6 @@ pub fn use_host_linker(target: TargetSelection) -> bool {
         || target.contains("wasm32")
         || target.contains("nvptx")
         || target.contains("fortanix")
-        || target.contains("fuchsia"))
+        || target.contains("fuchsia")
+        || target.contains("bpf"))
 }

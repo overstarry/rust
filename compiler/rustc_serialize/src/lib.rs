@@ -13,7 +13,10 @@ Core encoding and decoding interfaces.
 #![feature(never_type)]
 #![feature(nll)]
 #![feature(associated_type_bounds)]
-#![feature(min_const_generics)]
+#![feature(min_specialization)]
+#![feature(core_intrinsics)]
+#![feature(maybe_uninit_slice)]
+#![feature(new_uninit)]
 #![cfg_attr(test, feature(test))]
 #![allow(rustc::internal)]
 

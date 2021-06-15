@@ -44,7 +44,7 @@ where
 {
     infcx: &'me InferCtxt<'me, 'tcx>,
 
-    /// Callback to use when we deduce an outlives relationship
+    /// Callback to use when we deduce an outlives relationship.
     delegate: D,
 
     /// How are we relating `a` and `b`?
@@ -54,6 +54,8 @@ where
     /// - Invariant means `a == b.
     /// - Bivariant means that it doesn't matter.
     ambient_variance: ty::Variance,
+
+    ambient_variance_info: ty::VarianceDiagInfo<'tcx>,
 
     /// When we pass through a set of binders (e.g., when looking into
     /// a `fn` type), we push a new bound region scope onto here. This
@@ -72,11 +74,18 @@ where
 }
 
 pub trait TypeRelatingDelegate<'tcx> {
+    fn param_env(&self) -> ty::ParamEnv<'tcx>;
+
     /// Push a constraint `sup: sub` -- this constraint must be
     /// satisfied for the two types to be related. `sub` and `sup` may
     /// be regions from the type or new variables created through the
     /// delegate.
-    fn push_outlives(&mut self, sup: ty::Region<'tcx>, sub: ty::Region<'tcx>);
+    fn push_outlives(
+        &mut self,
+        sup: ty::Region<'tcx>,
+        sub: ty::Region<'tcx>,
+        info: ty::VarianceDiagInfo<'tcx>,
+    );
 
     fn const_equate(&mut self, a: &'tcx ty::Const<'tcx>, b: &'tcx ty::Const<'tcx>);
 
@@ -136,7 +145,14 @@ where
         delegate: D,
         ambient_variance: ty::Variance,
     ) -> Self {
-        Self { infcx, delegate, ambient_variance, a_scopes: vec![], b_scopes: vec![] }
+        Self {
+            infcx,
+            delegate,
+            ambient_variance,
+            ambient_variance_info: ty::VarianceDiagInfo::default(),
+            a_scopes: vec![],
+            b_scopes: vec![],
+        }
     }
 
     fn ambient_covariance(&self) -> bool {
@@ -155,7 +171,7 @@ where
 
     fn create_scope(
         &mut self,
-        value: ty::Binder<impl Relate<'tcx>>,
+        value: ty::Binder<'tcx, impl Relate<'tcx>>,
         universally_quantified: UniversallyQuantified,
     ) -> BoundRegionScope<'tcx> {
         let mut scope = BoundRegionScope::default();
@@ -176,7 +192,7 @@ where
                         universe
                     });
 
-                    let placeholder = ty::PlaceholderRegion { universe, name: br };
+                    let placeholder = ty::PlaceholderRegion { universe, name: br.kind };
                     delegate.next_placeholder_region(placeholder)
                 } else {
                     delegate.next_existential_region_var(true)
@@ -237,10 +253,15 @@ where
 
     /// Push a new outlives requirement into our output set of
     /// constraints.
-    fn push_outlives(&mut self, sup: ty::Region<'tcx>, sub: ty::Region<'tcx>) {
+    fn push_outlives(
+        &mut self,
+        sup: ty::Region<'tcx>,
+        sub: ty::Region<'tcx>,
+        info: ty::VarianceDiagInfo<'tcx>,
+    ) {
         debug!("push_outlives({:?}: {:?})", sup, sub);
 
-        self.delegate.push_outlives(sup, sub);
+        self.delegate.push_outlives(sup, sub, info);
     }
 
     /// Relate a projection type and some value type lazily. This will always
@@ -277,7 +298,7 @@ where
     /// Relate a type inference variable with a value type. This works
     /// by creating a "generalization" G of the value where all the
     /// lifetimes are replaced with fresh inference values. This
-    /// genearlization G becomes the value of the inference variable,
+    /// generalization G becomes the value of the inference variable,
     /// and is then related in turn to the value. So e.g. if you had
     /// `vid = ?0` and `value = &'a u32`, we might first instantiate
     /// `?0` to a type like `&'0 u32` where `'0` is a fresh variable,
@@ -473,9 +494,8 @@ where
         self.infcx.tcx
     }
 
-    // FIXME(oli-obk): not sure how to get the correct ParamEnv
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
-        ty::ParamEnv::empty()
+        self.delegate.param_env()
     }
 
     fn tag(&self) -> &'static str {
@@ -489,6 +509,7 @@ where
     fn relate_with_variance<T: Relate<'tcx>>(
         &mut self,
         variance: ty::Variance,
+        info: ty::VarianceDiagInfo<'tcx>,
         a: T,
         b: T,
     ) -> RelateResult<'tcx, T> {
@@ -496,6 +517,7 @@ where
 
         let old_ambient_variance = self.ambient_variance;
         self.ambient_variance = self.ambient_variance.xform(variance);
+        self.ambient_variance_info = self.ambient_variance_info.clone().xform(info);
 
         debug!("relate_with_variance: ambient_variance = {:?}", self.ambient_variance);
 
@@ -573,12 +595,12 @@ where
 
         if self.ambient_covariance() {
             // Covariance: a <= b. Hence, `b: a`.
-            self.push_outlives(v_b, v_a);
+            self.push_outlives(v_b, v_a, self.ambient_variance_info.clone());
         }
 
         if self.ambient_contravariance() {
             // Contravariant: b <= a. Hence, `a: b`.
-            self.push_outlives(v_a, v_b);
+            self.push_outlives(v_a, v_b, self.ambient_variance_info.clone());
         }
 
         Ok(a)
@@ -607,9 +629,9 @@ where
 
     fn binders<T>(
         &mut self,
-        a: ty::Binder<T>,
-        b: ty::Binder<T>,
-    ) -> RelateResult<'tcx, ty::Binder<T>>
+        a: ty::Binder<'tcx, T>,
+        b: ty::Binder<'tcx, T>,
+    ) -> RelateResult<'tcx, ty::Binder<'tcx, T>>
     where
         T: Relate<'tcx>,
     {
@@ -743,7 +765,7 @@ struct ScopeInstantiator<'me, 'tcx> {
 impl<'me, 'tcx> TypeVisitor<'tcx> for ScopeInstantiator<'me, 'tcx> {
     fn visit_binder<T: TypeFoldable<'tcx>>(
         &mut self,
-        t: &ty::Binder<T>,
+        t: &ty::Binder<'tcx, T>,
     ) -> ControlFlow<Self::BreakTy> {
         self.target_index.shift_in(1);
         t.super_visit_with(self);
@@ -767,7 +789,7 @@ impl<'me, 'tcx> TypeVisitor<'tcx> for ScopeInstantiator<'me, 'tcx> {
     }
 }
 
-/// The "type generalize" is used when handling inference variables.
+/// The "type generalizer" is used when handling inference variables.
 ///
 /// The basic strategy for handling a constraint like `?A <: B` is to
 /// apply a "generalization strategy" to the type `B` -- this replaces
@@ -819,9 +841,8 @@ where
         self.infcx.tcx
     }
 
-    // FIXME(oli-obk): not sure how to get the correct ParamEnv
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
-        ty::ParamEnv::empty()
+        self.delegate.param_env()
     }
 
     fn tag(&self) -> &'static str {
@@ -835,6 +856,7 @@ where
     fn relate_with_variance<T: Relate<'tcx>>(
         &mut self,
         variance: ty::Variance,
+        _info: ty::VarianceDiagInfo<'tcx>,
         a: T,
         b: T,
     ) -> RelateResult<'tcx, T> {
@@ -997,9 +1019,9 @@ where
 
     fn binders<T>(
         &mut self,
-        a: ty::Binder<T>,
-        _: ty::Binder<T>,
-    ) -> RelateResult<'tcx, ty::Binder<T>>
+        a: ty::Binder<'tcx, T>,
+        _: ty::Binder<'tcx, T>,
+    ) -> RelateResult<'tcx, ty::Binder<'tcx, T>>
     where
         T: Relate<'tcx>,
     {
@@ -1008,6 +1030,6 @@ where
         self.first_free_index.shift_in(1);
         let result = self.relate(a.skip_binder(), a.skip_binder())?;
         self.first_free_index.shift_out(1);
-        Ok(ty::Binder::bind(result))
+        Ok(a.rebind(result))
     }
 }

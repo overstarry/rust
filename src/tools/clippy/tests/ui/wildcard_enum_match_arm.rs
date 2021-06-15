@@ -7,7 +7,8 @@
     dead_code,
     clippy::single_match,
     clippy::wildcard_in_or_patterns,
-    clippy::unnested_or_patterns, clippy::diverging_sub_expression
+    clippy::unnested_or_patterns,
+    clippy::diverging_sub_expression
 )]
 
 use std::io::ErrorKind;
@@ -97,6 +98,8 @@ fn main() {
         ErrorKind::Interrupted => {},
         ErrorKind::Other => {},
         ErrorKind::UnexpectedEof => {},
+        ErrorKind::Unsupported => {},
+        ErrorKind::OutOfMemory => {},
         _ => {},
     }
 }

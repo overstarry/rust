@@ -3,7 +3,7 @@
 use rustc_errors::{Applicability, DiagnosticBuilder};
 use rustc_infer::infer::{
     error_reporting::nice_region_error::NiceRegionError,
-    error_reporting::unexpected_hidden_region_diagnostic, NLLRegionVariableOrigin,
+    error_reporting::unexpected_hidden_region_diagnostic, NllRegionVariableOrigin,
 };
 use rustc_middle::mir::{ConstraintCategory, ReturnConstraint};
 use rustc_middle::ty::subst::Subst;
@@ -13,6 +13,7 @@ use rustc_span::Span;
 
 use crate::util::borrowck_errors;
 
+use crate::borrow_check::region_infer::BlameConstraint;
 use crate::borrow_check::{
     nll::ConstraintDescription,
     region_infer::{values::RegionElement, TypeTest},
@@ -75,13 +76,13 @@ crate enum RegionErrorKind<'tcx> {
         /// The region element that erroneously must be outlived by `longer_fr`.
         error_element: RegionElement,
         /// The origin of the placeholder region.
-        fr_origin: NLLRegionVariableOrigin,
+        fr_origin: NllRegionVariableOrigin,
     },
 
     /// Any other lifetime error.
     RegionError {
         /// The origin of the region.
-        fr_origin: NLLRegionVariableOrigin,
+        fr_origin: NllRegionVariableOrigin,
         /// The region that should outlive `shorter_fr`.
         longer_fr: RegionVid,
         /// The region that should be shorter, but we can't prove it.
@@ -138,7 +139,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
     /// Returns `true` if a closure is inferred to be an `FnMut` closure.
     fn is_closure_fn_mut(&self, fr: RegionVid) -> bool {
         if let Some(ty::ReFree(free_region)) = self.to_error_region(fr) {
-            if let ty::BoundRegion::BrEnv = free_region.bound_region {
+            if let ty::BoundRegionKind::BrEnv = free_region.bound_region {
                 if let DefiningTy::Closure(_, substs) =
                     self.regioncx.universal_regions().defining_ty
                 {
@@ -269,18 +270,18 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
     pub(in crate::borrow_check) fn report_region_error(
         &mut self,
         fr: RegionVid,
-        fr_origin: NLLRegionVariableOrigin,
+        fr_origin: NllRegionVariableOrigin,
         outlived_fr: RegionVid,
         outlives_suggestion: &mut OutlivesSuggestionBuilder,
     ) {
         debug!("report_region_error(fr={:?}, outlived_fr={:?})", fr, outlived_fr);
 
-        let (category, _, span) =
+        let BlameConstraint { category, span, variance_info, from_closure: _ } =
             self.regioncx.best_blame_constraint(&self.body, fr, fr_origin, |r| {
                 self.regioncx.provides_universal_region(r, fr, outlived_fr)
             });
 
-        debug!("report_region_error: category={:?} {:?}", category, span);
+        debug!("report_region_error: category={:?} {:?} {:?}", category, span, variance_info);
         // Check if we can use one of the "nice region errors".
         if let (Some(f), Some(o)) = (self.to_error_region(fr), self.to_error_region(outlived_fr)) {
             let nice = NiceRegionError::new_from_span(self.infcx, span, o, f);
@@ -309,7 +310,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
             span,
         };
 
-        let diag = match (category, fr_is_local, outlived_fr_is_local) {
+        let mut diag = match (category, fr_is_local, outlived_fr_is_local) {
             (ConstraintCategory::Return(kind), true, false) if self.is_closure_fn_mut(fr) => {
                 self.report_fnmut_error(&errci, kind)
             }
@@ -331,6 +332,19 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                 db
             }
         };
+
+        match variance_info {
+            ty::VarianceDiagInfo::None => {}
+            ty::VarianceDiagInfo::Mut { kind, ty } => {
+                let kind_name = match kind {
+                    ty::VarianceDiagMutKind::Ref => "reference",
+                    ty::VarianceDiagMutKind::RawPtr => "pointer",
+                };
+                diag.note(&format!("requirement occurs because of a mutable {kind_name} to {ty}",));
+                diag.note(&format!("mutable {kind_name}s are invariant over their type parameter"));
+                diag.help("see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance");
+            }
+        }
 
         diag.buffer(&mut self.errors_buffer);
     }
@@ -385,6 +399,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
 
         diag.span_label(*span, message);
 
+        // FIXME(project-rfc-2229#48): This should store a captured_place not a hir id
         if let ReturnConstraint::ClosureUpvar(upvar) = kind {
             let def_id = match self.regioncx.universal_regions().defining_ty {
                 DefiningTy::Closure(def_id, _) => def_id,
@@ -590,8 +605,8 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
 
                     let mut found = false;
                     for (bound, _) in bounds {
-                        if let ty::PredicateAtom::TypeOutlives(ty::OutlivesPredicate(_, r)) =
-                            bound.skip_binders()
+                        if let ty::PredicateKind::TypeOutlives(ty::OutlivesPredicate(_, r)) =
+                            bound.kind().skip_binder()
                         {
                             let r = r.subst(self.infcx.tcx, substs);
                             if let ty::RegionKind::ReStatic = r {

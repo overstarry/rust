@@ -82,12 +82,12 @@ that contains only loops and breakable blocks. It tracks where a `break`,
 */
 
 use crate::build::{BlockAnd, BlockAndExtension, BlockFrame, Builder, CFG};
-use crate::thir::{Expr, ExprRef, LintLevel};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir as hir;
 use rustc_index::vec::IndexVec;
 use rustc_middle::middle::region;
 use rustc_middle::mir::*;
+use rustc_middle::thir::{Expr, LintLevel};
+
 use rustc_span::{Span, DUMMY_SP};
 
 #[derive(Debug)]
@@ -459,7 +459,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let breakable_scope = self.scopes.breakable_scopes.pop().unwrap();
         assert!(breakable_scope.region_scope == region_scope);
         let break_block = self.build_exit_tree(breakable_scope.break_drops, None);
-        if let Some(drops) = breakable_scope.continue_drops { self.build_exit_tree(drops, loop_block); }
+        if let Some(drops) = breakable_scope.continue_drops {
+            self.build_exit_tree(drops, loop_block);
+        }
         match (normal_exit_block, break_block) {
             (Some(block), None) | (None, Some(block)) => block,
             (None, None) => self.cfg.start_new_block().unit(),
@@ -515,7 +517,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     {
         debug!("in_scope(region_scope={:?})", region_scope);
         let source_scope = self.source_scope;
-        let tcx = self.hir.tcx();
+        let tcx = self.tcx;
         if let LintLevel::Explicit(current_hir_id) = lint_level {
             // Use `maybe_lint_level_root_bounded` with `root_lint_level` as a bound
             // to avoid adding Hir dependences on our parents.
@@ -523,10 +525,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 
             let parent_root = tcx.maybe_lint_level_root_bounded(
                 self.source_scopes[source_scope].local_data.as_ref().assert_crate_local().lint_root,
-                self.hir.root_lint_level,
+                self.hir_id,
             );
-            let current_root =
-                tcx.maybe_lint_level_root_bounded(current_hir_id, self.hir.root_lint_level);
+            let current_root = tcx.maybe_lint_level_root_bounded(current_hir_id, self.hir_id);
 
             if parent_root != current_root {
                 self.source_scope = self.new_source_scope(
@@ -574,7 +575,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     crate fn break_scope(
         &mut self,
         mut block: BasicBlock,
-        value: Option<ExprRef<'tcx>>,
+        value: Option<&Expr<'tcx>>,
         target: BreakableTarget,
         source_info: SourceInfo,
     ) -> BlockAnd<()> {
@@ -611,13 +612,20 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             if let Some(value) = value {
                 debug!("stmt_expr Break val block_context.push(SubExpr)");
                 self.block_context.push(BlockFrame::SubExpr);
-                unpack!(block = self.into(destination, block, value));
+                unpack!(block = self.expr_into_dest(destination, block, value));
                 self.block_context.pop();
             } else {
-                self.cfg.push_assign_unit(block, source_info, destination, self.hir.tcx())
+                self.cfg.push_assign_unit(block, source_info, destination, self.tcx)
             }
         } else {
             assert!(value.is_none(), "`return` and `break` should have a destination");
+            if self.tcx.sess.instrument_coverage() {
+                // Unlike `break` and `return`, which push an `Assign` statement to MIR, from which
+                // a Coverage code region can be generated, `continue` needs no `Assign`; but
+                // without one, the `InstrumentCoverage` MIR pass cannot generate a code region for
+                // `continue`. Coverage will be missing unless we add a dummy `Assign` to MIR.
+                self.add_dummy_assignment(&span, block, source_info);
+            }
         }
 
         let region_scope = self.scopes.breakable_scopes[break_index].region_scope;
@@ -641,6 +649,14 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.cfg.terminate(block, source_info, TerminatorKind::Resume);
 
         self.cfg.start_new_block().unit()
+    }
+
+    // Add a dummy `Assign` statement to the CFG, with the span for the source code's `continue`
+    // statement.
+    fn add_dummy_assignment(&mut self, span: &Span, block: BasicBlock, source_info: SourceInfo) {
+        let local_decl = LocalDecl::new(self.tcx.mk_unit(), *span).internal();
+        let temp_place = Place::from(self.local_decls.push(local_decl));
+        self.cfg.push_assign_unit(block, source_info, temp_place, self.tcx);
     }
 
     crate fn exit_top_scope(
@@ -733,18 +749,8 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// We would allocate the box but then free it on the unwinding
     /// path; we would also emit a free on the 'success' path from
     /// panic, but that will turn out to be removed as dead-code.
-    ///
-    /// When building statics/constants, returns `None` since
-    /// intermediate values do not have to be dropped in that case.
-    crate fn local_scope(&self) -> Option<region::Scope> {
-        match self.hir.body_owner_kind {
-            hir::BodyOwnerKind::Const | hir::BodyOwnerKind::Static(_) =>
-            // No need to free storage in this context.
-            {
-                None
-            }
-            hir::BodyOwnerKind::Closure | hir::BodyOwnerKind::Fn => Some(self.scopes.topmost()),
-        }
+    crate fn local_scope(&self) -> region::Scope {
+        self.scopes.topmost()
     }
 
     // Scheduling drops
@@ -772,7 +778,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) {
         let needs_drop = match drop_kind {
             DropKind::Value => {
-                if !self.hir.needs_drop(self.local_decls[local].ty) {
+                if !self.local_decls[local].ty.needs_drop(self.tcx, self.param_env) {
                     return;
                 }
                 true
@@ -843,10 +849,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
 
             if scope.region_scope == region_scope {
-                let region_scope_span =
-                    region_scope.span(self.hir.tcx(), &self.hir.region_scope_tree);
+                let region_scope_span = region_scope.span(self.tcx, &self.region_scope_tree);
                 // Attribute scope exit drops to scope's closing brace.
-                let scope_end = self.hir.tcx().sess.source_map().end_point(region_scope_span);
+                let scope_end = self.tcx.sess.source_map().end_point(region_scope_span);
 
                 scope.drops.push(DropData {
                     source_info: SourceInfo { span: scope_end, scope: scope.source_scope },
@@ -898,19 +903,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// not the `DROP(_X)` itself, but the (spurious) unwind pathways
     /// that it creates. See #64391 for an example.
     crate fn record_operands_moved(&mut self, operands: &[Operand<'tcx>]) {
-        let scope = match self.local_scope() {
-            None => {
-                // if there is no local scope, operands won't be dropped anyway
-                return;
-            }
+        let local_scope = self.local_scope();
+        let scope = self.scopes.scopes.last_mut().unwrap();
 
-            Some(local_scope) => self
-                .scopes
-                .scopes
-                .iter_mut()
-                .rfind(|scope| scope.region_scope == local_scope)
-                .unwrap_or_else(|| bug!("scope {:?} not found in scope list!", local_scope)),
-        };
+        assert_eq!(scope.region_scope, local_scope, "local scope is not the topmost scope!",);
 
         // look for moves of a local variable, like `MOVE(_X)`
         let locals_moved = operands.iter().flat_map(|operand| match operand {
@@ -938,21 +934,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     crate fn test_bool(
         &mut self,
         mut block: BasicBlock,
-        condition: Expr<'tcx>,
+        condition: &Expr<'tcx>,
         source_info: SourceInfo,
     ) -> (BasicBlock, BasicBlock) {
         let cond = unpack!(block = self.as_local_operand(block, condition));
         let true_block = self.cfg.start_new_block();
         let false_block = self.cfg.start_new_block();
-        let term = TerminatorKind::if_(self.hir.tcx(), cond.clone(), true_block, false_block);
+        let term = TerminatorKind::if_(self.tcx, cond.clone(), true_block, false_block);
         self.cfg.terminate(block, source_info, term);
 
         match cond {
             // Don't try to drop a constant
             Operand::Constant(_) => (),
-            // If constants and statics, we don't generate StorageLive for this
-            // temporary, so don't try to generate StorageDead for it either.
-            _ if self.local_scope().is_none() => (),
             Operand::Copy(place) | Operand::Move(place) => {
                 if let Some(cond_temp) = place.as_local() {
                     // Manually drop the condition on both branches.
@@ -1026,9 +1019,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             matches!(
                 self.cfg.block_data(start).terminator().kind,
                 TerminatorKind::Assert { .. }
-                | TerminatorKind::Call {..}
-                | TerminatorKind::DropAndReplace { .. }
-                | TerminatorKind::FalseUnwind { .. }
+                    | TerminatorKind::Call { .. }
+                    | TerminatorKind::DropAndReplace { .. }
+                    | TerminatorKind::FalseUnwind { .. }
             ),
             "diverge_from called on block with terminator that cannot unwind."
         );
@@ -1387,7 +1380,7 @@ impl<'tcx> DropTreeBuilder<'tcx> for Unwind {
             | TerminatorKind::Yield { .. }
             | TerminatorKind::GeneratorDrop
             | TerminatorKind::FalseEdge { .. }
-            | TerminatorKind::InlineAsm {.. } => {
+            | TerminatorKind::InlineAsm { .. } => {
                 span_bug!(term.source_info.span, "cannot unwind from {:?}", term.kind)
             }
         }

@@ -1,6 +1,13 @@
+/// This struct fakes the `Lint` declaration that is usually created by `declare_lint!`. This
+/// enables the simple extraction of the metadata without changing the current deprecation
+/// declaration.
+pub struct ClippyDeprecatedLint;
+
 macro_rules! declare_deprecated_lint {
-    (pub $name: ident, $_reason: expr) => {
-        declare_lint!(pub $name, Allow, "deprecated lint")
+    { $(#[$attr:meta])* pub $name: ident, $_reason: expr} => {
+        $(#[$attr])*
+        #[allow(dead_code)]
+        pub static $name: ClippyDeprecatedLint = ClippyDeprecatedLint {};
     }
 }
 
@@ -54,26 +61,6 @@ declare_deprecated_lint! {
 declare_deprecated_lint! {
     /// **What it does:** Nothing. This lint has been deprecated.
     ///
-    /// **Deprecation reason:** This used to check for `.to_string()` method calls on values
-    /// of type `&str`. This is not unidiomatic and with specialization coming, `to_string` could be
-    /// specialized to be as efficient as `to_owned`.
-    pub STR_TO_STRING,
-    "using `str::to_string` is common even today and specialization will likely happen soon"
-}
-
-declare_deprecated_lint! {
-    /// **What it does:** Nothing. This lint has been deprecated.
-    ///
-    /// **Deprecation reason:** This used to check for `.to_string()` method calls on values
-    /// of type `String`. This is not unidiomatic and with specialization coming, `to_string` could be
-    /// specialized to be as efficient as `clone`.
-    pub STRING_TO_STRING,
-    "using `string::to_string` is common even today and specialization will likely happen soon"
-}
-
-declare_deprecated_lint! {
-    /// **What it does:** Nothing. This lint has been deprecated.
-    ///
     /// **Deprecation reason:** This lint should never have applied to non-pointer types, as transmuting
     /// between non-pointer types of differing alignment is well-defined behavior (it's semantically
     /// equivalent to a memcpy). This lint has thus been refactored into two separate lints:
@@ -116,36 +103,9 @@ declare_deprecated_lint! {
 declare_deprecated_lint! {
     /// **What it does:** Nothing. This lint has been deprecated.
     ///
-    /// **Deprecation reason:** This lint has been superseded by the warn-by-default
-    /// `invalid_value` rustc lint.
-    pub INVALID_REF,
-    "superseded by rustc lint `invalid_value`"
-}
-
-declare_deprecated_lint! {
-    /// **What it does:** Nothing. This lint has been deprecated.
-    ///
     /// **Deprecation reason:** This lint has been superseded by #[must_use] in rustc.
     pub UNUSED_COLLECT,
     "`collect` has been marked as #[must_use] in rustc and that covers all cases of this lint"
-}
-
-declare_deprecated_lint! {
-    /// **What it does:** Nothing. This lint has been deprecated.
-    ///
-    /// **Deprecation reason:** This lint has been uplifted to rustc and is now called
-    /// `array_into_iter`.
-    pub INTO_ITER_ON_ARRAY,
-    "this lint has been uplifted to rustc and is now called `array_into_iter`"
-}
-
-declare_deprecated_lint! {
-    /// **What it does:** Nothing. This lint has been deprecated.
-    ///
-    /// **Deprecation reason:** This lint has been uplifted to rustc and is now called
-    /// `unused_labels`.
-    pub UNUSED_LABEL,
-    "this lint has been uplifted to rustc and is now called `unused_labels`"
 }
 
 declare_deprecated_lint! {
@@ -167,22 +127,36 @@ declare_deprecated_lint! {
 declare_deprecated_lint! {
     /// **What it does:** Nothing. This lint has been deprecated.
     ///
-    /// **Deprecation reason:** This lint has been uplifted to rustc and is now called
-    /// `drop_bounds`.
-    pub DROP_BOUNDS,
-    "this lint has been uplifted to rustc and is now called `drop_bounds`"
+    /// **Deprecation reason:** This lint has been replaced by `manual_find_map`, a
+    /// more specific lint.
+    pub FIND_MAP,
+    "this lint has been replaced by `manual_find_map`, a more specific lint"
 }
 
 declare_deprecated_lint! {
     /// **What it does:** Nothing. This lint has been deprecated.
     ///
-    /// **Deprecation reason:** This lint has been uplifted to rustc and is now called
-    /// `temporary_cstring_as_ptr`.
-    pub TEMPORARY_CSTRING_AS_PTR,
-    "this lint has been uplifted to rustc and is now called `temporary_cstring_as_ptr`"
+    /// **Deprecation reason:** This lint has been replaced by `manual_filter_map`, a
+    /// more specific lint.
+    pub FILTER_MAP,
+    "this lint has been replaced by `manual_filter_map`, a more specific lint"
 }
 
 declare_deprecated_lint! {
-    pub PANIC_PARAMS,
-    "this lint has been uplifted to rustc and is now called `panic_fmt`"
+    /// **What it does:** Nothing. This lint has been deprecated.
+    ///
+    /// **Deprecation reason:** The `avoid_breaking_exported_api` config option was added, which
+    /// enables the `enum_variant_names` lint for public items.
+    /// ```
+    pub PUB_ENUM_VARIANT_NAMES,
+    "set the `avoid_breaking_exported_api` config option to `false` to enable the `enum_variant_names` lint for public items"
+}
+
+declare_deprecated_lint! {
+    /// **What it does:** Nothing. This lint has been deprecated.
+    ///
+    /// **Deprecation reason:** The `avoid_breaking_exported_api` config option was added, which
+    /// enables the `wrong_self_conversion` lint for public items.
+    pub WRONG_PUB_SELF_CONVENTION,
+    "set the `avoid_breaking_exported_api` config option to `false` to enable the `wrong_self_convention` lint for public items"
 }

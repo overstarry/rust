@@ -1,7 +1,8 @@
-#![feature(bool_to_option)]
 #![feature(crate_visibility_modifier)]
 #![feature(decl_macro)]
-#![feature(or_patterns)]
+#![feature(destructuring_assignment)]
+#![feature(format_args_capture)]
+#![feature(iter_zip)]
 #![feature(proc_macro_diagnostic)]
 #![feature(proc_macro_internals)]
 #![feature(proc_macro_span)]
@@ -36,16 +37,13 @@ crate mod mbe;
 mod tests;
 #[cfg(test)]
 mod parse {
-    #[cfg(test)]
     mod tests;
 }
 #[cfg(test)]
 mod tokenstream {
-    #[cfg(test)]
     mod tests;
 }
 #[cfg(test)]
 mod mut_visit {
-    #[cfg(test)]
     mod tests;
 }

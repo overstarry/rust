@@ -1,4 +1,4 @@
-use crate::dep_graph::{DepConstructor, DepNode, WorkProduct, WorkProductId};
+use crate::dep_graph::{DepNode, WorkProduct, WorkProductId};
 use crate::ich::{NodeIdHashingMode, StableHashingContext};
 use crate::ty::{subst::InternalSubsts, Instance, InstanceDef, SymbolName, TyCtxt};
 use rustc_attr::InlineAttr;
@@ -6,8 +6,8 @@ use rustc_data_structures::base_n;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LOCAL_CRATE};
-use rustc_hir::HirId;
+use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
+use rustc_hir::{HirId, ItemId};
 use rustc_session::config::OptLevel;
 use rustc_span::source_map::Span;
 use rustc_span::symbol::Symbol;
@@ -43,7 +43,7 @@ pub enum InstantiationMode {
 pub enum MonoItem<'tcx> {
     Fn(Instance<'tcx>),
     Static(DefId),
-    GlobalAsm(HirId),
+    GlobalAsm(ItemId),
 }
 
 impl<'tcx> MonoItem<'tcx> {
@@ -71,9 +71,8 @@ impl<'tcx> MonoItem<'tcx> {
         match *self {
             MonoItem::Fn(instance) => tcx.symbol_name(instance),
             MonoItem::Static(def_id) => tcx.symbol_name(Instance::mono(tcx, def_id)),
-            MonoItem::GlobalAsm(hir_id) => {
-                let def_id = tcx.hir().local_def_id(hir_id);
-                SymbolName::new(tcx, &format!("global_asm_{:?}", def_id))
+            MonoItem::GlobalAsm(item_id) => {
+                SymbolName::new(tcx, &format!("global_asm_{:?}", item_id.def_id))
             }
         }
     }
@@ -89,12 +88,12 @@ impl<'tcx> MonoItem<'tcx> {
 
         match *self {
             MonoItem::Fn(ref instance) => {
-                let entry_def_id = tcx.entry_fn(LOCAL_CRATE).map(|(id, _)| id);
+                let entry_def_id = tcx.entry_fn(()).map(|(id, _)| id);
                 // If this function isn't inlined or otherwise has an extern
                 // indicator, then we'll be creating a globally shared version.
                 if tcx.codegen_fn_attrs(instance.def_id()).contains_extern_indicator()
                     || !instance.def.generates_cgu_internal_copy(tcx)
-                    || Some(instance.def_id()) == entry_def_id.map(LocalDefId::to_def_id)
+                    || Some(instance.def_id()) == entry_def_id
                 {
                     return InstantiationMode::GloballyShared { may_conflict: false };
                 }
@@ -178,9 +177,23 @@ impl<'tcx> MonoItem<'tcx> {
             MonoItem::Static(def_id) => {
                 def_id.as_local().map(|def_id| tcx.hir().local_def_id_to_hir_id(def_id))
             }
-            MonoItem::GlobalAsm(hir_id) => Some(hir_id),
+            MonoItem::GlobalAsm(item_id) => Some(item_id.hir_id()),
         }
         .map(|hir_id| tcx.hir().span(hir_id))
+    }
+
+    // Only used by rustc_codegen_cranelift
+    pub fn codegen_dep_node(&self, tcx: TyCtxt<'tcx>) -> DepNode {
+        crate::dep_graph::make_compile_mono_item(tcx, self)
+    }
+
+    /// Returns the item's `CrateNum`
+    pub fn krate(&self) -> CrateNum {
+        match self {
+            MonoItem::Fn(ref instance) => instance.def_id().krate,
+            MonoItem::Static(def_id) => def_id.krate,
+            MonoItem::GlobalAsm(..) => LOCAL_CRATE,
+        }
     }
 }
 
@@ -195,9 +208,9 @@ impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for MonoItem<'tcx> {
             MonoItem::Static(def_id) => {
                 def_id.hash_stable(hcx, hasher);
             }
-            MonoItem::GlobalAsm(node_id) => {
+            MonoItem::GlobalAsm(item_id) => {
                 hcx.with_node_id_hashing_mode(NodeIdHashingMode::HashDefPath, |hcx| {
-                    node_id.hash_stable(hcx, hasher);
+                    item_id.hash_stable(hcx, hasher);
                 })
             }
         }
@@ -216,6 +229,7 @@ impl<'tcx> fmt::Display for MonoItem<'tcx> {
     }
 }
 
+#[derive(Debug)]
 pub struct CodegenUnit<'tcx> {
     /// A name for this CGU. Incremental compilation requires that
     /// name be unique amongst **all** crates. Therefore, it should
@@ -224,6 +238,7 @@ pub struct CodegenUnit<'tcx> {
     name: Symbol,
     items: FxHashMap<MonoItem<'tcx>, (Linkage, Visibility)>,
     size_estimate: Option<usize>,
+    primary: bool,
 }
 
 /// Specifies the linkage type for a `MonoItem`.
@@ -252,8 +267,9 @@ pub enum Visibility {
 }
 
 impl<'tcx> CodegenUnit<'tcx> {
+    #[inline]
     pub fn new(name: Symbol) -> CodegenUnit<'tcx> {
-        CodegenUnit { name, items: Default::default(), size_estimate: None }
+        CodegenUnit { name, items: Default::default(), size_estimate: None, primary: false }
     }
 
     pub fn name(&self) -> Symbol {
@@ -262,6 +278,14 @@ impl<'tcx> CodegenUnit<'tcx> {
 
     pub fn set_name(&mut self, name: Symbol) {
         self.name = name;
+    }
+
+    pub fn is_primary(&self) -> bool {
+        self.primary
+    }
+
+    pub fn make_primary(&mut self) {
+        self.primary = true;
     }
 
     pub fn items(&self) -> &FxHashMap<MonoItem<'tcx>, (Linkage, Visibility)> {
@@ -288,6 +312,7 @@ impl<'tcx> CodegenUnit<'tcx> {
         self.size_estimate = Some(self.items.keys().map(|mi| mi.size_estimate(tcx)).sum());
     }
 
+    #[inline]
     pub fn size_estimate(&self) -> usize {
         // Should only be called if `estimate_size` has previously been called.
         self.size_estimate.expect("estimate_size must be called before getting a size_estimate")
@@ -350,7 +375,7 @@ impl<'tcx> CodegenUnit<'tcx> {
                     MonoItem::Static(def_id) => {
                         def_id.as_local().map(|def_id| tcx.hir().local_def_id_to_hir_id(def_id))
                     }
-                    MonoItem::GlobalAsm(hir_id) => Some(hir_id),
+                    MonoItem::GlobalAsm(item_id) => Some(item_id.hir_id()),
                 },
                 item.symbol_name(tcx),
             )
@@ -362,7 +387,7 @@ impl<'tcx> CodegenUnit<'tcx> {
     }
 
     pub fn codegen_dep_node(&self, tcx: TyCtxt<'tcx>) -> DepNode {
-        DepConstructor::CompileCodegenUnit(tcx, self.name())
+        crate::dep_graph::make_compile_codegen_unit(tcx, self.name())
     }
 }
 
@@ -373,6 +398,7 @@ impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for CodegenUnit<'tcx> {
             name,
             // The size estimate is not relevant to the hash
             size_estimate: _,
+            primary: _,
         } = *self;
 
         name.hash_stable(hcx, hasher);

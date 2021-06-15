@@ -9,10 +9,10 @@ use crate::cell::{Cell, RefCell};
 use crate::fmt;
 use crate::io::{self, BufReader, Initializer, IoSlice, IoSliceMut, LineWriter};
 use crate::lazy::SyncOnceCell;
+use crate::pin::Pin;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::{Arc, Mutex, MutexGuard};
 use crate::sys::stdio;
-use crate::sys_common;
 use crate::sys_common::remutex::{ReentrantMutex, ReentrantMutexGuard};
 
 type LocalStream = Arc<Mutex<Vec<u8>>>;
@@ -230,7 +230,7 @@ pub struct Stdin {
     inner: &'static Mutex<BufReader<StdinRaw>>,
 }
 
-/// A locked reference to the `Stdin` handle.
+/// A locked reference to the [`Stdin`] handle.
 ///
 /// This handle implements both the [`Read`] and [`BufRead`] traits, and
 /// is constructed via the [`Stdin::lock`] method.
@@ -250,8 +250,8 @@ pub struct Stdin {
 ///     let mut buffer = String::new();
 ///     let stdin = io::stdin(); // We get `Stdin` here.
 ///     {
-///         let mut stdin_lock = stdin.lock(); // We get `StdinLock` here.
-///         stdin_lock.read_to_string(&mut buffer)?;
+///         let mut handle = stdin.lock(); // We get `StdinLock` here.
+///         handle.read_to_string(&mut buffer)?;
 ///     } // `StdinLock` is dropped here.
 ///     Ok(())
 /// }
@@ -372,7 +372,7 @@ impl Stdin {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for Stdin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Stdin { .. }")
+        f.debug_struct("Stdin").finish_non_exhaustive()
     }
 }
 
@@ -466,7 +466,7 @@ impl BufRead for StdinLock<'_> {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for StdinLock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("StdinLock { .. }")
+        f.debug_struct("StdinLock").finish_non_exhaustive()
     }
 }
 
@@ -490,13 +490,13 @@ pub struct Stdout {
     // FIXME: this should be LineWriter or BufWriter depending on the state of
     //        stdout (tty or not). Note that if this is not line buffered it
     //        should also flush-on-panic or some form of flush-on-abort.
-    inner: &'static ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>,
+    inner: Pin<&'static ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>>,
 }
 
-/// A locked reference to the `Stdout` handle.
+/// A locked reference to the [`Stdout`] handle.
 ///
 /// This handle implements the [`Write`] trait, and is constructed via
-/// the [`Stdout::lock`] method.
+/// the [`Stdout::lock`] method. See its documentation for more.
 ///
 /// ### Note: Windows Portability Consideration
 /// When operating in a console, the Windows implementation of this stream does not support
@@ -506,6 +506,8 @@ pub struct Stdout {
 pub struct StdoutLock<'a> {
     inner: ReentrantMutexGuard<'a, RefCell<LineWriter<StdoutRaw>>>,
 }
+
+static STDOUT: SyncOnceCell<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>> = SyncOnceCell::new();
 
 /// Constructs a new handle to the standard output of the current process.
 ///
@@ -548,27 +550,25 @@ pub struct StdoutLock<'a> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stdout() -> Stdout {
-    static INSTANCE: SyncOnceCell<ReentrantMutex<RefCell<LineWriter<StdoutRaw>>>> =
-        SyncOnceCell::new();
     Stdout {
-        inner: INSTANCE.get_or_init(|| unsafe {
-            let _ = sys_common::at_exit(|| {
-                if let Some(instance) = INSTANCE.get() {
-                    // Flush the data and disable buffering during shutdown
-                    // by replacing the line writer by one with zero
-                    // buffering capacity.
-                    // We use try_lock() instead of lock(), because someone
-                    // might have leaked a StdoutLock, which would
-                    // otherwise cause a deadlock here.
-                    if let Some(lock) = instance.try_lock() {
-                        *lock.borrow_mut() = LineWriter::with_capacity(0, stdout_raw());
-                    }
-                }
-            });
-            let r = ReentrantMutex::new(RefCell::new(LineWriter::new(stdout_raw())));
-            r.init();
-            r
-        }),
+        inner: Pin::static_ref(&STDOUT).get_or_init_pin(
+            || unsafe { ReentrantMutex::new(RefCell::new(LineWriter::new(stdout_raw()))) },
+            |mutex| unsafe { mutex.init() },
+        ),
+    }
+}
+
+pub fn cleanup() {
+    if let Some(instance) = STDOUT.get() {
+        // Flush the data and disable buffering during shutdown
+        // by replacing the line writer by one with zero
+        // buffering capacity.
+        // We use try_lock() instead of lock(), because someone
+        // might have leaked a StdoutLock, which would
+        // otherwise cause a deadlock here.
+        if let Some(lock) = Pin::static_ref(instance).try_lock() {
+            *lock.borrow_mut() = LineWriter::with_capacity(0, stdout_raw());
+        }
     }
 }
 
@@ -602,7 +602,7 @@ impl Stdout {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for Stdout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Stdout { .. }")
+        f.debug_struct("Stdout").finish_non_exhaustive()
     }
 }
 
@@ -684,7 +684,7 @@ impl Write for StdoutLock<'_> {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for StdoutLock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("StdoutLock { .. }")
+        f.debug_struct("StdoutLock").finish_non_exhaustive()
     }
 }
 
@@ -700,13 +700,13 @@ impl fmt::Debug for StdoutLock<'_> {
 /// an error.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Stderr {
-    inner: &'static ReentrantMutex<RefCell<StderrRaw>>,
+    inner: Pin<&'static ReentrantMutex<RefCell<StderrRaw>>>,
 }
 
-/// A locked reference to the `Stderr` handle.
+/// A locked reference to the [`Stderr`] handle.
 ///
-/// This handle implements the `Write` trait and is constructed via
-/// the [`Stderr::lock`] method.
+/// This handle implements the [`Write`] trait and is constructed via
+/// the [`Stderr::lock`] method. See its documentation for more.
 ///
 /// ### Note: Windows Portability Consideration
 /// When operating in a console, the Windows implementation of this stream does not support
@@ -756,21 +756,16 @@ pub struct StderrLock<'a> {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn stderr() -> Stderr {
-    // Note that unlike `stdout()` we don't use `Lazy` here which registers a
-    // destructor. Stderr is not buffered nor does the `stderr_raw` type consume
-    // any owned resources, so there's no need to run any destructors at some
-    // point in the future.
-    //
-    // This has the added benefit of allowing `stderr` to be usable during
-    // process shutdown as well!
+    // Note that unlike `stdout()` we don't use `at_exit` here to register a
+    // destructor. Stderr is not buffered , so there's no need to run a
+    // destructor for flushing the buffer
     static INSTANCE: SyncOnceCell<ReentrantMutex<RefCell<StderrRaw>>> = SyncOnceCell::new();
 
     Stderr {
-        inner: INSTANCE.get_or_init(|| unsafe {
-            let r = ReentrantMutex::new(RefCell::new(stderr_raw()));
-            r.init();
-            r
-        }),
+        inner: Pin::static_ref(&INSTANCE).get_or_init_pin(
+            || unsafe { ReentrantMutex::new(RefCell::new(stderr_raw())) },
+            |mutex| unsafe { mutex.init() },
+        ),
     }
 }
 
@@ -804,7 +799,7 @@ impl Stderr {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for Stderr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("Stderr { .. }")
+        f.debug_struct("Stderr").finish_non_exhaustive()
     }
 }
 
@@ -886,7 +881,7 @@ impl Write for StderrLock<'_> {
 #[stable(feature = "std_debug", since = "1.16.0")]
 impl fmt::Debug for StderrLock<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("StderrLock { .. }")
+        f.debug_struct("StderrLock").finish_non_exhaustive()
     }
 }
 

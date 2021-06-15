@@ -45,6 +45,7 @@ fn config() -> Config {
         "--rustc-path=",
         "--lldb-python=",
         "--docck-python=",
+        "--jsondocck-path=",
         "--src-base=",
         "--build-base=",
         "--stage-id=stage2",
@@ -54,6 +55,7 @@ fn config() -> Config {
         "--llvm-components=",
         "--android-cross-path=",
         "--target=x86_64-unknown-linux-gnu",
+        "--channel=nightly",
     ];
     let args = args.iter().map(ToString::to_string).collect();
     crate::parse_config(args)
@@ -223,6 +225,31 @@ fn sanitizers() {
 }
 
 #[test]
+fn asm_support() {
+    let mut config = config();
+
+    config.target = "avr-unknown-gnu-atmega328".to_owned();
+    assert!(parse_rs(&config, "// needs-asm-support").ignore);
+
+    config.target = "i686-unknown-netbsd".to_owned();
+    assert!(!parse_rs(&config, "// needs-asm-support").ignore);
+}
+
+#[test]
+fn channel() {
+    let mut config = config();
+    config.channel = "beta".into();
+
+    assert!(parse_rs(&config, "// ignore-beta").ignore);
+    assert!(parse_rs(&config, "// only-nightly").ignore);
+    assert!(parse_rs(&config, "// only-stable").ignore);
+
+    assert!(!parse_rs(&config, "// only-beta").ignore);
+    assert!(!parse_rs(&config, "// ignore-nightly").ignore);
+    assert!(!parse_rs(&config, "// ignore-stable").ignore);
+}
+
+#[test]
 fn test_extract_version_range() {
     use super::{extract_llvm_version, extract_version_range};
 
@@ -235,4 +262,11 @@ fn test_extract_version_range() {
     assert_eq!(extract_version_range(" - 4.5.6", extract_llvm_version), None);
     assert_eq!(extract_version_range("   - 4.5.6", extract_llvm_version), None);
     assert_eq!(extract_version_range("0  -", extract_llvm_version), None);
+}
+
+#[test]
+#[should_panic(expected = "Duplicate revision: `rpass1` in line ` rpass1 rpass1`")]
+fn test_duplicate_revisions() {
+    let config = config();
+    parse_rs(&config, "// revisions: rpass1 rpass1");
 }

@@ -72,6 +72,10 @@ fn main() {
     let rx1: i32;
     let tx_cake: i32;
     let rx_cake: i32;
+
+    // names often used in win32 code (for example WindowProc)
+    let wparam: i32;
+    let lparam: i32;
 }
 
 fn foo() {
@@ -100,4 +104,9 @@ pub(crate) struct DirSizes {
     pub(crate) total_reg_src_size: u64,
     pub(crate) numb_reg_cache_entries: u64,
     pub(crate) numb_reg_src_checkouts: u64,
+}
+
+fn ignore_underscore_prefix() {
+    let hello: ();
+    let _hello: ();
 }

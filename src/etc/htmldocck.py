@@ -135,6 +135,8 @@ except NameError:
     unichr = chr
 
 
+channel = os.environ["DOC_RUST_LANG_ORG_CHANNEL"]
+
 class CustomHTMLParser(HTMLParser):
     """simplified HTML parser.
 
@@ -218,7 +220,7 @@ def concat_multi_lines(f):
 
 
 LINE_PATTERN = re.compile(r'''
-    (?<=(?<!\S)@)(?P<negated>!?)
+    (?<=(?<!\S))(?P<invalid>!?)@(?P<negated>!?)
     (?P<cmd>[A-Za-z]+(?:-[A-Za-z]+)*)
     (?P<args>.*)$
 ''', re.X | re.UNICODE)
@@ -233,6 +235,16 @@ def get_commands(template):
 
             negated = (m.group('negated') == '!')
             cmd = m.group('cmd')
+            if m.group('invalid') == '!':
+                print_err(
+                    lineno,
+                    line,
+                    'Invalid command: `!@{0}{1}`, (help: try with `@!{1}`)'.format(
+                        '!' if negated else '',
+                        cmd,
+                    ),
+                )
+                continue
             args = m.group('args')
             if args and not args[:1].isspace():
                 print_err(lineno, line, 'Invalid template syntax')
@@ -260,6 +272,7 @@ def flatten(node):
 
 
 def normalize_xpath(path):
+    path = path.replace("{{channel}}", channel)
     if path.startswith('//'):
         return '.' + path  # avoid warnings
     elif path.startswith('.//'):
@@ -324,6 +337,7 @@ class CachedFiles(object):
 
 
 def check_string(data, pat, regexp):
+    pat = pat.replace("{{channel}}", channel)
     if not pat:
         return True  # special case a presence testing
     elif regexp:

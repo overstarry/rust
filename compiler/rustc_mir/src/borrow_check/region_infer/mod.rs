@@ -9,7 +9,7 @@ use rustc_hir::def_id::DefId;
 use rustc_index::vec::IndexVec;
 use rustc_infer::infer::canonical::QueryOutlivesConstraint;
 use rustc_infer::infer::region_constraints::{GenericKind, VarInfos, VerifyBound};
-use rustc_infer::infer::{InferCtxt, NLLRegionVariableOrigin, RegionVariableOrigin};
+use rustc_infer::infer::{InferCtxt, NllRegionVariableOrigin, RegionVariableOrigin};
 use rustc_middle::mir::{
     Body, ClosureOutlivesRequirement, ClosureOutlivesSubject, ClosureRegionRequirements,
     ConstraintCategory, Local, Location, ReturnConstraint,
@@ -54,7 +54,7 @@ pub struct RegionInferenceContext<'tcx> {
     liveness_constraints: LivenessValues<RegionVid>,
 
     /// The outlives constraints computed by the type-check.
-    constraints: Frozen<OutlivesConstraintSet>,
+    constraints: Frozen<OutlivesConstraintSet<'tcx>>,
 
     /// The constraint-set, but in graph form, making it easy to traverse
     /// the constraints adjacent to a particular region. Used to construct
@@ -143,9 +143,9 @@ pub(crate) struct AppliedMemberConstraint {
 
 pub(crate) struct RegionDefinition<'tcx> {
     /// What kind of variable is this -- a free region? existential
-    /// variable? etc. (See the `NLLRegionVariableOrigin` for more
+    /// variable? etc. (See the `NllRegionVariableOrigin` for more
     /// info.)
-    pub(in crate::borrow_check) origin: NLLRegionVariableOrigin,
+    pub(in crate::borrow_check) origin: NllRegionVariableOrigin,
 
     /// Which universe is this region variable defined in? This is
     /// most often `ty::UniverseIndex::ROOT`, but when we encounter
@@ -227,10 +227,10 @@ enum RegionRelationCheckResult {
     Error,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum Trace {
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Trace<'tcx> {
     StartRegion,
-    FromOutlivesConstraint(OutlivesConstraint),
+    FromOutlivesConstraint(OutlivesConstraint<'tcx>),
     NotVisited,
 }
 
@@ -247,7 +247,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         universal_regions: Rc<UniversalRegions<'tcx>>,
         placeholder_indices: Rc<PlaceholderIndices>,
         universal_region_relations: Frozen<UniversalRegionRelations<'tcx>>,
-        outlives_constraints: OutlivesConstraintSet,
+        outlives_constraints: OutlivesConstraintSet<'tcx>,
         member_constraints_in: MemberConstraintSet<'tcx, RegionVid>,
         closure_bounds_mapping: FxHashMap<
             Location,
@@ -451,7 +451,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
             let scc = self.constraint_sccs.scc(variable);
 
             match self.definitions[variable].origin {
-                NLLRegionVariableOrigin::FreeRegion => {
+                NllRegionVariableOrigin::FreeRegion => {
                     // For each free, universally quantified region X:
 
                     // Add all nodes in the CFG to liveness constraints
@@ -462,7 +462,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                     self.scc_values.add_element(scc, variable);
                 }
 
-                NLLRegionVariableOrigin::Placeholder(placeholder) => {
+                NllRegionVariableOrigin::Placeholder(placeholder) => {
                     // Each placeholder region is only visible from
                     // its universe `ui` and its extensions. So we
                     // can't just add it into `scc` unless the
@@ -480,8 +480,8 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                     }
                 }
 
-                NLLRegionVariableOrigin::RootEmptyRegion
-                | NLLRegionVariableOrigin::Existential { .. } => {
+                NllRegionVariableOrigin::RootEmptyRegion
+                | NllRegionVariableOrigin::Existential { .. } => {
                     // For existential, regions, nothing to do.
                 }
             }
@@ -1145,8 +1145,24 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         for ur in self.scc_values.universal_regions_outlived_by(r_scc) {
             let new_lub = self.universal_region_relations.postdom_upper_bound(lub, ur);
             debug!("approx_universal_upper_bound: ur={:?} lub={:?} new_lub={:?}", ur, lub, new_lub);
+            // The upper bound of two non-static regions is static: this
+            // means we know nothing about the relationship between these
+            // two regions. Pick a 'better' one to use when constructing
+            // a diagnostic
             if ur != static_r && lub != static_r && new_lub == static_r {
-                lub = std::cmp::min(ur, lub);
+                // Prefer the region with an `external_name` - this
+                // indicates that the region is early-bound, so working with
+                // it can produce a nicer error.
+                if self.region_definition(ur).external_name.is_some() {
+                    lub = ur;
+                } else if self.region_definition(lub).external_name.is_some() {
+                    // Leave lub unchanged
+                } else {
+                    // If we get here, we don't have any reason to prefer
+                    // one region over the other. Just pick the
+                    // one with the lower index for now.
+                    lub = std::cmp::min(ur, lub);
+                }
             } else {
                 lub = new_lub;
             }
@@ -1225,7 +1241,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     /// it. However, it works pretty well in practice. In particular,
     /// this is needed to deal with projection outlives bounds like
     ///
-    /// ```ignore (internal compiler representation so lifetime syntax is invalid)
+    /// ```text
     /// <T as Foo<'0>>::Item: '1
     /// ```
     ///
@@ -1332,7 +1348,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
     ) {
         for (fr, fr_definition) in self.definitions.iter_enumerated() {
             match fr_definition.origin {
-                NLLRegionVariableOrigin::FreeRegion => {
+                NllRegionVariableOrigin::FreeRegion => {
                     // Go through each of the universal regions `fr` and check that
                     // they did not grow too large, accumulating any requirements
                     // for our caller into the `outlives_requirements` vector.
@@ -1344,12 +1360,12 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                     );
                 }
 
-                NLLRegionVariableOrigin::Placeholder(placeholder) => {
+                NllRegionVariableOrigin::Placeholder(placeholder) => {
                     self.check_bound_universal_region(fr, placeholder, errors_buffer);
                 }
 
-                NLLRegionVariableOrigin::RootEmptyRegion
-                | NLLRegionVariableOrigin::Existential { .. } => {
+                NllRegionVariableOrigin::RootEmptyRegion
+                | NllRegionVariableOrigin::Existential { .. } => {
                     // nothing to check here
                 }
             }
@@ -1433,7 +1449,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 errors_buffer.push(RegionErrorKind::RegionError {
                     longer_fr: *longer_fr,
                     shorter_fr: *shorter_fr,
-                    fr_origin: NLLRegionVariableOrigin::FreeRegion,
+                    fr_origin: NllRegionVariableOrigin::FreeRegion,
                     is_reported: true,
                 });
             }
@@ -1443,16 +1459,16 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         // a more complete picture on how to separate this responsibility.
         for (fr, fr_definition) in self.definitions.iter_enumerated() {
             match fr_definition.origin {
-                NLLRegionVariableOrigin::FreeRegion => {
+                NllRegionVariableOrigin::FreeRegion => {
                     // handled by polonius above
                 }
 
-                NLLRegionVariableOrigin::Placeholder(placeholder) => {
+                NllRegionVariableOrigin::Placeholder(placeholder) => {
                     self.check_bound_universal_region(fr, placeholder, errors_buffer);
                 }
 
-                NLLRegionVariableOrigin::RootEmptyRegion
-                | NLLRegionVariableOrigin::Existential { .. } => {
+                NllRegionVariableOrigin::RootEmptyRegion
+                | NllRegionVariableOrigin::Existential { .. } => {
                     // nothing to check here
                 }
             }
@@ -1500,7 +1516,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 errors_buffer.push(RegionErrorKind::RegionError {
                     longer_fr,
                     shorter_fr: representative,
-                    fr_origin: NLLRegionVariableOrigin::FreeRegion,
+                    fr_origin: NllRegionVariableOrigin::FreeRegion,
                     is_reported: true,
                 });
             }
@@ -1523,7 +1539,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 errors_buffer.push(RegionErrorKind::RegionError {
                     longer_fr,
                     shorter_fr,
-                    fr_origin: NLLRegionVariableOrigin::FreeRegion,
+                    fr_origin: NllRegionVariableOrigin::FreeRegion,
                     is_reported: !error_reported,
                 });
 
@@ -1581,7 +1597,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 let blame_span_category = self.find_outlives_blame_span(
                     body,
                     longer_fr,
-                    NLLRegionVariableOrigin::FreeRegion,
+                    NllRegionVariableOrigin::FreeRegion,
                     shorter_fr,
                 );
 
@@ -1640,7 +1656,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         errors_buffer.push(RegionErrorKind::BoundUniversalRegionError {
             longer_fr,
             error_element,
-            fr_origin: NLLRegionVariableOrigin::Placeholder(placeholder),
+            fr_origin: NllRegionVariableOrigin::Placeholder(placeholder),
         });
     }
 
@@ -1716,7 +1732,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         debug!("cannot_name_value_of(r1={:?}, r2={:?})", r1, r2);
 
         match self.definitions[r2].origin {
-            NLLRegionVariableOrigin::Placeholder(placeholder) => {
+            NllRegionVariableOrigin::Placeholder(placeholder) => {
                 let universe1 = self.definitions[r1].universe;
                 debug!(
                     "cannot_name_value_of: universe1={:?} placeholder={:?}",
@@ -1725,29 +1741,44 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 universe1.cannot_name(placeholder.universe)
             }
 
-            NLLRegionVariableOrigin::RootEmptyRegion
-            | NLLRegionVariableOrigin::FreeRegion
-            | NLLRegionVariableOrigin::Existential { .. } => false,
+            NllRegionVariableOrigin::RootEmptyRegion
+            | NllRegionVariableOrigin::FreeRegion
+            | NllRegionVariableOrigin::Existential { .. } => false,
         }
     }
 
     crate fn retrieve_closure_constraint_info(
         &self,
         body: &Body<'tcx>,
-        constraint: &OutlivesConstraint,
-    ) -> (ConstraintCategory, bool, Span) {
+        constraint: &OutlivesConstraint<'tcx>,
+    ) -> BlameConstraint<'tcx> {
         let loc = match constraint.locations {
-            Locations::All(span) => return (constraint.category, false, span),
+            Locations::All(span) => {
+                return BlameConstraint {
+                    category: constraint.category,
+                    from_closure: false,
+                    span,
+                    variance_info: constraint.variance_info.clone(),
+                };
+            }
             Locations::Single(loc) => loc,
         };
 
         let opt_span_category =
             self.closure_bounds_mapping[&loc].get(&(constraint.sup, constraint.sub));
-        opt_span_category.map(|&(category, span)| (category, true, span)).unwrap_or((
-            constraint.category,
-            false,
-            body.source_info(loc).span,
-        ))
+        opt_span_category
+            .map(|&(category, span)| BlameConstraint {
+                category,
+                from_closure: true,
+                span: span,
+                variance_info: constraint.variance_info.clone(),
+            })
+            .unwrap_or(BlameConstraint {
+                category: constraint.category,
+                from_closure: false,
+                span: body.source_info(loc).span,
+                variance_info: constraint.variance_info.clone(),
+            })
     }
 
     /// Finds a good span to blame for the fact that `fr1` outlives `fr2`.
@@ -1755,12 +1786,13 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         &self,
         body: &Body<'tcx>,
         fr1: RegionVid,
-        fr1_origin: NLLRegionVariableOrigin,
+        fr1_origin: NllRegionVariableOrigin,
         fr2: RegionVid,
     ) -> (ConstraintCategory, Span) {
-        let (category, _, span) = self.best_blame_constraint(body, fr1, fr1_origin, |r| {
-            self.provides_universal_region(r, fr1, fr2)
-        });
+        let BlameConstraint { category, span, .. } =
+            self.best_blame_constraint(body, fr1, fr1_origin, |r| {
+                self.provides_universal_region(r, fr1, fr2)
+            });
         (category, span)
     }
 
@@ -1776,7 +1808,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         &self,
         from_region: RegionVid,
         target_test: impl Fn(RegionVid) -> bool,
-    ) -> Option<(Vec<OutlivesConstraint>, RegionVid)> {
+    ) -> Option<(Vec<OutlivesConstraint<'tcx>>, RegionVid)> {
         let mut context = IndexVec::from_elem(Trace::NotVisited, &self.definitions);
         context[from_region] = Trace::StartRegion;
 
@@ -1800,14 +1832,14 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 let mut result = vec![];
                 let mut p = r;
                 loop {
-                    match context[p] {
+                    match context[p].clone() {
                         Trace::NotVisited => {
                             bug!("found unvisited region {:?} on path to {:?}", p, r)
                         }
 
                         Trace::FromOutlivesConstraint(c) => {
-                            result.push(c);
                             p = c.sup;
+                            result.push(c);
                         }
 
                         Trace::StartRegion => {
@@ -1830,7 +1862,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
 
             // Always inline this closure because it can be hot.
             let mut handle_constraint = #[inline(always)]
-            |constraint: OutlivesConstraint| {
+            |constraint: OutlivesConstraint<'tcx>| {
                 debug_assert_eq!(constraint.sup, r);
                 let sub_region = constraint.sub;
                 if let Trace::NotVisited = context[sub_region] {
@@ -1854,6 +1886,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                     sub: constraint.min_choice,
                     locations: Locations::All(p_c.definition_span),
                     category: ConstraintCategory::OpaqueType,
+                    variance_info: ty::VarianceDiagInfo::default(),
                 };
                 handle_constraint(constraint);
             }
@@ -1917,7 +1950,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 .definitions
                 .iter_enumerated()
                 .find_map(|(r, definition)| match definition.origin {
-                    NLLRegionVariableOrigin::Placeholder(p) if p == error_placeholder => Some(r),
+                    NllRegionVariableOrigin::Placeholder(p) if p == error_placeholder => Some(r),
                     _ => None,
                 })
                 .unwrap(),
@@ -1949,9 +1982,9 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         &self,
         body: &Body<'tcx>,
         from_region: RegionVid,
-        from_region_origin: NLLRegionVariableOrigin,
+        from_region_origin: NllRegionVariableOrigin,
         target_test: impl Fn(RegionVid) -> bool,
-    ) -> (ConstraintCategory, bool, Span) {
+    ) -> BlameConstraint<'tcx> {
         debug!(
             "best_blame_constraint(from_region={:?}, from_region_origin={:?})",
             from_region, from_region_origin
@@ -1963,7 +1996,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         debug!(
             "best_blame_constraint: path={:#?}",
             path.iter()
-                .map(|&c| format!(
+                .map(|c| format!(
                     "{:?} ({:?}: {:?})",
                     c,
                     self.constraint_sccs.scc(c.sup),
@@ -1973,13 +2006,18 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         );
 
         // Classify each of the constraints along the path.
-        let mut categorized_path: Vec<(ConstraintCategory, bool, Span)> = path
+        let mut categorized_path: Vec<BlameConstraint<'tcx>> = path
             .iter()
             .map(|constraint| {
                 if constraint.category == ConstraintCategory::ClosureBounds {
                     self.retrieve_closure_constraint_info(body, &constraint)
                 } else {
-                    (constraint.category, false, constraint.locations.span(body))
+                    BlameConstraint {
+                        category: constraint.category,
+                        from_closure: false,
+                        span: constraint.locations.span(body),
+                        variance_info: constraint.variance_info.clone(),
+                    }
                 }
             })
             .collect();
@@ -2043,20 +2081,20 @@ impl<'tcx> RegionInferenceContext<'tcx> {
         //
         // and here we prefer to blame the source (the y = x statement).
         let blame_source = match from_region_origin {
-            NLLRegionVariableOrigin::FreeRegion
-            | NLLRegionVariableOrigin::Existential { from_forall: false } => true,
-            NLLRegionVariableOrigin::RootEmptyRegion
-            | NLLRegionVariableOrigin::Placeholder(_)
-            | NLLRegionVariableOrigin::Existential { from_forall: true } => false,
+            NllRegionVariableOrigin::FreeRegion
+            | NllRegionVariableOrigin::Existential { from_forall: false } => true,
+            NllRegionVariableOrigin::RootEmptyRegion
+            | NllRegionVariableOrigin::Placeholder(_)
+            | NllRegionVariableOrigin::Existential { from_forall: true } => false,
         };
 
         let find_region = |i: &usize| {
-            let constraint = path[*i];
+            let constraint = &path[*i];
 
             let constraint_sup_scc = self.constraint_sccs.scc(constraint.sup);
 
             if blame_source {
-                match categorized_path[*i].0 {
+                match categorized_path[*i].category {
                     ConstraintCategory::OpaqueType
                     | ConstraintCategory::Boring
                     | ConstraintCategory::BoringNoLocation
@@ -2067,7 +2105,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                     _ => constraint_sup_scc != target_scc,
                 }
             } else {
-                match categorized_path[*i].0 {
+                match categorized_path[*i].category {
                     ConstraintCategory::OpaqueType
                     | ConstraintCategory::Boring
                     | ConstraintCategory::BoringNoLocation
@@ -2087,37 +2125,42 @@ impl<'tcx> RegionInferenceContext<'tcx> {
 
         if let Some(i) = best_choice {
             if let Some(next) = categorized_path.get(i + 1) {
-                if matches!(categorized_path[i].0, ConstraintCategory::Return(_))
-                    && next.0 == ConstraintCategory::OpaqueType
+                if matches!(categorized_path[i].category, ConstraintCategory::Return(_))
+                    && next.category == ConstraintCategory::OpaqueType
                 {
                     // The return expression is being influenced by the return type being
                     // impl Trait, point at the return type and not the return expr.
-                    return *next;
+                    return next.clone();
                 }
             }
 
-            if categorized_path[i].0 == ConstraintCategory::Return(ReturnConstraint::Normal) {
+            if categorized_path[i].category == ConstraintCategory::Return(ReturnConstraint::Normal)
+            {
                 let field = categorized_path.iter().find_map(|p| {
-                    if let ConstraintCategory::ClosureUpvar(f) = p.0 { Some(f) } else { None }
+                    if let ConstraintCategory::ClosureUpvar(f) = p.category {
+                        Some(f)
+                    } else {
+                        None
+                    }
                 });
 
                 if let Some(field) = field {
-                    categorized_path[i].0 =
+                    categorized_path[i].category =
                         ConstraintCategory::Return(ReturnConstraint::ClosureUpvar(field));
                 }
             }
 
-            return categorized_path[i];
+            return categorized_path[i].clone();
         }
 
         // If that search fails, that is.. unusual. Maybe everything
         // is in the same SCC or something. In that case, find what
         // appears to be the most interesting point to report to the
         // user via an even more ad-hoc guess.
-        categorized_path.sort_by(|p0, p1| p0.0.cmp(&p1.0));
+        categorized_path.sort_by(|p0, p1| p0.category.cmp(&p1.category));
         debug!("`: sorted_path={:#?}", categorized_path);
 
-        *categorized_path.first().unwrap()
+        categorized_path.remove(0)
     }
 }
 
@@ -2128,8 +2171,8 @@ impl<'tcx> RegionDefinition<'tcx> {
         // `init_universal_regions`.
 
         let origin = match rv_origin {
-            RegionVariableOrigin::NLL(origin) => origin,
-            _ => NLLRegionVariableOrigin::Existential { from_forall: false },
+            RegionVariableOrigin::Nll(origin) => origin,
+            _ => NllRegionVariableOrigin::Existential { from_forall: false },
         };
 
         Self { origin, universe, external_name: None }
@@ -2211,4 +2254,12 @@ impl<'tcx> ClosureRegionRequirementsExt<'tcx> for ClosureRegionRequirements<'tcx
             })
             .collect()
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct BlameConstraint<'tcx> {
+    pub category: ConstraintCategory,
+    pub from_closure: bool,
+    pub span: Span,
+    pub variance_info: ty::VarianceDiagInfo<'tcx>,
 }

@@ -1,13 +1,13 @@
+use clippy_utils::diagnostics::span_lint_and_help;
+use clippy_utils::source::snippet;
+use if_chain::if_chain;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::mir::interpret::ConstValue;
 use rustc_middle::ty::{self, ConstKind};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 
-use if_chain::if_chain;
-
 use crate::rustc_target::abi::LayoutOf;
-use crate::utils::{snippet, span_lint_and_help};
 
 declare_clippy_lint! {
     /// **What it does:** Checks for local arrays that may be too large.
@@ -43,8 +43,7 @@ impl<'tcx> LateLintPass<'tcx> for LargeStackArrays {
         if_chain! {
             if let ExprKind::Repeat(_, _) = expr.kind;
             if let ty::Array(element_type, cst) = cx.typeck_results().expr_ty(expr).kind();
-            if let ConstKind::Value(val) = cst.val;
-            if let ConstValue::Scalar(element_count) = val;
+            if let ConstKind::Value(ConstValue::Scalar(element_count)) = cst.val;
             if let Ok(element_count) = element_count.to_machine_usize(&cx.tcx);
             if let Ok(element_size) = cx.layout_of(element_type).map(|l| l.size.bytes());
             if self.maximum_allowed_size < element_count * element_size;

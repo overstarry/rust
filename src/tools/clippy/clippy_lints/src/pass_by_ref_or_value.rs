@@ -1,12 +1,16 @@
 use std::cmp;
+use std::iter;
 
-use crate::utils::{is_copy, is_self_ty, snippet, span_lint_and_sugg};
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::is_self_ty;
+use clippy_utils::source::snippet;
+use clippy_utils::ty::is_copy;
 use if_chain::if_chain;
 use rustc_ast::attr;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{BindingAnnotation, Body, FnDecl, HirId, ItemKind, MutTy, Mutability, Node, PatKind};
+use rustc_hir::{BindingAnnotation, Body, FnDecl, HirId, Impl, ItemKind, MutTy, Mutability, Node, PatKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
@@ -38,6 +42,14 @@ declare_clippy_lint! {
     /// false positives in cases involving multiple lifetimes that are bounded by
     /// each other.
     ///
+    /// Also, it does not take account of other similar cases where getting memory addresses
+    /// matters; namely, returning the pointer to the argument in question,
+    /// and passing the argument, as both references and pointers,
+    /// to a function that needs the memory address. For further details, refer to
+    /// [this issue](https://github.com/rust-lang/rust-clippy/issues/5953)
+    /// that explains a real case in which this false positive
+    /// led to an **undefined behaviour** introduced with unsafe code.
+    ///
     /// **Example:**
     ///
     /// ```rust
@@ -63,7 +75,7 @@ declare_clippy_lint! {
     ///
     /// **Why is this bad?** Arguments passed by value might result in an unnecessary
     /// shallow copy, taking up more space in the stack and requiring a call to
-    /// `memcpy`, which which can be expensive.
+    /// `memcpy`, which can be expensive.
     ///
     /// **Example:**
     ///
@@ -90,10 +102,16 @@ declare_clippy_lint! {
 pub struct PassByRefOrValue {
     ref_min_size: u64,
     value_max_size: u64,
+    avoid_breaking_exported_api: bool,
 }
 
 impl<'tcx> PassByRefOrValue {
-    pub fn new(ref_min_size: Option<u64>, value_max_size: u64, target: &Target) -> Self {
+    pub fn new(
+        ref_min_size: Option<u64>,
+        value_max_size: u64,
+        avoid_breaking_exported_api: bool,
+        target: &Target,
+    ) -> Self {
         let ref_min_size = ref_min_size.unwrap_or_else(|| {
             let bit_width = u64::from(target.pointer_width);
             // Cap the calculated bit width at 32-bits to reduce
@@ -108,10 +126,14 @@ impl<'tcx> PassByRefOrValue {
         Self {
             ref_min_size,
             value_max_size,
+            avoid_breaking_exported_api,
         }
     }
 
     fn check_poly_fn(&mut self, cx: &LateContext<'tcx>, hir_id: HirId, decl: &FnDecl<'_>, span: Option<Span>) {
+        if self.avoid_breaking_exported_api && cx.access_levels.is_exported(hir_id) {
+            return;
+        }
         let fn_def_id = cx.tcx.hir().local_def_id(hir_id);
 
         let fn_sig = cx.tcx.fn_sig(fn_def_id);
@@ -119,7 +141,7 @@ impl<'tcx> PassByRefOrValue {
 
         let fn_body = cx.enclosing_body.map(|id| cx.tcx.hir().body(id));
 
-        for (index, (input, &ty)) in decl.inputs.iter().zip(fn_sig.inputs()).enumerate() {
+        for (index, (input, &ty)) in iter::zip(decl.inputs, fn_sig.inputs()).enumerate() {
             // All spans generated from a proc-macro invocation are the same...
             match span {
                 Some(s) if s == input.span => return,
@@ -138,11 +160,11 @@ impl<'tcx> PassByRefOrValue {
                     };
 
                     if_chain! {
-                        if !output_lts.contains(&input_lt);
+                        if !output_lts.contains(input_lt);
                         if is_copy(cx, ty);
                         if let Some(size) = cx.layout_of(ty).ok().map(|l| l.size.bytes());
                         if size <= self.ref_min_size;
-                        if let hir::TyKind::Rptr(_, MutTy { ty: ref decl_ty, .. }) = input.kind;
+                        if let hir::TyKind::Rptr(_, MutTy { ty: decl_ty, .. }) = input.kind;
                         then {
                             let value_type = if is_self_ty(decl_ty) {
                                 "self".into()
@@ -172,7 +194,6 @@ impl<'tcx> PassByRefOrValue {
                     }
 
                     if_chain! {
-                        if !cx.access_levels.is_exported(hir_id);
                         if is_copy(cx, ty);
                         if !is_self_ty(input);
                         if let Some(size) = cx.layout_of(ty).ok().map(|l| l.size.bytes());
@@ -206,7 +227,7 @@ impl<'tcx> LateLintPass<'tcx> for PassByRefOrValue {
         }
 
         if let hir::TraitItemKind::Fn(method_sig, _) = &item.kind {
-            self.check_poly_fn(cx, item.hir_id, &*method_sig.decl, None);
+            self.check_poly_fn(cx, item.hir_id(), &*method_sig.decl, None);
         }
     }
 
@@ -224,10 +245,11 @@ impl<'tcx> LateLintPass<'tcx> for PassByRefOrValue {
         }
 
         match kind {
-            FnKind::ItemFn(.., header, _, attrs) => {
+            FnKind::ItemFn(.., header, _) => {
                 if header.abi != Abi::Rust {
                     return;
                 }
+                let attrs = cx.tcx.hir().attrs(hir_id);
                 for a in attrs {
                     if let Some(meta_items) = a.meta_item_list() {
                         if a.has_name(sym::proc_macro_derive)
@@ -239,14 +261,15 @@ impl<'tcx> LateLintPass<'tcx> for PassByRefOrValue {
                 }
             },
             FnKind::Method(..) => (),
-            FnKind::Closure(..) => return,
+            FnKind::Closure => return,
         }
 
         // Exclude non-inherent impls
         if let Some(Node::Item(item)) = cx.tcx.hir().find(cx.tcx.hir().get_parent_node(hir_id)) {
-            if matches!(item.kind, ItemKind::Impl{ of_trait: Some(_), .. } |
-            ItemKind::Trait(..))
-            {
+            if matches!(
+                item.kind,
+                ItemKind::Impl(Impl { of_trait: Some(_), .. }) | ItemKind::Trait(..)
+            ) {
                 return;
             }
         }

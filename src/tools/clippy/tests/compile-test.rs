@@ -4,13 +4,16 @@
 use compiletest_rs as compiletest;
 use compiletest_rs::common::Mode as TestMode;
 
-use std::env::{self, set_var, var};
-use std::ffi::OsStr;
+use std::env::{self, remove_var, set_var, var_os};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 mod cargo;
+
+// whether to run internal tests or not
+const RUN_INTERNAL_TESTS: bool = cfg!(feature = "internal-lints");
 
 fn host_lib() -> PathBuf {
     option_env!("HOST_LIBS").map_or(cargo::CARGO_TARGET_DIR.join(env!("PROFILE")), PathBuf::from)
@@ -41,7 +44,9 @@ fn third_party_crates() -> String {
         };
         if let Some(name) = path.file_name().and_then(OsStr::to_str) {
             for dep in CRATES {
-                if name.starts_with(&format!("lib{}-", dep)) && name.ends_with(".rlib") {
+                if name.starts_with(&format!("lib{}-", dep))
+                    && name.rsplit('.').next().map(|ext| ext.eq_ignore_ascii_case("rlib")) == Some(true)
+                {
                     if let Some(old) = crates.insert(dep, path.clone()) {
                         panic!("Found multiple rlibs for crate `{}`: `{:?}` and `{:?}", dep, old, path);
                     }
@@ -61,8 +66,8 @@ fn third_party_crates() -> String {
 fn default_config() -> compiletest::Config {
     let mut config = compiletest::Config::default();
 
-    if let Ok(name) = env::var("TESTNAME") {
-        config.filter = Some(name);
+    if let Ok(filters) = env::var("TESTNAME") {
+        config.filters = filters.split(',').map(std::string::ToString::to_string).collect();
     }
 
     if let Some(path) = option_env!("RUSTC_LIB_PATH") {
@@ -78,22 +83,27 @@ fn default_config() -> compiletest::Config {
         third_party_crates(),
     ));
 
-    config.build_base = if cargo::is_rustc_test_suite() {
-        // This make the stderr files go to clippy OUT_DIR on rustc repo build dir
-        let mut path = PathBuf::from(env!("OUT_DIR"));
-        path.push("test_build_base");
-        path
-    } else {
-        host_lib().join("test_build_base")
-    };
+    config.build_base = host_lib().join("test_build_base");
     config.rustc_path = clippy_driver_path();
     config
 }
 
-fn run_mode(cfg: &mut compiletest::Config) {
+fn run_ui(cfg: &mut compiletest::Config) {
     cfg.mode = TestMode::Ui;
     cfg.src_base = Path::new("tests").join("ui");
-    compiletest::run_tests(&cfg);
+    // use tests/clippy.toml
+    let _g = VarGuard::set("CARGO_MANIFEST_DIR", std::fs::canonicalize("tests").unwrap());
+    compiletest::run_tests(cfg);
+}
+
+fn run_internal_tests(cfg: &mut compiletest::Config) {
+    // only run internal tests with the internal-tests feature
+    if !RUN_INTERNAL_TESTS {
+        return;
+    }
+    cfg.mode = TestMode::Ui;
+    cfg.src_base = Path::new("tests").join("ui-internal");
+    compiletest::run_tests(cfg);
 }
 
 fn run_ui_toml(config: &mut compiletest::Config) {
@@ -106,7 +116,7 @@ fn run_ui_toml(config: &mut compiletest::Config) {
                 continue;
             }
             let dir_path = dir.path();
-            set_var("CARGO_MANIFEST_DIR", &dir_path);
+            let _g = VarGuard::set("CARGO_MANIFEST_DIR", &dir_path);
             for file in fs::read_dir(&dir_path)? {
                 let file = file?;
                 let file_path = file.path();
@@ -121,7 +131,7 @@ fn run_ui_toml(config: &mut compiletest::Config) {
                     base: config.src_base.clone(),
                     relative_dir: dir_path.file_name().unwrap().into(),
                 };
-                let test_name = compiletest::make_test_name(&config, &paths);
+                let test_name = compiletest::make_test_name(config, &paths);
                 let index = tests
                     .iter()
                     .position(|test| test.desc.name == test_name)
@@ -135,11 +145,9 @@ fn run_ui_toml(config: &mut compiletest::Config) {
     config.mode = TestMode::Ui;
     config.src_base = Path::new("tests").join("ui-toml").canonicalize().unwrap();
 
-    let tests = compiletest::make_tests(&config);
+    let tests = compiletest::make_tests(config);
 
-    let manifest_dir = var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let res = run_tests(&config, tests);
-    set_var("CARGO_MANIFEST_DIR", &manifest_dir);
+    let res = run_tests(config, tests);
     match res {
         Ok(true) => {},
         Ok(false) => panic!("Some tests failed"),
@@ -152,7 +160,7 @@ fn run_ui_toml(config: &mut compiletest::Config) {
 fn run_ui_cargo(config: &mut compiletest::Config) {
     fn run_tests(
         config: &compiletest::Config,
-        filter: &Option<String>,
+        filters: &[String],
         mut tests: Vec<tester::TestDescAndFn>,
     ) -> Result<bool, io::Error> {
         let mut result = true;
@@ -166,9 +174,10 @@ fn run_ui_cargo(config: &mut compiletest::Config) {
 
             // Use the filter if provided
             let dir_path = dir.path();
-            match &filter {
-                Some(name) if !dir_path.ends_with(name) => continue,
-                _ => {},
+            for filter in filters {
+                if !dir_path.ends_with(filter) {
+                    continue;
+                }
             }
 
             for case in fs::read_dir(&dir_path)? {
@@ -199,13 +208,13 @@ fn run_ui_cargo(config: &mut compiletest::Config) {
                         Some("main.rs") => {},
                         _ => continue,
                     }
-
+                    let _g = VarGuard::set("CLIPPY_CONF_DIR", case.path());
                     let paths = compiletest::common::TestPaths {
                         file: file_path,
                         base: config.src_base.clone(),
                         relative_dir: src_path.strip_prefix(&config.src_base).unwrap().into(),
                     };
-                    let test_name = compiletest::make_test_name(&config, &paths);
+                    let test_name = compiletest::make_test_name(config, &paths);
                     let index = tests
                         .iter()
                         .position(|test| test.desc.name == test_name)
@@ -224,11 +233,10 @@ fn run_ui_cargo(config: &mut compiletest::Config) {
     config.mode = TestMode::Ui;
     config.src_base = Path::new("tests").join("ui-cargo").canonicalize().unwrap();
 
-    let tests = compiletest::make_tests(&config);
+    let tests = compiletest::make_tests(config);
 
     let current_dir = env::current_dir().unwrap();
-    let filter = env::var("TESTNAME").ok();
-    let res = run_tests(&config, &filter, tests);
+    let res = run_tests(config, &config.filters, tests);
     env::set_current_dir(current_dir).unwrap();
 
     match res {
@@ -242,7 +250,7 @@ fn run_ui_cargo(config: &mut compiletest::Config) {
 
 fn prepare_env() {
     set_var("CLIPPY_DISABLE_DOCS_LINKS", "true");
-    set_var("CLIPPY_TESTS", "true");
+    set_var("__CLIPPY_INTERNAL_TESTS", "true");
     //set_var("RUST_BACKTRACE", "0");
 }
 
@@ -250,7 +258,32 @@ fn prepare_env() {
 fn compile_test() {
     prepare_env();
     let mut config = default_config();
-    run_mode(&mut config);
+    run_ui(&mut config);
     run_ui_toml(&mut config);
     run_ui_cargo(&mut config);
+    run_internal_tests(&mut config);
+}
+
+/// Restores an env var on drop
+#[must_use]
+struct VarGuard {
+    key: &'static str,
+    value: Option<OsString>,
+}
+
+impl VarGuard {
+    fn set(key: &'static str, val: impl AsRef<OsStr>) -> Self {
+        let value = var_os(key);
+        set_var(key, val);
+        Self { key, value }
+    }
+}
+
+impl Drop for VarGuard {
+    fn drop(&mut self) {
+        match self.value.as_deref() {
+            None => remove_var(self.key),
+            Some(value) => set_var(self.key, value),
+        }
+    }
 }

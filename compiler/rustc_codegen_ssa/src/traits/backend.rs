@@ -1,5 +1,6 @@
 use super::write::WriteBackendMethods;
 use super::CodegenObject;
+use crate::back::write::TargetMachineFactoryFn;
 use crate::{CodegenResults, ModuleCodegen};
 
 use rustc_ast::expand::allocator::AllocatorKind;
@@ -21,7 +22,6 @@ use rustc_target::spec::Target;
 pub use rustc_data_structures::sync::MetadataRef;
 
 use std::any::Any;
-use std::sync::Arc;
 
 pub trait BackendTypes {
     type Value: CodegenObject;
@@ -63,9 +63,16 @@ pub trait CodegenBackend {
         None
     }
 
-    fn metadata_loader(&self) -> Box<MetadataLoaderDyn>;
-    fn provide(&self, _providers: &mut Providers);
-    fn provide_extern(&self, _providers: &mut Providers);
+    /// The metadata loader used to load rlib and dylib metadata.
+    ///
+    /// Alternative codegen backends may want to use different rlib or dylib formats than the
+    /// default native static archives and dynamic libraries.
+    fn metadata_loader(&self) -> Box<MetadataLoaderDyn> {
+        Box::new(crate::back::metadata::DefaultMetadataLoader)
+    }
+
+    fn provide(&self, _providers: &mut Providers) {}
+    fn provide_extern(&self, _providers: &mut Providers) {}
     fn codegen_crate<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -123,7 +130,7 @@ pub trait ExtraBackendMethods: CodegenBackend + WriteBackendMethods + Sized + Se
         &self,
         sess: &Session,
         opt_level: config::OptLevel,
-    ) -> Arc<dyn Fn() -> Result<Self::TargetMachine, String> + Send + Sync>;
+    ) -> TargetMachineFactoryFn<Self>;
     fn target_cpu<'b>(&self, sess: &'b Session) -> &'b str;
     fn tune_cpu<'b>(&self, sess: &'b Session) -> Option<&'b str>;
 }

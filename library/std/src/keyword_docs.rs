@@ -42,7 +42,7 @@
 /// [Reference]: ../reference/expressions/operator-expr.html#type-cast-expressions
 /// [`crate`]: keyword.crate.html
 /// [`use`]: keyword.use.html
-/// [const-cast]: primitive.pointer.html#method.cast
+/// [const-cast]: pointer::cast
 /// [mut-cast]: primitive.pointer.html#method.cast-1
 mod as_keyword {}
 
@@ -181,9 +181,8 @@ mod break_keyword {}
 /// The `const` keyword is also used in raw pointers in combination with `mut`, as seen in `*const
 /// T` and `*mut T`. More about `const` as used in raw pointers can be read at the Rust docs for the [pointer primitive].
 ///
-/// [pointer primitive]: primitive.pointer.html
-/// [Rust Book]:
-/// ../book/ch03-01-variables-and-mutability.html#differences-between-variables-and-constants
+/// [pointer primitive]: pointer
+/// [Rust Book]: ../book/ch03-01-variables-and-mutability.html#differences-between-variables-and-constants
 /// [Reference]: ../reference/items/constant-items.html
 /// [const-eval]: ../reference/const_eval.html
 mod const_keyword {}
@@ -371,7 +370,6 @@ mod else_keyword {}
 /// [ADT]: https://en.wikipedia.org/wiki/Algebraic_data_type
 /// [Rust Book]: ../book/ch06-01-defining-an-enum.html
 /// [Reference]: ../reference/items/enumerations.html
-/// [`!`]: primitive.never.html
 mod enum_keyword {}
 
 #[doc(keyword = "extern")]
@@ -401,7 +399,7 @@ mod enum_keyword {}
 ///
 /// ```rust
 /// #[no_mangle]
-/// pub extern fn callable_from_c(x: i32) -> bool {
+/// pub extern "C" fn callable_from_c(x: i32) -> bool {
 ///     x % 3 == 0
 /// }
 /// ```
@@ -549,15 +547,18 @@ mod fn_keyword {}
 /// # fn code() { }
 /// # let iterator = 0..2;
 /// {
-///     let mut _iter = std::iter::IntoIterator::into_iter(iterator);
-///     loop {
-///         match _iter.next() {
-///             Some(loop_variable) => {
-///                 code()
-///             },
-///             None => break,
-///         }
-///     }
+///     let result = match IntoIterator::into_iter(iterator) {
+///         mut iter => loop {
+///             let next;
+///             match iter.next() {
+///                 Some(val) => next = val,
+///                 None => break,
+///             };
+///             let loop_variable = next;
+///             let () = { code(); };
+///         },
+///     };
+///     result
 /// }
 /// ```
 ///
@@ -565,8 +566,12 @@ mod fn_keyword {}
 ///
 /// For more information on for-loops, see the [Rust book] or the [Reference].
 ///
+/// See also, [`loop`], [`while`].
+///
 /// [`in`]: keyword.in.html
 /// [`impl`]: keyword.impl.html
+/// [`loop`]: keyword.loop.html
+/// [`while`]: keyword.while.html
 /// [higher-ranked trait bounds]: ../reference/trait-bounds.html#higher-ranked-trait-bounds
 /// [Rust book]:
 /// ../book/ch03-05-control-flow.html#looping-through-a-collection-with-for
@@ -842,6 +847,8 @@ mod let_keyword {}
 ///
 /// For more information on `while` and loops in general, see the [reference].
 ///
+/// See also, [`for`], [`loop`].
+///
 /// [`for`]: keyword.for.html
 /// [`loop`]: keyword.loop.html
 /// [reference]: ../reference/expressions/loop-expr.html#predicate-loops
@@ -890,6 +897,10 @@ mod while_keyword {}
 ///
 /// For more information on `loop` and loops in general, see the [Reference].
 ///
+/// See also, [`for`], [`while`].
+///
+/// [`for`]: keyword.for.html
+/// [`while`]: keyword.while.html
 /// [Reference]: ../reference/expressions/loop-expr.html
 mod loop_keyword {}
 
@@ -976,13 +987,13 @@ mod mod_keyword {}
 /// Capture a [closure]'s environment by value.
 ///
 /// `move` converts any variables captured by reference or mutable reference
-/// to owned by value variables.
+/// to variables captured by value.
 ///
 /// ```rust
-/// let capture = "hello";
-/// let closure = move || {
-///     println!("rust says {}", capture);
-/// };
+/// let data = vec![1, 2, 3];
+/// let closure = move || println!("captured {:?} by value", data);
+///
+/// // data is no longer available, it is owned by the closure
 /// ```
 ///
 /// Note: `move` closures may still implement [`Fn`] or [`FnMut`], even though
@@ -993,38 +1004,36 @@ mod mod_keyword {}
 /// ```rust
 /// fn create_fn() -> impl Fn() {
 ///     let text = "Fn".to_owned();
-///
 ///     move || println!("This is a: {}", text)
 /// }
 ///
-///     let fn_plain = create_fn();
-///
-///     fn_plain();
+/// let fn_plain = create_fn();
+/// fn_plain();
 /// ```
 ///
 /// `move` is often used when [threads] are involved.
 ///
 /// ```rust
-/// let x = 5;
+/// let data = vec![1, 2, 3];
 ///
 /// std::thread::spawn(move || {
-///     println!("captured {} by value", x)
+///     println!("captured {:?} by value", data)
 /// }).join().unwrap();
 ///
-/// // x is no longer available
+/// // data was moved to the spawned thread, so we cannot use it here
 /// ```
 ///
 /// `move` is also valid before an async block.
 ///
 /// ```rust
-/// let capture = "hello";
+/// let capture = "hello".to_owned();
 /// let block = async move {
 ///     println!("rust says {} from async block", capture);
 /// };
 /// ```
 ///
-/// For more information on the `move` keyword, see the [closure]'s section
-/// of the Rust book or the [threads] section
+/// For more information on the `move` keyword, see the [closures][closure] section
+/// of the Rust book or the [threads] section.
 ///
 /// [closure]: ../book/ch13-01-closures.html
 /// [threads]: ../book/ch16-01-threads.html#using-move-closures-with-threads
@@ -1302,7 +1311,11 @@ mod return_keyword {}
 /// [Reference]: ../reference/items/associated-items.html#methods
 mod self_keyword {}
 
-#[doc(keyword = "Self")]
+// FIXME: Once rustdoc can handle URL conflicts on case insensitive file systems, we can remove the
+// three next lines and put back: `#[doc(keyword = "Self")]`.
+#[doc(alias = "Self")]
+#[allow(rustc::existing_doc_keyword)]
+#[doc(keyword = "SelfTy")]
 //
 /// The implementing type within a [`trait`] or [`impl`] block, or the current type within a type
 /// definition.
@@ -1753,6 +1766,7 @@ mod super_keyword {}
 /// In the 2015 edition the parameters pattern was not needed for traits:
 ///
 /// ```rust,edition2015
+/// # #![allow(anonymous_parameters)]
 /// trait Tr {
 ///     fn f(i32);
 /// }
@@ -2186,6 +2200,7 @@ mod where_keyword {}
 
 // 2018 Edition keywords
 
+#[doc(alias = "promise")]
 #[doc(keyword = "async")]
 //
 /// Return a [`Future`] instead of blocking the current thread.

@@ -1,5 +1,5 @@
 use crate::io::{self, BufWriter, IoSlice, Write};
-use crate::memchr;
+use crate::sys_common::memchr;
 
 /// Private helper struct for implementing the line-buffered writing logic.
 /// This shim temporarily wraps a BufWriter, and uses its internals to
@@ -18,6 +18,12 @@ pub struct LineWriterShim<'a, W: Write> {
 impl<'a, W: Write> LineWriterShim<'a, W> {
     pub fn new(buffer: &'a mut BufWriter<W>) -> Self {
         Self { buffer }
+    }
+
+    /// Get a reference to the inner writer (that is, the writer
+    /// wrapped by the BufWriter).
+    fn inner(&self) -> &W {
+        self.buffer.get_ref()
     }
 
     /// Get a mutable reference to the inner writer (that is, the writer
@@ -227,7 +233,7 @@ impl<'a, W: Write> Write for LineWriterShim<'a, W> {
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.buffer.is_write_vectored()
+        self.inner().is_write_vectored()
     }
 
     /// Write some data into this BufReader with line buffering. This means

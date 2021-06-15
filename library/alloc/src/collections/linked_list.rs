@@ -35,6 +35,7 @@ mod tests;
 /// array-based containers are generally faster,
 /// more memory efficient, and make better use of CPU cache.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "LinkedList")]
 pub struct LinkedList<T> {
     head: Option<NonNull<Node<T>>>,
     tail: Option<NonNull<Node<T>>>,
@@ -63,7 +64,15 @@ pub struct Iter<'a, T: 'a> {
 #[stable(feature = "collection_debug", since = "1.17.0")]
 impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Iter").field(&self.len).finish()
+        f.debug_tuple("Iter")
+            .field(&*mem::ManuallyDrop::new(LinkedList {
+                head: self.head,
+                tail: self.tail,
+                len: self.len,
+                marker: PhantomData,
+            }))
+            .field(&self.len)
+            .finish()
     }
 }
 
@@ -81,19 +90,24 @@ impl<T> Clone for Iter<'_, T> {
 /// documentation for more.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct IterMut<'a, T: 'a> {
-    // We do *not* exclusively own the entire list here, references to node's `element`
-    // have been handed out by the iterator! So be careful when using this; the methods
-    // called must be aware that there can be aliasing pointers to `element`.
-    list: &'a mut LinkedList<T>,
     head: Option<NonNull<Node<T>>>,
     tail: Option<NonNull<Node<T>>>,
     len: usize,
+    marker: PhantomData<&'a mut Node<T>>,
 }
 
 #[stable(feature = "collection_debug", since = "1.17.0")]
 impl<T: fmt::Debug> fmt::Debug for IterMut<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("IterMut").field(&self.list).field(&self.len).finish()
+        f.debug_tuple("IterMut")
+            .field(&*mem::ManuallyDrop::new(LinkedList {
+                head: self.head,
+                tail: self.tail,
+                len: self.len,
+                marker: PhantomData,
+            }))
+            .field(&self.len)
+            .finish()
     }
 }
 
@@ -441,27 +455,6 @@ impl<T> LinkedList<T> {
         }
     }
 
-    /// Moves all elements from `other` to the begin of the list.
-    #[unstable(feature = "linked_list_prepend", issue = "none")]
-    pub fn prepend(&mut self, other: &mut Self) {
-        match self.head {
-            None => mem::swap(self, other),
-            Some(mut head) => {
-                // `as_mut` is okay here because we have exclusive access to the entirety
-                // of both lists.
-                if let Some(mut other_tail) = other.tail.take() {
-                    unsafe {
-                        head.as_mut().prev = Some(other_tail);
-                        other_tail.as_mut().next = Some(head);
-                    }
-
-                    self.head = other.head.take();
-                    self.len += mem::replace(&mut other.len, 0);
-                }
-            }
-        }
-    }
-
     /// Provides a forward iterator.
     ///
     /// # Examples
@@ -513,7 +506,7 @@ impl<T> LinkedList<T> {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
-        IterMut { head: self.head, tail: self.tail, len: self.len, list: self }
+        IterMut { head: self.head, tail: self.tail, len: self.len, marker: PhantomData }
     }
 
     /// Provides a cursor at the front element.
@@ -593,6 +586,7 @@ impl<T> LinkedList<T> {
     /// dl.push_back(3);
     /// assert_eq!(dl.len(), 3);
     /// ```
+    #[doc(alias = "length")]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn len(&self) -> usize {
@@ -1098,68 +1092,6 @@ impl<T> ExactSizeIterator for IterMut<'_, T> {}
 
 #[stable(feature = "fused", since = "1.26.0")]
 impl<T> FusedIterator for IterMut<'_, T> {}
-
-impl<T> IterMut<'_, T> {
-    /// Inserts the given element just after the element most recently returned by `.next()`.
-    /// The inserted element does not appear in the iteration.
-    ///
-    /// This method will be removed soon.
-    #[inline]
-    #[unstable(
-        feature = "linked_list_extras",
-        reason = "this is probably better handled by a cursor type -- we'll see",
-        issue = "27794"
-    )]
-    #[rustc_deprecated(
-        reason = "Deprecated in favor of CursorMut methods. This method will be removed soon.",
-        since = "1.47.0"
-    )]
-    pub fn insert_next(&mut self, element: T) {
-        match self.head {
-            // `push_back` is okay with aliasing `element` references
-            None => self.list.push_back(element),
-            Some(head) => unsafe {
-                let prev = match head.as_ref().prev {
-                    // `push_front` is okay with aliasing nodes
-                    None => return self.list.push_front(element),
-                    Some(prev) => prev,
-                };
-
-                let node = Some(
-                    Box::leak(box Node { next: Some(head), prev: Some(prev), element }).into(),
-                );
-
-                // Not creating references to entire nodes to not invalidate the
-                // reference to `element` we handed to the user.
-                (*prev.as_ptr()).next = node;
-                (*head.as_ptr()).prev = node;
-
-                self.list.len += 1;
-            },
-        }
-    }
-
-    /// Provides a reference to the next element, without changing the iterator.
-    ///
-    /// This method will be removed soon.
-    #[inline]
-    #[unstable(
-        feature = "linked_list_extras",
-        reason = "this is probably better handled by a cursor type -- we'll see",
-        issue = "27794"
-    )]
-    #[rustc_deprecated(
-        reason = "Deprecated in favor of CursorMut methods. This method will be removed soon.",
-        since = "1.47.0"
-    )]
-    pub fn peek_next(&mut self) -> Option<&mut T> {
-        if self.len == 0 {
-            None
-        } else {
-            unsafe { self.head.as_mut().map(|node| &mut node.as_mut().element) }
-        }
-    }
-}
 
 /// A cursor over a `LinkedList`.
 ///

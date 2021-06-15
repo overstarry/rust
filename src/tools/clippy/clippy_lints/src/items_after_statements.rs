@@ -1,6 +1,6 @@
 //! lint when items are used after statements
 
-use crate::utils::span_lint;
+use clippy_utils::diagnostics::span_lint;
 use rustc_ast::ast::{Block, ItemKind, StmtKind};
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext};
 use rustc_middle::lint::in_external_macro;
@@ -58,12 +58,12 @@ impl EarlyLintPass for ItemsAfterStatements {
             return;
         }
 
-        // skip initial items
+        // skip initial items and trailing semicolons
         let stmts = item
             .stmts
             .iter()
             .map(|stmt| &stmt.kind)
-            .skip_while(|s| matches!(**s, StmtKind::Item(..)));
+            .skip_while(|s| matches!(**s, StmtKind::Item(..) | StmtKind::Empty));
 
         // lint on all further items
         for stmt in stmts {

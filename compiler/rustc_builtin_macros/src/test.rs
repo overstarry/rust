@@ -254,6 +254,10 @@ pub fn expand_test_or_bench(
                                         "allow_fail",
                                         cx.expr_bool(sp, should_fail(&cx.sess, &item)),
                                     ),
+                                    // compile_fail: true | false
+                                    field("compile_fail", cx.expr_bool(sp, false)),
+                                    // no_run: true | false
+                                    field("no_run", cx.expr_bool(sp, false)),
                                     // should_panic: ...
                                     field(
                                         "should_panic",
@@ -425,7 +429,7 @@ fn test_type(cx: &ExtCtxt<'_>) -> TestType {
 fn has_test_signature(cx: &ExtCtxt<'_>, i: &ast::Item) -> bool {
     let has_should_panic_attr = cx.sess.contains_name(&i.attrs, sym::should_panic);
     let sd = &cx.sess.parse_sess.span_diagnostic;
-    if let ast::ItemKind::Fn(_, ref sig, ref generics, _) = i.kind {
+    if let ast::ItemKind::Fn(box ast::FnKind(_, ref sig, ref generics, _)) = i.kind {
         if let ast::Unsafe::Yes(span) = sig.header.unsafety {
             sd.struct_span_err(i.span, "unsafe functions cannot be used for tests")
                 .span_label(span, "`unsafe` because of this")
@@ -474,7 +478,7 @@ fn has_test_signature(cx: &ExtCtxt<'_>, i: &ast::Item) -> bool {
 }
 
 fn has_bench_signature(cx: &ExtCtxt<'_>, i: &ast::Item) -> bool {
-    let has_sig = if let ast::ItemKind::Fn(_, ref sig, _, _) = i.kind {
+    let has_sig = if let ast::ItemKind::Fn(box ast::FnKind(_, ref sig, _, _)) = i.kind {
         // N.B., inadequate check, but we're running
         // well before resolve, can't get too deep.
         sig.decl.inputs.len() == 1

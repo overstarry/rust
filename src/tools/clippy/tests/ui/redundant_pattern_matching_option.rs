@@ -3,11 +3,10 @@
 #![warn(clippy::all)]
 #![warn(clippy::redundant_pattern_matching)]
 #![allow(
-    clippy::unit_arg,
     unused_must_use,
     clippy::needless_bool,
     clippy::match_like_matches_macro,
-    deprecated
+    clippy::if_same_then_else
 )]
 
 fn main() {
@@ -52,8 +51,7 @@ fn main() {
     };
 
     let opt = Some(false);
-    let x = if let Some(_) = opt { true } else { false };
-    takes_bool(x);
+    let _ = if let Some(_) = opt { true } else { false };
 
     issue6067();
 
@@ -69,8 +67,6 @@ fn main() {
 fn gen_opt() -> Option<()> {
     None
 }
-
-fn takes_bool(_: bool) {}
 
 fn foo() {}
 

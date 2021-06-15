@@ -14,6 +14,7 @@ use rustc_lint::LintStore;
 use rustc_middle::arena::Arena;
 use rustc_middle::dep_graph::DepGraph;
 use rustc_middle::ty::{GlobalCtxt, ResolverOutputs, TyCtxt};
+use rustc_query_impl::Queries as TcxQueries;
 use rustc_serialize::json;
 use rustc_session::config::{self, OutputFilenames, OutputType};
 use rustc_session::{output::find_crate_name, Session};
@@ -23,7 +24,11 @@ use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
 
 /// Represent the result of a query.
-/// This result can be stolen with the `take` method and generated with the `compute` method.
+///
+/// This result can be stolen with the [`take`] method and generated with the [`compute`] method.
+///
+/// [`take`]: Self::take
+/// [`compute`]: Self::compute
 pub struct Query<T> {
     result: RefCell<Option<Result<T>>>,
 }
@@ -67,6 +72,7 @@ impl<T> Default for Query<T> {
 pub struct Queries<'tcx> {
     compiler: &'tcx Compiler,
     gcx: OnceCell<GlobalCtxt<'tcx>>,
+    queries: OnceCell<TcxQueries<'tcx>>,
 
     arena: WorkerLocal<Arena<'tcx>>,
     hir_arena: WorkerLocal<rustc_ast_lowering::Arena<'tcx>>,
@@ -88,6 +94,7 @@ impl<'tcx> Queries<'tcx> {
         Queries {
             compiler,
             gcx: OnceCell::new(),
+            queries: OnceCell::new(),
             arena: WorkerLocal::new(|_| Arena::default()),
             hir_arena: WorkerLocal::new(|_| rustc_ast_lowering::Arena::default()),
             dep_graph_future: Default::default(),
@@ -141,7 +148,7 @@ impl<'tcx> Queries<'tcx> {
                 self.compiler.register_lints.as_deref().unwrap_or_else(|| empty),
                 krate,
                 &crate_name,
-            );
+            )?;
 
             // Compute the dependency graph (in the background). We want to do
             // this as early as possible, to give the DepGraph maximum time to
@@ -150,7 +157,7 @@ impl<'tcx> Queries<'tcx> {
             // called, which happens within passes::register_plugins().
             self.dep_graph_future().ok();
 
-            result
+            Ok(result)
         })
     }
 
@@ -200,7 +207,13 @@ impl<'tcx> Queries<'tcx> {
                                 })
                                 .open(self.session())
                         });
-                    DepGraph::new(prev_graph, prev_work_products)
+
+                    rustc_incremental::build_dep_graph(
+                        self.session(),
+                        prev_graph,
+                        prev_work_products,
+                    )
+                    .unwrap_or_else(DepGraph::new_disabled)
                 }
             })
         })
@@ -232,8 +245,7 @@ impl<'tcx> Queries<'tcx> {
         self.prepare_outputs.compute(|| {
             let expansion_result = self.expansion()?;
             let (krate, boxed_resolver, _) = &*expansion_result.peek();
-            let crate_name = self.crate_name()?;
-            let crate_name = crate_name.peek();
+            let crate_name = self.crate_name()?.peek();
             passes::prepare_outputs(
                 self.session(),
                 self.compiler,
@@ -261,6 +273,7 @@ impl<'tcx> Queries<'tcx> {
                 resolver_outputs.steal(),
                 outputs,
                 &crate_name,
+                &self.queries,
                 &self.gcx,
                 &self.arena,
             ))
@@ -271,12 +284,12 @@ impl<'tcx> Queries<'tcx> {
         self.ongoing_codegen.compute(|| {
             let outputs = self.prepare_outputs()?;
             self.global_ctxt()?.peek_mut().enter(|tcx| {
-                tcx.analysis(LOCAL_CRATE).ok();
+                tcx.analysis(()).ok();
 
                 // Don't do code generation if there were any errors
                 self.session().compile_status()?;
 
-                // Hook for compile-fail tests.
+                // Hook for UI tests.
                 Self::check_for_rustc_errors_attr(tcx);
 
                 Ok(passes::start_codegen(&***self.codegen_backend(), tcx, &*outputs.peek()))
@@ -285,15 +298,15 @@ impl<'tcx> Queries<'tcx> {
     }
 
     /// Check for the `#[rustc_error]` annotation, which forces an error in codegen. This is used
-    /// to write compile-fail tests that actually test that compilation succeeds without reporting
+    /// to write UI tests that actually test that compilation succeeds without reporting
     /// an error.
     fn check_for_rustc_errors_attr(tcx: TyCtxt<'_>) {
-        let def_id = match tcx.entry_fn(LOCAL_CRATE) {
+        let def_id = match tcx.entry_fn(()) {
             Some((def_id, _)) => def_id,
             _ => return,
         };
 
-        let attrs = &*tcx.get_attrs(def_id.to_def_id());
+        let attrs = &*tcx.get_attrs(def_id);
         let attrs = attrs.iter().filter(|attr| tcx.sess.check_name(attr, sym::rustc_error));
         for attr in attrs {
             match attr.meta_item_list() {
@@ -329,32 +342,36 @@ impl<'tcx> Queries<'tcx> {
     }
 
     pub fn linker(&'tcx self) -> Result<Linker> {
-        let dep_graph = self.dep_graph()?;
-        let prepare_outputs = self.prepare_outputs()?;
-        let crate_hash = self.global_ctxt()?.peek_mut().enter(|tcx| tcx.crate_hash(LOCAL_CRATE));
-        let ongoing_codegen = self.ongoing_codegen()?;
-
         let sess = self.session().clone();
         let codegen_backend = self.codegen_backend().clone();
 
+        let dep_graph = self.dep_graph()?.peek().clone();
+        let prepare_outputs = self.prepare_outputs()?.take();
+        let crate_hash = self.global_ctxt()?.peek_mut().enter(|tcx| tcx.crate_hash(LOCAL_CRATE));
+        let ongoing_codegen = self.ongoing_codegen()?.take();
+
         Ok(Linker {
             sess,
-            dep_graph: dep_graph.peek().clone(),
-            prepare_outputs: prepare_outputs.take(),
-            crate_hash,
-            ongoing_codegen: ongoing_codegen.take(),
             codegen_backend,
+
+            dep_graph,
+            prepare_outputs,
+            crate_hash,
+            ongoing_codegen,
         })
     }
 }
 
 pub struct Linker {
+    // compilation inputs
     sess: Lrc<Session>,
+    codegen_backend: Lrc<Box<dyn CodegenBackend>>,
+
+    // compilation outputs
     dep_graph: DepGraph,
     prepare_outputs: OutputFilenames,
     crate_hash: Svh,
     ongoing_codegen: Box<dyn Any>,
-    codegen_backend: Lrc<Box<dyn CodegenBackend>>,
 }
 
 impl Linker {
@@ -399,6 +416,7 @@ impl Linker {
             return Ok(());
         }
 
+        let _timer = sess.prof.verbose_generic_activity("link_crate");
         self.codegen_backend.link(&self.sess, codegen_results, &self.prepare_outputs)
     }
 }
@@ -412,10 +430,23 @@ impl Compiler {
         let queries = Queries::new(&self);
         let ret = f(&queries);
 
-        if self.session().opts.debugging_opts.query_stats {
-            if let Ok(gcx) = queries.global_ctxt() {
-                gcx.peek_mut().print_stats();
+        // NOTE: intentionally does not compute the global context if it hasn't been built yet,
+        // since that likely means there was a parse error.
+        if let Some(Ok(gcx)) = &mut *queries.global_ctxt.result.borrow_mut() {
+            // We assume that no queries are run past here. If there are new queries
+            // after this point, they'll show up as "<unknown>" in self-profiling data.
+            {
+                let _prof_timer =
+                    queries.session().prof.generic_activity("self_profile_alloc_query_strings");
+                gcx.enter(rustc_query_impl::alloc_self_profile_query_strings);
             }
+
+            if self.session().opts.debugging_opts.query_stats {
+                gcx.enter(rustc_query_impl::print_stats);
+            }
+
+            self.session()
+                .time("serialize_dep_graph", || gcx.enter(rustc_incremental::save_dep_graph));
         }
 
         _timer = Some(self.session().timer("free_global_ctxt"));

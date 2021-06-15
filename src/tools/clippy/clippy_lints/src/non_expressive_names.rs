@@ -1,5 +1,8 @@
-use crate::utils::{span_lint, span_lint_and_then};
-use rustc_ast::ast::{Arm, AssocItem, AssocItemKind, Attribute, Block, FnDecl, Item, ItemKind, Local, Pat, PatKind};
+use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
+use rustc_ast::ast::{
+    Arm, AssocItem, AssocItemKind, Attribute, Block, FnDecl, FnKind, Item, ItemKind, Local, Pat,
+    PatKind,
+};
 use rustc_ast::visit::{walk_block, walk_expr, walk_pat, Visitor};
 use rustc_lint::{EarlyContext, EarlyLintPass};
 use rustc_middle::lint::in_external_macro;
@@ -123,6 +126,7 @@ const ALLOWED_TO_BE_SIMILAR: &[&[&str]] = &[
     &["args", "arms"],
     &["qpath", "path"],
     &["lit", "lint"],
+    &["wparam", "lparam"],
 ];
 
 struct SimilarNamesNameVisitor<'a, 'tcx, 'b>(&'b mut SimilarNamesLocalVisitor<'a, 'tcx>);
@@ -135,7 +139,7 @@ impl<'a, 'tcx, 'b> Visitor<'tcx> for SimilarNamesNameVisitor<'a, 'tcx, 'b> {
                     self.check_ident(ident);
                 }
             },
-            PatKind::Struct(_, ref fields, _) => {
+            PatKind::Struct(_, _, ref fields, _) => {
                 for field in fields {
                     if !field.is_shorthand {
                         self.visit_pat(&field.pat);
@@ -197,6 +201,10 @@ impl<'a, 'tcx, 'b> SimilarNamesNameVisitor<'a, 'tcx, 'b> {
                 ident.span,
                 "consider choosing a more descriptive name",
             );
+            return;
+        }
+        if interned_name.starts_with('_') {
+            // these bindings are typically unused or represent an ignored portion of a destructuring pattern
             return;
         }
         let count = interned_name.chars().count();
@@ -360,7 +368,7 @@ impl EarlyLintPass for NonExpressiveNames {
             return;
         }
 
-        if let ItemKind::Fn(_, ref sig, _, Some(ref blk)) = item.kind {
+        if let ItemKind::Fn(box FnKind(_, ref sig, _, Some(ref blk))) = item.kind {
             do_check(self, cx, &item.attrs, &sig.decl, blk);
         }
     }
@@ -370,7 +378,7 @@ impl EarlyLintPass for NonExpressiveNames {
             return;
         }
 
-        if let AssocItemKind::Fn(_, ref sig, _, Some(ref blk)) = item.kind {
+        if let AssocItemKind::Fn(box FnKind(_, ref sig, _, Some(ref blk))) = item.kind {
             do_check(self, cx, &item.attrs, &sig.decl, blk);
         }
     }
@@ -409,11 +417,10 @@ fn levenstein_not_1(a_name: &str, b_name: &str) -> bool {
         if let Some(b2) = b_chars.next() {
             // check if there's just one character inserted
             return a != b2 || a_chars.ne(b_chars);
-        } else {
-            // tuple
-            // ntuple
-            return true;
         }
+        // tuple
+        // ntuple
+        return true;
     }
     // for item in items
     true
