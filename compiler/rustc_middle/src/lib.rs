@@ -23,6 +23,7 @@
 //! This API is completely unstable and subject to change.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![feature(allocator_api)]
 #![feature(array_windows)]
 #![feature(assert_matches)]
 #![feature(backtrace)]
@@ -33,6 +34,7 @@
 #![feature(discriminant_kind)]
 #![feature(never_type)]
 #![feature(extern_types)]
+#![feature(new_uninit)]
 #![feature(nll)]
 #![feature(once_cell)]
 #![feature(min_specialization)]
@@ -42,13 +44,15 @@
 #![feature(crate_visibility_modifier)]
 #![feature(associated_type_bounds)]
 #![feature(rustc_attrs)]
-#![feature(int_error_matching)]
 #![feature(half_open_range_patterns)]
 #![feature(exclusive_range_pattern)]
 #![feature(control_flow_enum)]
 #![feature(associated_type_defaults)]
 #![feature(iter_zip)]
 #![feature(thread_local_const_init)]
+#![feature(try_reserve)]
+#![feature(try_reserve_kind)]
+#![feature(nonzero_ops)]
 #![recursion_limit = "512"]
 
 #[macro_use]

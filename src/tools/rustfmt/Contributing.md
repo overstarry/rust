@@ -38,7 +38,7 @@ colourised diff will be printed so that the offending line(s) can quickly be
 identified.
 
 Without explicit settings, the tests will be run using rustfmt's default
-configuration. It is possible to run a test using non-default settings in several 
+configuration. It is possible to run a test using non-default settings in several
 ways. Firstly, you can include configuration parameters in comments at the top
 of the file. For example: to use 3 spaces per tab, start your test with
 `// rustfmt-tab_spaces: 3`. Just remember that the comment is part of the input,
@@ -65,7 +65,7 @@ and get a better grasp on the execution flow.
 
 ## Hack!
 
-Here are some [good starting issues](https://github.com/rust-lang/rustfmt/issues?q=is%3Aopen+is%3Aissue+label%3Agood-first-issue).
+Here are some [good starting issues](https://github.com/rust-lang/rustfmt/issues?q=is%3Aopen+is%3Aissue+label%3A%22good+first+issue%22).
 
 If you've found areas which need polish and don't have issues, please submit a
 PR, don't feel there needs to be an issue.
@@ -138,8 +138,8 @@ format.
 
 There are different nodes for every kind of item and expression in Rust. For
 more details see the source code in the compiler -
-[ast.rs](https://dxr.mozilla.org/rust/source/src/libsyntax/ast.rs) - and/or the
-[docs](https://doc.rust-lang.org/nightly/nightly-rustc/syntax/ast/index.html).
+[ast.rs](https://github.com/rust-lang/rust/blob/master/compiler/rustc_ast/src/ast.rs) - and/or the
+[docs](https://doc.rust-lang.org/nightly/nightly-rustc/rustc_ast/ast/index.html).
 
 Many nodes in the AST (but not all, annoyingly) have a `Span`. A `Span` is a
 range in the source code, it can easily be converted to a snippet of source

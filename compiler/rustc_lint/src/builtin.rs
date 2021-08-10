@@ -1,5 +1,3 @@
-// ignore-tidy-filelength
-
 //! Lints in the Rust compiler.
 //!
 //! This contains lints which can feasibly be implemented as their own
@@ -38,7 +36,7 @@ use rustc_feature::{deprecated_attributes, AttributeGate, AttributeTemplate, Att
 use rustc_feature::{GateIssue, Stability};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdSet};
+use rustc_hir::def_id::{DefId, LocalDefId, LocalDefIdSet, CRATE_DEF_ID};
 use rustc_hir::{ForeignItemKind, GenericParamKind, PatKind};
 use rustc_hir::{HirId, Node};
 use rustc_index::vec::Idx;
@@ -47,6 +45,7 @@ use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::subst::{GenericArgKind, Subst};
 use rustc_middle::ty::Instance;
 use rustc_middle::ty::{self, layout::LayoutError, Ty, TyCtxt};
+use rustc_session::lint::FutureIncompatibilityReason;
 use rustc_session::Session;
 use rustc_span::edition::Edition;
 use rustc_span::source_map::Spanned;
@@ -510,7 +509,7 @@ impl MissingDoc {
     fn check_missing_docs_attrs(
         &self,
         cx: &LateContext<'_>,
-        id: hir::HirId,
+        def_id: LocalDefId,
         sp: Span,
         article: &'static str,
         desc: &'static str,
@@ -529,13 +528,13 @@ impl MissingDoc {
         // Only check publicly-visible items, using the result from the privacy pass.
         // It's an option so the crate root can also use this function (it doesn't
         // have a `NodeId`).
-        if id != hir::CRATE_HIR_ID {
-            if !cx.access_levels.is_exported(id) {
+        if def_id != CRATE_DEF_ID {
+            if !cx.access_levels.is_exported(def_id) {
                 return;
             }
         }
 
-        let attrs = cx.tcx.hir().attrs(id);
+        let attrs = cx.tcx.get_attrs(def_id.to_def_id());
         let has_doc = attrs.iter().any(|a| has_doc(cx.sess(), a));
         if !has_doc {
             cx.struct_span_lint(
@@ -567,9 +566,15 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
     }
 
     fn check_crate(&mut self, cx: &LateContext<'_>, krate: &hir::Crate<'_>) {
-        self.check_missing_docs_attrs(cx, hir::CRATE_HIR_ID, krate.item.inner, "the", "crate");
+        self.check_missing_docs_attrs(cx, CRATE_DEF_ID, krate.module().inner, "the", "crate");
 
-        for macro_def in krate.exported_macros {
+        for macro_def in krate.exported_macros() {
+            // Non exported macros should be skipped, since `missing_docs` only
+            // applies to externally visible items.
+            if !cx.access_levels.is_exported(macro_def.def_id) {
+                continue;
+            }
+
             let attrs = cx.tcx.hir().attrs(macro_def.hir_id());
             let has_doc = attrs.iter().any(|a| has_doc(cx.sess(), a));
             if !has_doc {
@@ -625,7 +630,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
 
         let (article, desc) = cx.tcx.article_and_description(it.def_id.to_def_id());
 
-        self.check_missing_docs_attrs(cx, it.hir_id(), it.span, article, desc);
+        self.check_missing_docs_attrs(cx, it.def_id, it.span, article, desc);
     }
 
     fn check_trait_item(&mut self, cx: &LateContext<'_>, trait_item: &hir::TraitItem<'_>) {
@@ -635,7 +640,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
 
         let (article, desc) = cx.tcx.article_and_description(trait_item.def_id.to_def_id());
 
-        self.check_missing_docs_attrs(cx, trait_item.hir_id(), trait_item.span, article, desc);
+        self.check_missing_docs_attrs(cx, trait_item.def_id, trait_item.span, article, desc);
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'_>, impl_item: &hir::ImplItem<'_>) {
@@ -645,22 +650,23 @@ impl<'tcx> LateLintPass<'tcx> for MissingDoc {
         }
 
         let (article, desc) = cx.tcx.article_and_description(impl_item.def_id.to_def_id());
-        self.check_missing_docs_attrs(cx, impl_item.hir_id(), impl_item.span, article, desc);
+        self.check_missing_docs_attrs(cx, impl_item.def_id, impl_item.span, article, desc);
     }
 
     fn check_foreign_item(&mut self, cx: &LateContext<'_>, foreign_item: &hir::ForeignItem<'_>) {
         let (article, desc) = cx.tcx.article_and_description(foreign_item.def_id.to_def_id());
-        self.check_missing_docs_attrs(cx, foreign_item.hir_id(), foreign_item.span, article, desc);
+        self.check_missing_docs_attrs(cx, foreign_item.def_id, foreign_item.span, article, desc);
     }
 
     fn check_field_def(&mut self, cx: &LateContext<'_>, sf: &hir::FieldDef<'_>) {
         if !sf.is_positional() {
-            self.check_missing_docs_attrs(cx, sf.hir_id, sf.span, "a", "struct field")
+            let def_id = cx.tcx.hir().local_def_id(sf.hir_id);
+            self.check_missing_docs_attrs(cx, def_id, sf.span, "a", "struct field")
         }
     }
 
     fn check_variant(&mut self, cx: &LateContext<'_>, v: &hir::Variant<'_>) {
-        self.check_missing_docs_attrs(cx, v.id, v.span, "a", "variant");
+        self.check_missing_docs_attrs(cx, cx.tcx.hir().local_def_id(v.id), v.span, "a", "variant");
     }
 }
 
@@ -702,7 +708,7 @@ declare_lint_pass!(MissingCopyImplementations => [MISSING_COPY_IMPLEMENTATIONS])
 
 impl<'tcx> LateLintPass<'tcx> for MissingCopyImplementations {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &hir::Item<'_>) {
-        if !cx.access_levels.is_reachable(item.hir_id()) {
+        if !cx.access_levels.is_reachable(item.def_id) {
             return;
         }
         let (def, ty) = match item.kind {
@@ -789,7 +795,7 @@ impl_lint_pass!(MissingDebugImplementations => [MISSING_DEBUG_IMPLEMENTATIONS]);
 
 impl<'tcx> LateLintPass<'tcx> for MissingDebugImplementations {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &hir::Item<'_>) {
-        if !cx.access_levels.is_reachable(item.hir_id()) {
+        if !cx.access_levels.is_reachable(item.def_id) {
             return;
         }
 
@@ -874,7 +880,7 @@ declare_lint! {
     "detects anonymous parameters",
     @future_incompatible = FutureIncompatibleInfo {
         reference: "issue #41686 <https://github.com/rust-lang/rust/issues/41686>",
-        edition: Some(Edition::Edition2018),
+        reason: FutureIncompatibilityReason::EditionError(Edition::Edition2018),
     };
 }
 
@@ -983,13 +989,16 @@ impl EarlyLintPass for DeprecatedAttr {
 }
 
 fn warn_if_doc(cx: &EarlyContext<'_>, node_span: Span, node_kind: &str, attrs: &[ast::Attribute]) {
+    use rustc_ast::token::CommentKind;
+
     let mut attrs = attrs.iter().peekable();
 
     // Accumulate a single span for sugared doc comments.
     let mut sugared_span: Option<Span> = None;
 
     while let Some(attr) = attrs.next() {
-        if attr.is_doc_comment() {
+        let is_doc_comment = attr.is_doc_comment();
+        if is_doc_comment {
             sugared_span =
                 Some(sugared_span.map_or(attr.span, |span| span.with_hi(attr.span.hi())));
         }
@@ -1000,13 +1009,21 @@ fn warn_if_doc(cx: &EarlyContext<'_>, node_span: Span, node_kind: &str, attrs: &
 
         let span = sugared_span.take().unwrap_or(attr.span);
 
-        if attr.is_doc_comment() || cx.sess().check_name(attr, sym::doc) {
+        if is_doc_comment || cx.sess().check_name(attr, sym::doc) {
             cx.struct_span_lint(UNUSED_DOC_COMMENTS, span, |lint| {
                 let mut err = lint.build("unused doc comment");
                 err.span_label(
                     node_span,
                     format!("rustdoc does not generate documentation for {}", node_kind),
                 );
+                match attr.kind {
+                    AttrKind::DocComment(CommentKind::Line, _) | AttrKind::Normal(..) => {
+                        err.help("use `//` for a plain comment");
+                    }
+                    AttrKind::DocComment(CommentKind::Block, _) => {
+                        err.help("use `/* */` for a plain comment");
+                    }
+                }
                 err.emit();
             });
         }
@@ -1083,7 +1100,7 @@ declare_lint! {
     ///
     /// ### Explanation
     ///
-    /// An function with generics must have its symbol mangled to accommodate
+    /// A function with generics must have its symbol mangled to accommodate
     /// the generic parameter. The [`no_mangle` attribute] has no effect in
     /// this situation, and should be removed.
     ///
@@ -1296,14 +1313,14 @@ impl UnreachablePub {
         &self,
         cx: &LateContext<'_>,
         what: &str,
-        id: hir::HirId,
+        def_id: LocalDefId,
         vis: &hir::Visibility<'_>,
         span: Span,
         exportable: bool,
     ) {
         let mut applicability = Applicability::MachineApplicable;
         match vis.node {
-            hir::VisibilityKind::Public if !cx.access_levels.is_reachable(id) => {
+            hir::VisibilityKind::Public if !cx.access_levels.is_reachable(def_id) => {
                 if span.from_expansion() {
                     applicability = Applicability::MaybeIncorrect;
                 }
@@ -1336,14 +1353,14 @@ impl UnreachablePub {
 
 impl<'tcx> LateLintPass<'tcx> for UnreachablePub {
     fn check_item(&mut self, cx: &LateContext<'_>, item: &hir::Item<'_>) {
-        self.perform_lint(cx, "item", item.hir_id(), &item.vis, item.span, true);
+        self.perform_lint(cx, "item", item.def_id, &item.vis, item.span, true);
     }
 
     fn check_foreign_item(&mut self, cx: &LateContext<'_>, foreign_item: &hir::ForeignItem<'tcx>) {
         self.perform_lint(
             cx,
             "item",
-            foreign_item.hir_id(),
+            foreign_item.def_id,
             &foreign_item.vis,
             foreign_item.span,
             true,
@@ -1351,11 +1368,12 @@ impl<'tcx> LateLintPass<'tcx> for UnreachablePub {
     }
 
     fn check_field_def(&mut self, cx: &LateContext<'_>, field: &hir::FieldDef<'_>) {
-        self.perform_lint(cx, "field", field.hir_id, &field.vis, field.span, false);
+        let def_id = cx.tcx.hir().local_def_id(field.hir_id);
+        self.perform_lint(cx, "field", def_id, &field.vis, field.span, false);
     }
 
     fn check_impl_item(&mut self, cx: &LateContext<'_>, impl_item: &hir::ImplItem<'_>) {
-        self.perform_lint(cx, "item", impl_item.hir_id(), &impl_item.vis, impl_item.span, false);
+        self.perform_lint(cx, "item", impl_item.def_id, &impl_item.vis, impl_item.span, false);
     }
 }
 
@@ -1663,7 +1681,7 @@ declare_lint! {
     "`...` range patterns are deprecated",
     @future_incompatible = FutureIncompatibleInfo {
         reference: "issue #80165 <https://github.com/rust-lang/rust/issues/80165>",
-        edition: Some(Edition::Edition2021),
+        reason: FutureIncompatibilityReason::EditionError(Edition::Edition2021),
     };
 }
 
@@ -1891,7 +1909,7 @@ declare_lint! {
     "detects edition keywords being used as an identifier",
     @future_incompatible = FutureIncompatibleInfo {
         reference: "issue #49716 <https://github.com/rust-lang/rust/issues/49716>",
-        edition: Some(Edition::Edition2018),
+        reason: FutureIncompatibilityReason::EditionError(Edition::Edition2018),
     };
 }
 
@@ -2297,7 +2315,7 @@ declare_lint! {
     /// ### Example
     ///
     /// ```rust
-    /// #![feature(generic_associated_types)]
+    /// #![feature(const_generics)]
     /// ```
     ///
     /// {{produces}}
@@ -2326,7 +2344,7 @@ impl EarlyLintPass for IncompleteFeatures {
             .iter()
             .map(|(name, span, _)| (name, span))
             .chain(features.declared_lib_features.iter().map(|(name, span)| (name, span)))
-            .filter(|(name, _)| rustc_feature::INCOMPLETE_FEATURES.iter().any(|f| name == &f))
+            .filter(|(&name, _)| features.incomplete(name))
             .for_each(|(&name, &span)| {
                 cx.struct_span_lint(INCOMPLETE_FEATURES, span, |lint| {
                     let mut builder = lint.build(&format!(

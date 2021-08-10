@@ -12,24 +12,23 @@ use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::sym;
 
 declare_clippy_lint! {
-    /// **What it does:**
+    /// ### What it does
     /// Lints usage of `if let Some(v) = ... { y } else { x }` which is more
     /// idiomatically done with `Option::map_or` (if the else bit is a pure
     /// expression) or `Option::map_or_else` (if the else bit is an impure
     /// expression).
     ///
-    /// **Why is this bad?**
+    /// ### Why is this bad?
     /// Using the dedicated functions of the Option type is clearer and
     /// more concise than an `if let` expression.
     ///
-    /// **Known problems:**
+    /// ### Known problems
     /// This lint uses a deliberately conservative metric for checking
     /// if the inside of either body contains breaks or continues which will
     /// cause it to not suggest a fix if either block contains a loop with
     /// continues or breaks contained within the loop.
     ///
-    /// **Example:**
-    ///
+    /// ### Example
     /// ```rust
     /// # let optional: Option<u32> = Some(0);
     /// # fn do_complicated_function() -> u32 { 5 };
@@ -132,7 +131,7 @@ fn detect_option_if_let_else<'tcx>(
         if !is_else_clause(cx.tcx, expr);
         if arms.len() == 2;
         if !is_result_ok(cx, cond_expr); // Don't lint on Result::ok because a different lint does it already
-        if let PatKind::TupleStruct(struct_qpath, &[inner_pat], _) = &arms[0].pat.kind;
+        if let PatKind::TupleStruct(struct_qpath, [inner_pat], _) = &arms[0].pat.kind;
         if is_lang_ctor(cx, struct_qpath, OptionSome);
         if let PatKind::Binding(bind_annotation, _, id, _) = &inner_pat.kind;
         if !contains_return_break_continue_macro(arms[0].body);

@@ -1107,8 +1107,7 @@ impl<'a> Parser<'a> {
                 e
             })?;
 
-        let enum_definition =
-            EnumDef { variants: variants.into_iter().filter_map(|v| v).collect() };
+        let enum_definition = EnumDef { variants: variants.into_iter().flatten().collect() };
         Ok((id, ItemKind::Enum(enum_definition, generics)))
     }
 
@@ -1143,7 +1142,7 @@ impl<'a> Parser<'a> {
                     ident,
                     vis,
                     id: DUMMY_NODE_ID,
-                    attrs: variant_attrs,
+                    attrs: variant_attrs.into(),
                     data: struct_def,
                     disr_expr,
                     span: vlo.to(this.prev_token.span),
@@ -1286,7 +1285,7 @@ impl<'a> Parser<'a> {
                         ident: None,
                         id: DUMMY_NODE_ID,
                         ty,
-                        attrs,
+                        attrs: attrs.into(),
                         is_placeholder: false,
                     },
                     TrailingToken::MaybeComma,
@@ -1460,7 +1459,7 @@ impl<'a> Parser<'a> {
             vis,
             id: DUMMY_NODE_ID,
             ty,
-            attrs,
+            attrs: attrs.into(),
             is_placeholder: false,
         })
     }
@@ -1715,13 +1714,11 @@ impl<'a> Parser<'a> {
                     // the AST for typechecking.
                     err.span_label(ident.span, "while parsing this `fn`");
                     err.emit();
-                    (Vec::new(), None)
                 } else {
                     return Err(err);
                 }
-            } else {
-                unreachable!()
             }
+            (Vec::new(), None)
         };
         attrs.extend(inner_attrs);
         Ok(body)
@@ -1771,8 +1768,14 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_fn_front_matter(&mut self) -> PResult<'a, FnHeader> {
         let sp_start = self.token.span;
         let constness = self.parse_constness();
+
+        let async_start_sp = self.token.span;
         let asyncness = self.parse_asyncness();
+
+        let unsafe_start_sp = self.token.span;
         let unsafety = self.parse_unsafety();
+
+        let ext_start_sp = self.token.span;
         let ext = self.parse_extern();
 
         if let Async::Yes { span, .. } = asyncness {
@@ -1787,11 +1790,44 @@ impl<'a> Parser<'a> {
                 Ok(true) => {}
                 Ok(false) => unreachable!(),
                 Err(mut err) => {
+                    // Qualifier keywords ordering check
+
+                    // This will allow the machine fix to directly place the keyword in the correct place
+                    let current_qual_sp = if self.check_keyword(kw::Const) {
+                        Some(async_start_sp)
+                    } else if self.check_keyword(kw::Async) {
+                        Some(unsafe_start_sp)
+                    } else if self.check_keyword(kw::Unsafe) {
+                        Some(ext_start_sp)
+                    } else {
+                        None
+                    };
+
+                    if let Some(current_qual_sp) = current_qual_sp {
+                        let current_qual_sp = current_qual_sp.to(self.prev_token.span);
+                        if let Ok(current_qual) = self.span_to_snippet(current_qual_sp) {
+                            let invalid_qual_sp = self.token.uninterpolated_span();
+                            let invalid_qual = self.span_to_snippet(invalid_qual_sp).unwrap();
+
+                            err.span_suggestion(
+                                current_qual_sp.to(invalid_qual_sp),
+                                &format!("`{}` must come before `{}`", invalid_qual, current_qual),
+                                format!("{} {}", invalid_qual, current_qual),
+                                Applicability::MachineApplicable,
+                            ).note("keyword order for functions declaration is `default`, `pub`, `const`, `async`, `unsafe`, `extern`");
+                        }
+                    }
                     // Recover incorrect visibility order such as `async pub`.
-                    if self.check_keyword(kw::Pub) {
+                    else if self.check_keyword(kw::Pub) {
                         let sp = sp_start.to(self.prev_token.span);
                         if let Ok(snippet) = self.span_to_snippet(sp) {
-                            let vis = self.parse_visibility(FollowedByType::No)?;
+                            let vis = match self.parse_visibility(FollowedByType::No) {
+                                Ok(v) => v,
+                                Err(mut d) => {
+                                    d.cancel();
+                                    return Err(err);
+                                }
+                            };
                             let vs = pprust::vis_to_string(&vis);
                             let vs = vs.trim_end();
                             err.span_suggestion(

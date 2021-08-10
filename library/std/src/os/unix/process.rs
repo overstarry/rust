@@ -83,7 +83,7 @@ pub trait CommandExt: Sealed {
     ///
     /// When this closure is run, aspects such as the stdio file descriptors and
     /// working directory have successfully been changed, so output to these
-    /// locations may not appear where intended.
+    /// locations might not appear where intended.
     ///
     /// [POSIX fork() specification]:
     ///     https://pubs.opengroup.org/onlinepubs/9699919799/functions/fork.html
@@ -226,7 +226,7 @@ pub trait ExitStatusExt: Sealed {
     ///
     /// Panics on an attempt to make an `ExitStatusError` from a wait status of `0`.
     ///
-    /// Making an `ExitStatus` always succeds and never panics.
+    /// Making an `ExitStatus` always succeeds and never panics.
     #[stable(feature = "exit_status_from", since = "1.12.0")]
     fn from_raw(raw: i32) -> Self;
 

@@ -276,13 +276,16 @@ language_item_table! {
     // is required to define it somewhere. Additionally, there are restrictions on crates that use
     // a weak lang item, but do not have it defined.
     Panic,                   sym::panic,               panic_fn,                   Target::Fn;
+    PanicFmt,                sym::panic_fmt,           panic_fmt,                  Target::Fn;
     PanicStr,                sym::panic_str,           panic_str,                  Target::Fn;
+    ConstPanicFmt,           sym::const_panic_fmt,     const_panic_fmt,            Target::Fn;
     PanicBoundsCheck,        sym::panic_bounds_check,  panic_bounds_check_fn,      Target::Fn;
     PanicInfo,               sym::panic_info,          panic_info,                 Target::Struct;
     PanicLocation,           sym::panic_location,      panic_location,             Target::Struct;
     PanicImpl,               sym::panic_impl,          panic_impl,                 Target::Fn;
     /// libstd panic entry point. Necessary for const eval to be able to catch it
     BeginPanic,              sym::begin_panic,         begin_panic_fn,             Target::Fn;
+    BeginPanicFmt,           sym::begin_panic_fmt,     begin_panic_fmt,            Target::Fn;
 
     ExchangeMalloc,          sym::exchange_malloc,     exchange_malloc_fn,         Target::Fn;
     BoxFree,                 sym::box_free,            box_free_fn,                Target::Fn;
@@ -309,6 +312,8 @@ language_item_table! {
     Termination,             sym::termination,         termination,                Target::Trait;
 
     Try,                     sym::Try,                 try_trait,                  Target::Trait;
+
+    SliceLen,                sym::slice_len_fn,        slice_len_fn,               Target::Method(MethodKind::Inherent);
 
     // Language items from AST lowering
     TryTraitFromResidual,    sym::from_residual,       from_residual_fn,           Target::Method(MethodKind::Trait { body: false });
@@ -346,7 +351,4 @@ language_item_table! {
     Range,                   sym::Range,               range_struct,               Target::Struct;
     RangeToInclusive,        sym::RangeToInclusive,    range_to_inclusive_struct,  Target::Struct;
     RangeTo,                 sym::RangeTo,             range_to_struct,            Target::Struct;
-    Send,                    sym::send,                send_trait,                 Target::Trait;
-    UnwindSafe,              sym::unwind_safe,         unwind_safe_trait,          Target::Trait;
-    RefUnwindSafe,           sym::ref_unwind_safe,     ref_unwind_safe_trait,      Target::Trait;
 }

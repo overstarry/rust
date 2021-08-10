@@ -167,7 +167,7 @@ type BoxedNode<K, V> = NonNull<LeafNode<K, V>>;
 ///   carry a lifetime, because we want it to return `&'a` references.
 ///   Therefore, we define it only for the least powerful type `Immut<'a>`.
 /// - We cannot get implicit coercion from say `Mut<'a>` to `Immut<'a>`.
-///   Therefore, we have to explicitly call `reborrow` on a more powerfull
+///   Therefore, we have to explicitly call `reborrow` on a more powerful
 ///   `NodeRef` in order to reach a method like `into_kv`.
 ///
 /// All methods on `NodeRef` that return some kind of reference, either:
@@ -409,7 +409,7 @@ impl<K, V> NodeRef<marker::Dying, K, V, marker::LeafOrInternal> {
 
 impl<'a, K, V, Type> NodeRef<marker::Mut<'a>, K, V, Type> {
     /// Temporarily takes out another mutable reference to the same node. Beware, as
-    /// this method is very dangerous, doubly so since it may not immediately appear
+    /// this method is very dangerous, doubly so since it might not immediately appear
     /// dangerous.
     ///
     /// Because mutable pointers can roam anywhere around the tree, the returned
@@ -777,7 +777,7 @@ impl<BorrowType, K, V, NodeType, HandleType>
 
 impl<'a, K, V, NodeType, HandleType> Handle<NodeRef<marker::Mut<'a>, K, V, NodeType>, HandleType> {
     /// Temporarily takes out another mutable handle on the same location. Beware, as
-    /// this method is very dangerous, doubly so since it may not immediately appear
+    /// this method is very dangerous, doubly so since it might not immediately appear
     /// dangerous.
     ///
     /// For details, see `NodeRef::reborrow_mut`.

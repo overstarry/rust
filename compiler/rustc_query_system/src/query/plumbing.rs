@@ -9,7 +9,7 @@ use crate::query::config::{QueryDescription, QueryVtable, QueryVtableExt};
 use crate::query::job::{
     report_cycle, QueryInfo, QueryJob, QueryJobId, QueryJobInfo, QueryShardJobId,
 };
-use crate::query::{QueryContext, QueryMap, QueryStackFrame};
+use crate::query::{QueryContext, QueryMap, QuerySideEffects, QueryStackFrame};
 
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxHasher};
@@ -428,6 +428,7 @@ fn try_execute_query<CTX, C>(
     key: C::Key,
     lookup: QueryLookup,
     query: &QueryVtable<CTX, C::Key, C::Value>,
+    compute: fn(CTX::DepContext, C::Key) -> C::Value,
 ) -> C::Stored
 where
     C: QueryCache,
@@ -457,7 +458,7 @@ where
     // Fast path for when incr. comp. is off.
     if !dep_graph.is_fully_enabled() {
         let prof_timer = tcx.dep_context().profiler().query_provider();
-        let result = tcx.start_query(job.id, None, || query.compute(tcx, key));
+        let result = tcx.start_query(job.id, None, || compute(*tcx.dep_context(), key));
         let dep_node_index = dep_graph.next_virtual_depnode_index();
         prof_timer.finish_with_query_invocation_id(dep_node_index.into());
         return job.complete(result, dep_node_index);
@@ -468,8 +469,9 @@ where
 
         let ((result, dep_node_index), diagnostics) = with_diagnostics(|diagnostics| {
             tcx.start_query(job.id, diagnostics, || {
-                dep_graph
-                    .with_anon_task(*tcx.dep_context(), query.dep_kind, || query.compute(tcx, key))
+                dep_graph.with_anon_task(*tcx.dep_context(), query.dep_kind, || {
+                    compute(*tcx.dep_context(), key)
+                })
             })
         });
 
@@ -477,8 +479,10 @@ where
 
         dep_graph.read_index(dep_node_index);
 
-        if unlikely!(!diagnostics.is_empty()) {
-            tcx.store_diagnostics_for_anon_node(dep_node_index, diagnostics);
+        let side_effects = QuerySideEffects { diagnostics };
+
+        if unlikely!(!side_effects.is_empty()) {
+            tcx.store_side_effects_for_anon_node(dep_node_index, side_effects);
         }
 
         return job.complete(result, dep_node_index);
@@ -501,6 +505,7 @@ where
                         dep_node_index,
                         &dep_node,
                         query,
+                        compute,
                     ),
                     dep_node_index,
                 )
@@ -511,7 +516,7 @@ where
         }
     }
 
-    let (result, dep_node_index) = force_query_with_job(tcx, key, job, dep_node, query);
+    let (result, dep_node_index) = force_query_with_job(tcx, key, job, dep_node, query, compute);
     dep_graph.read_index(dep_node_index);
     result
 }
@@ -523,6 +528,7 @@ fn load_from_disk_and_cache_in_memory<CTX, K, V: Debug>(
     dep_node_index: DepNodeIndex,
     dep_node: &DepNode<CTX::DepKind>,
     query: &QueryVtable<CTX, K, V>,
+    compute: fn(CTX::DepContext, K) -> V,
 ) -> V
 where
     CTX: QueryContext,
@@ -565,7 +571,7 @@ where
         let prof_timer = tcx.dep_context().profiler().query_provider();
 
         // The dep-graph for this computation is already in-place.
-        let result = tcx.dep_context().dep_graph().with_ignore(|| query.compute(tcx, key));
+        let result = tcx.dep_context().dep_graph().with_ignore(|| compute(*tcx.dep_context(), key));
 
         prof_timer.finish_with_query_invocation_id(dep_node_index.into());
 
@@ -614,8 +620,8 @@ fn incremental_verify_ich<CTX, K, V: Debug>(
         };
         tcx.sess().struct_err(&format!("internal compiler error: encountered incremental compilation error with {:?}", dep_node))
             .help(&format!("This is a known issue with the compiler. Run {} to allow your project to compile", run_cmd))
-            .note(&format!("Please follow the instructions below to create a bug report with the provided information"))
-            .note(&format!("See <https://github.com/rust-lang/rust/issues/84970> for more information"))
+            .note(&"Please follow the instructions below to create a bug report with the provided information")
+            .note(&"See <https://github.com/rust-lang/rust/issues/84970> for more information")
             .emit();
         panic!("Found unstable fingerprints for {:?}: {:?}", dep_node, result);
     }
@@ -627,6 +633,7 @@ fn force_query_with_job<C, CTX>(
     job: JobOwner<'_, CTX::DepKind, C>,
     dep_node: DepNode<CTX::DepKind>,
     query: &QueryVtable<CTX, C::Key, C::Value>,
+    compute: fn(CTX::DepContext, C::Key) -> C::Value,
 ) -> (C::Stored, DepNodeIndex)
 where
     C: QueryCache,
@@ -653,17 +660,17 @@ where
             if query.eval_always {
                 tcx.dep_context().dep_graph().with_eval_always_task(
                     dep_node,
-                    tcx,
+                    *tcx.dep_context(),
                     key,
-                    query.compute,
+                    compute,
                     query.hash_result,
                 )
             } else {
                 tcx.dep_context().dep_graph().with_task(
                     dep_node,
-                    tcx,
+                    *tcx.dep_context(),
                     key,
-                    query.compute,
+                    compute,
                     query.hash_result,
                 )
             }
@@ -672,8 +679,10 @@ where
 
     prof_timer.finish_with_query_invocation_id(dep_node_index.into());
 
-    if unlikely!(!diagnostics.is_empty()) && dep_node.kind != DepKind::NULL {
-        tcx.store_diagnostics(dep_node_index, diagnostics);
+    let side_effects = QuerySideEffects { diagnostics };
+
+    if unlikely!(!side_effects.is_empty()) && dep_node.kind != DepKind::NULL {
+        tcx.store_side_effects(dep_node_index, side_effects);
     }
 
     let result = job.complete(result, dep_node_index);
@@ -690,13 +699,14 @@ fn get_query_impl<CTX, C>(
     key: C::Key,
     lookup: QueryLookup,
     query: &QueryVtable<CTX, C::Key, C::Value>,
+    compute: fn(CTX::DepContext, C::Key) -> C::Value,
 ) -> C::Stored
 where
     CTX: QueryContext,
     C: QueryCache,
     C::Key: DepNodeParams<CTX::DepContext>,
 {
-    try_execute_query(tcx, state, cache, span, key, lookup, query)
+    try_execute_query(tcx, state, cache, span, key, lookup, query, compute)
 }
 
 /// Ensure that either this query has all green inputs or been executed.
@@ -744,8 +754,10 @@ fn force_query_impl<CTX, C>(
     tcx: CTX,
     state: &QueryState<CTX::DepKind, C::Key>,
     cache: &QueryCacheStore<C>,
+    key: C::Key,
     dep_node: DepNode<CTX::DepKind>,
     query: &QueryVtable<CTX, C::Key, C::Value>,
+    compute: fn(CTX::DepContext, C::Key) -> C::Value,
 ) -> bool
 where
     C: QueryCache,
@@ -753,18 +765,6 @@ where
     CTX: QueryContext,
 {
     debug_assert!(!query.anon);
-
-    if !<C::Key as DepNodeParams<CTX::DepContext>>::can_reconstruct_query_key() {
-        return false;
-    }
-
-    let key = if let Some(key) =
-        <C::Key as DepNodeParams<CTX::DepContext>>::recover(*tcx.dep_context(), &dep_node)
-    {
-        key
-    } else {
-        return false;
-    };
 
     // We may be concurrently trying both execute and force a query.
     // Ensure that only one of them runs the query.
@@ -798,7 +798,7 @@ where
         TryGetJob::JobCompleted(_) => return true,
     };
 
-    force_query_with_job(tcx, key, job, dep_node, query);
+    force_query_with_job(tcx, key, job, dep_node, query, compute);
 
     true
 }
@@ -828,8 +828,17 @@ where
     }
 
     debug!("ty::query::get_query<{}>(key={:?}, span={:?})", Q::NAME, key, span);
-    let value =
-        get_query_impl(tcx, Q::query_state(tcx), Q::query_cache(tcx), span, key, lookup, query);
+    let compute = Q::compute_fn(tcx, &key);
+    let value = get_query_impl(
+        tcx,
+        Q::query_state(tcx),
+        Q::query_cache(tcx),
+        span,
+        key,
+        lookup,
+        query,
+        compute,
+    );
     Some(value)
 }
 
@@ -843,5 +852,26 @@ where
         return false;
     }
 
-    force_query_impl(tcx, Q::query_state(tcx), Q::query_cache(tcx), *dep_node, &Q::VTABLE)
+    if !<Q::Key as DepNodeParams<CTX::DepContext>>::can_reconstruct_query_key() {
+        return false;
+    }
+
+    let key = if let Some(key) =
+        <Q::Key as DepNodeParams<CTX::DepContext>>::recover(*tcx.dep_context(), &dep_node)
+    {
+        key
+    } else {
+        return false;
+    };
+
+    let compute = Q::compute_fn(tcx, &key);
+    force_query_impl(
+        tcx,
+        Q::query_state(tcx),
+        Q::query_cache(tcx),
+        key,
+        *dep_node,
+        &Q::VTABLE,
+        compute,
+    )
 }

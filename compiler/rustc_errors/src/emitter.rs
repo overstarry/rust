@@ -9,7 +9,6 @@
 
 use Destination::*;
 
-use rustc_lint_defs::FutureBreakage;
 use rustc_span::source_map::SourceMap;
 use rustc_span::{MultiSpan, SourceFile, Span};
 
@@ -193,7 +192,7 @@ pub trait Emitter {
     /// other formats can, and will, simply ignore it.
     fn emit_artifact_notification(&mut self, _path: &Path, _artifact_type: &str) {}
 
-    fn emit_future_breakage_report(&mut self, _diags: Vec<(FutureBreakage, Diagnostic)>) {}
+    fn emit_future_breakage_report(&mut self, _diags: Vec<Diagnostic>) {}
 
     /// Emit list of unused externs
     fn emit_unused_externs(&mut self, _lint_level: &str, _unused_externs: &[&str]) {}
@@ -309,9 +308,7 @@ pub trait Emitter {
                     // are some which do actually involve macros.
                     ExpnKind::Inlined | ExpnKind::Desugaring(..) | ExpnKind::AstPass(..) => None,
 
-                    ExpnKind::Macro { kind: macro_kind, name, proc_macro: _ } => {
-                        Some((macro_kind, name))
-                    }
+                    ExpnKind::Macro(macro_kind, name) => Some((macro_kind, name)),
                 }
             });
 
@@ -368,23 +365,11 @@ pub trait Emitter {
                     continue;
                 }
 
-                if matches!(trace.kind, ExpnKind::Inlined) {
-                    new_labels
-                        .push((trace.call_site, "in the inlined copy of this code".to_string()));
-                } else if always_backtrace {
-                    let proc_macro = if let ExpnKind::Macro { kind: _, name: _, proc_macro: true } =
-                        trace.kind
-                    {
-                        "procedural macro "
-                    } else {
-                        ""
-                    };
-
+                if always_backtrace && !matches!(trace.kind, ExpnKind::Inlined) {
                     new_labels.push((
                         trace.def_site,
                         format!(
-                            "in this expansion of {}`{}`{}",
-                            proc_macro,
+                            "in this expansion of `{}`{}",
                             trace.kind.descr(),
                             if macro_backtrace.len() > 1 {
                                 // if macro_backtrace.len() == 1 it'll be
@@ -410,17 +395,27 @@ pub trait Emitter {
                 // and it needs an "in this macro invocation" label to match that.
                 let redundant_span = trace.call_site.contains(sp);
 
-                if !redundant_span
-                    && matches!(
-                        trace.kind,
-                        ExpnKind::Macro { kind: MacroKind::Bang, name: _, proc_macro: _ }
-                    )
-                    || always_backtrace
-                {
+                if !redundant_span || always_backtrace {
+                    let msg: Cow<'static, _> = match trace.kind {
+                        ExpnKind::Macro(MacroKind::Attr, _) => {
+                            "this procedural macro expansion".into()
+                        }
+                        ExpnKind::Macro(MacroKind::Derive, _) => {
+                            "this derive macro expansion".into()
+                        }
+                        ExpnKind::Macro(MacroKind::Bang, _) => "this macro invocation".into(),
+                        ExpnKind::Inlined => "the inlined copy of this code".into(),
+                        ExpnKind::Root => "in the crate root".into(),
+                        ExpnKind::AstPass(kind) => kind.descr().into(),
+                        ExpnKind::Desugaring(kind) => {
+                            format!("this {} desugaring", kind.descr()).into()
+                        }
+                    };
                     new_labels.push((
                         trace.call_site,
                         format!(
-                            "in this macro invocation{}",
+                            "in {}{}",
+                            msg,
                             if macro_backtrace.len() > 1 && always_backtrace {
                                 // only specify order when the macro
                                 // backtrace is multiple levels deep
@@ -959,7 +954,6 @@ impl EmitterWriter {
         //   |
         for pos in 0..=line_len {
             draw_col_separator(buffer, line_offset + pos + 1, width_offset - 2);
-            buffer.putc(line_offset + pos + 1, width_offset - 2, '|', Style::LineNumber);
         }
 
         // Write the horizontal lines for multiline annotations
@@ -1349,7 +1343,11 @@ impl EmitterWriter {
                 let buffer_msg_line_offset = buffer.num_lines();
 
                 // Add spacing line
-                draw_col_separator(&mut buffer, buffer_msg_line_offset, max_line_num_len + 1);
+                draw_col_separator_no_space(
+                    &mut buffer,
+                    buffer_msg_line_offset,
+                    max_line_num_len + 1,
+                );
 
                 // Then, the secondary file indicator
                 buffer.prepend(buffer_msg_line_offset + 1, "::: ", Style::LineNumber);

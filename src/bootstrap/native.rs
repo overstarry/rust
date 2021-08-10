@@ -118,6 +118,10 @@ impl Step for Llvm {
             let idx = target.triple.find('-').unwrap();
 
             format!("riscv{}{}", &target.triple[5..7], &target.triple[idx..])
+        } else if self.target.starts_with("powerpc") && self.target.ends_with("freebsd") {
+            // FreeBSD 13 had incompatible ABI changes on all PowerPC platforms.
+            // Set the version suffix to 13.0 so the correct target details are used.
+            format!("{}{}", self.target, "13.0")
         } else {
             target.to_string()
         };
@@ -128,6 +132,7 @@ impl Step for Llvm {
                 Err(m) => m,
             };
 
+        builder.update_submodule(&Path::new("src").join("llvm-project"));
         if builder.config.llvm_link_shared
             && (target.contains("windows") || target.contains("apple-darwin"))
         {
@@ -139,7 +144,7 @@ impl Step for Llvm {
         let _time = util::timeit(&builder);
         t!(fs::create_dir_all(&out_dir));
 
-        // http://llvm.org/docs/CMake.html
+        // https://llvm.org/docs/CMake.html
         let mut cfg = cmake::Config::new(builder.src.join(root));
 
         let profile = match (builder.config.llvm_optimize, builder.config.llvm_release_debuginfo) {
@@ -164,10 +169,12 @@ impl Step for Llvm {
         };
 
         let assertions = if builder.config.llvm_assertions { "ON" } else { "OFF" };
+        let plugins = if builder.config.llvm_plugins { "ON" } else { "OFF" };
 
         cfg.out_dir(&out_dir)
             .profile(profile)
             .define("LLVM_ENABLE_ASSERTIONS", assertions)
+            .define("LLVM_ENABLE_PLUGINS", plugins)
             .define("LLVM_TARGETS_TO_BUILD", llvm_targets)
             .define("LLVM_EXPERIMENTAL_TARGETS_TO_BUILD", llvm_exp_targets)
             .define("LLVM_INCLUDE_EXAMPLES", "OFF")
@@ -260,6 +267,10 @@ impl Step for Llvm {
             enabled_llvm_projects.push("polly");
         }
 
+        if builder.config.llvm_clang {
+            enabled_llvm_projects.push("clang");
+        }
+
         // We want libxml to be disabled.
         // See https://github.com/rust-lang/rust/pull/50104
         cfg.define("LLVM_ENABLE_LIBXML2", "OFF");
@@ -276,7 +287,12 @@ impl Step for Llvm {
             }
         }
 
-        // http://llvm.org/docs/HowToCrossCompileLLVM.html
+        // Workaround for ppc32 lld limitation
+        if target == "powerpc-unknown-freebsd" {
+            cfg.define("CMAKE_EXE_LINKER_FLAGS", "-fuse-ld=bfd");
+        }
+
+        // https://llvm.org/docs/HowToCrossCompileLLVM.html
         if target != builder.config.build {
             builder.ensure(Llvm { target: builder.config.build });
             // FIXME: if the llvm root for the build triple is overridden then we
@@ -811,6 +827,9 @@ fn supported_sanitizers(
         "x86_64-apple-darwin" => darwin_libs("osx", &["asan", "lsan", "tsan"]),
         "x86_64-fuchsia" => common_libs("fuchsia", "x86_64", &["asan"]),
         "x86_64-unknown-freebsd" => common_libs("freebsd", "x86_64", &["asan", "msan", "tsan"]),
+        "x86_64-unknown-netbsd" => {
+            common_libs("netbsd", "x86_64", &["asan", "lsan", "msan", "tsan"])
+        }
         "x86_64-unknown-linux-gnu" => {
             common_libs("linux", "x86_64", &["asan", "lsan", "msan", "tsan"])
         }

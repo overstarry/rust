@@ -3,9 +3,11 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
+use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::ty::print::{Print, Printer};
 use rustc_middle::ty::subst::{GenericArg, GenericArgKind, Subst};
 use rustc_middle::ty::{self, FloatTy, Instance, IntTy, Ty, TyCtxt, TypeFoldable, UintTy};
+use rustc_target::abi::Integer;
 use rustc_target::spec::abi::Abi;
 
 use std::fmt::Write;
@@ -21,15 +23,12 @@ pub(super) fn mangle(
     let substs = tcx.normalize_erasing_regions(ty::ParamEnv::reveal_all(), instance.substs);
 
     let prefix = "_R";
-    let mut cx = SymbolMangler {
+    let mut cx = &mut SymbolMangler {
         tcx,
-        compress: Some(Box::new(CompressionCaches {
-            start_offset: prefix.len(),
-
-            paths: FxHashMap::default(),
-            types: FxHashMap::default(),
-            consts: FxHashMap::default(),
-        })),
+        start_offset: prefix.len(),
+        paths: FxHashMap::default(),
+        types: FxHashMap::default(),
+        consts: FxHashMap::default(),
         binders: vec![],
         out: String::from(prefix),
     };
@@ -50,17 +49,7 @@ pub(super) fn mangle(
     if let Some(instantiating_crate) = instantiating_crate {
         cx = cx.print_def_path(instantiating_crate.as_def_id(), &[]).unwrap();
     }
-    cx.out
-}
-
-struct CompressionCaches<'tcx> {
-    // The length of the prefix in `out` (e.g. 2 for `_R`).
-    start_offset: usize,
-
-    // The values are start positions in `out`, in bytes.
-    paths: FxHashMap<(DefId, &'tcx [GenericArg<'tcx>]), usize>,
-    types: FxHashMap<Ty<'tcx>, usize>,
-    consts: FxHashMap<&'tcx ty::Const<'tcx>, usize>,
+    std::mem::take(&mut cx.out)
 }
 
 struct BinderLevel {
@@ -79,9 +68,15 @@ struct BinderLevel {
 
 struct SymbolMangler<'tcx> {
     tcx: TyCtxt<'tcx>,
-    compress: Option<Box<CompressionCaches<'tcx>>>,
     binders: Vec<BinderLevel>,
     out: String,
+
+    /// The length of the prefix in `out` (e.g. 2 for `_R`).
+    start_offset: usize,
+    /// The values are start positions in `out`, in bytes.
+    paths: FxHashMap<(DefId, &'tcx [GenericArg<'tcx>]), usize>,
+    types: FxHashMap<Ty<'tcx>, usize>,
+    consts: FxHashMap<&'tcx ty::Const<'tcx>, usize>,
 }
 
 impl SymbolMangler<'tcx> {
@@ -158,13 +153,13 @@ impl SymbolMangler<'tcx> {
         self.push(ident);
     }
 
-    fn path_append_ns(
-        mut self,
-        print_prefix: impl FnOnce(Self) -> Result<Self, !>,
+    fn path_append_ns<'a>(
+        mut self: &'a mut Self,
+        print_prefix: impl FnOnce(&'a mut Self) -> Result<&'a mut Self, !>,
         ns: char,
         disambiguator: u64,
         name: &str,
-    ) -> Result<Self, !> {
+    ) -> Result<&'a mut Self, !> {
         self.push("N");
         self.out.push(ns);
         self = print_prefix(self)?;
@@ -173,17 +168,17 @@ impl SymbolMangler<'tcx> {
         Ok(self)
     }
 
-    fn print_backref(mut self, i: usize) -> Result<Self, !> {
+    fn print_backref(&mut self, i: usize) -> Result<&mut Self, !> {
         self.push("B");
-        self.push_integer_62((i - self.compress.as_ref().unwrap().start_offset) as u64);
+        self.push_integer_62((i - self.start_offset) as u64);
         Ok(self)
     }
 
-    fn in_binder<T>(
-        mut self,
+    fn in_binder<'a, T>(
+        mut self: &'a mut Self,
         value: &ty::Binder<'tcx, T>,
-        print_value: impl FnOnce(Self, &T) -> Result<Self, !>,
-    ) -> Result<Self, !>
+        print_value: impl FnOnce(&'a mut Self, &T) -> Result<&'a mut Self, !>,
+    ) -> Result<&'a mut Self, !>
     where
         T: TypeFoldable<'tcx>,
     {
@@ -216,7 +211,7 @@ impl SymbolMangler<'tcx> {
     }
 }
 
-impl Printer<'tcx> for SymbolMangler<'tcx> {
+impl Printer<'tcx> for &mut SymbolMangler<'tcx> {
     type Error = !;
 
     type Path = Self;
@@ -234,7 +229,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         def_id: DefId,
         substs: &'tcx [GenericArg<'tcx>],
     ) -> Result<Self::Path, Self::Error> {
-        if let Some(&i) = self.compress.as_ref().and_then(|c| c.paths.get(&(def_id, substs))) {
+        if let Some(&i) = self.paths.get(&(def_id, substs)) {
             return self.print_backref(i);
         }
         let start = self.out.len();
@@ -244,9 +239,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         // Only cache paths that do not refer to an enclosing
         // binder (which would change depending on context).
         if !substs.iter().any(|k| k.has_escaping_bound_vars()) {
-            if let Some(c) = &mut self.compress {
-                c.paths.insert((def_id, substs), start);
-            }
+            self.paths.insert((def_id, substs), start);
         }
         Ok(self)
     }
@@ -310,7 +303,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         Ok(self)
     }
 
-    fn print_region(mut self, region: ty::Region<'_>) -> Result<Self::Region, Self::Error> {
+    fn print_region(self, region: ty::Region<'_>) -> Result<Self::Region, Self::Error> {
         let i = match *region {
             // Erased lifetimes use the index 0, for a
             // shorter mangling of `L_`.
@@ -365,7 +358,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
             return Ok(self);
         }
 
-        if let Some(&i) = self.compress.as_ref().and_then(|c| c.types.get(&ty)) {
+        if let Some(&i) = self.types.get(&ty) {
             return self.print_backref(i);
         }
         let start = self.out.len();
@@ -474,9 +467,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         // Only cache types that do not refer to an enclosing
         // binder (which would change depending on context).
         if !ty.has_escaping_bound_vars() {
-            if let Some(c) = &mut self.compress {
-                c.types.insert(ty, start);
-            }
+            self.types.insert(ty, start);
         }
         Ok(self)
     }
@@ -543,7 +534,7 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
     }
 
     fn print_const(mut self, ct: &'tcx ty::Const<'tcx>) -> Result<Self::Const, Self::Error> {
-        if let Some(&i) = self.compress.as_ref().and_then(|c| c.consts.get(&ct)) {
+        if let Some(&i) = self.consts.get(&ct) {
             return self.print_backref(i);
         }
         let start = self.out.len();
@@ -553,11 +544,9 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
             ty::Uint(_) | ty::Bool | ty::Char => {
                 ct.try_eval_bits(self.tcx, ty::ParamEnv::reveal_all(), ct.ty)
             }
-            ty::Int(_) => {
-                let param_env = ty::ParamEnv::reveal_all();
-                ct.try_eval_bits(self.tcx, param_env, ct.ty).and_then(|b| {
-                    let sz = self.tcx.layout_of(param_env.and(ct.ty)).ok()?.size;
-                    let val = sz.sign_extend(b) as i128;
+            ty::Int(ity) => {
+                ct.try_eval_bits(self.tcx, ty::ParamEnv::reveal_all(), ct.ty).and_then(|b| {
+                    let val = Integer::from_int_ty(&self.tcx, *ity).size().sign_extend(b) as i128;
                     if val < 0 {
                         neg = true;
                     }
@@ -583,17 +572,15 @@ impl Printer<'tcx> for SymbolMangler<'tcx> {
         // Only cache consts that do not refer to an enclosing
         // binder (which would change depending on context).
         if !ct.has_escaping_bound_vars() {
-            if let Some(c) = &mut self.compress {
-                c.consts.insert(ct, start);
-            }
+            self.consts.insert(ct, start);
         }
         Ok(self)
     }
 
-    fn path_crate(mut self, cnum: CrateNum) -> Result<Self::Path, Self::Error> {
+    fn path_crate(self, cnum: CrateNum) -> Result<Self::Path, Self::Error> {
         self.push("C");
-        let fingerprint = self.tcx.crate_disambiguator(cnum).to_fingerprint();
-        self.push_disambiguator(fingerprint.to_smaller_hash());
+        let stable_crate_id = self.tcx.def_path_hash(cnum.as_def_id()).stable_crate_id();
+        self.push_disambiguator(stable_crate_id.to_u64());
         let name = self.tcx.crate_name(cnum).as_str();
         self.push_ident(&name);
         Ok(self)

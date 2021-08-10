@@ -2,7 +2,6 @@ use crate::build;
 use crate::build::expr::as_place::PlaceBuilder;
 use crate::build::scope::DropKind;
 use crate::thir::pattern::pat_from_hir;
-use rustc_attr::{self as attr, UnwindAttr};
 use rustc_errors::ErrorReported;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -19,7 +18,6 @@ use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeckResults};
 use rustc_span::symbol::{kw, sym};
 use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
-use rustc_target::spec::PanicStrategy;
 
 use super::lints;
 
@@ -367,12 +365,8 @@ struct Builder<'a, 'tcx> {
     /// `{ STMTS; EXPR1 } + EXPR2`.
     block_context: BlockContext,
 
-    /// The current unsafe block in scope, even if it is hidden by
-    /// a `PushUnsafeBlock`.
-    unpushed_unsafe: Safety,
-
-    /// The number of `push_unsafe_block` levels in scope.
-    push_unsafe_count: usize,
+    /// The current unsafe block in scope
+    in_scope_unsafe: Safety,
 
     /// The vector of all scopes that we have created thus far;
     /// we track this for debuginfo later.
@@ -585,60 +579,6 @@ macro_rules! unpack {
     }};
 }
 
-fn should_abort_on_panic(tcx: TyCtxt<'_>, fn_def_id: LocalDefId, abi: Abi) -> bool {
-    // Validate `#[unwind]` syntax regardless of platform-specific panic strategy.
-    let attrs = &tcx.get_attrs(fn_def_id.to_def_id());
-    let unwind_attr = attr::find_unwind_attr(&tcx.sess, attrs);
-
-    // We never unwind, so it's not relevant to stop an unwind.
-    if tcx.sess.panic_strategy() != PanicStrategy::Unwind {
-        return false;
-    }
-
-    match unwind_attr {
-        // If an `#[unwind]` attribute was found, we should adhere to it.
-        Some(UnwindAttr::Allowed) => false,
-        Some(UnwindAttr::Aborts) => true,
-        // If no attribute was found and the panic strategy is `unwind`, then we should examine
-        // the function's ABI string to determine whether it should abort upon panic.
-        None if tcx.features().c_unwind => {
-            use Abi::*;
-            match abi {
-                // In the case of ABI's that have an `-unwind` equivalent, check whether the ABI
-                // permits unwinding. If so, we should not abort. Otherwise, we should.
-                C { unwind } | Stdcall { unwind } | System { unwind } | Thiscall { unwind } => {
-                    !unwind
-                }
-                // Rust and `rust-call` functions are allowed to unwind, and should not abort.
-                Rust | RustCall => false,
-                // Other ABI's should abort.
-                Cdecl
-                | Fastcall
-                | Vectorcall
-                | Aapcs
-                | Win64
-                | SysV64
-                | PtxKernel
-                | Msp430Interrupt
-                | X86Interrupt
-                | AmdGpuKernel
-                | EfiApi
-                | AvrInterrupt
-                | AvrNonBlockingInterrupt
-                | CCmseNonSecureCall
-                | Wasm
-                | RustIntrinsic
-                | PlatformIntrinsic
-                | Unadjusted => true,
-            }
-        }
-        // If the `c_unwind` feature gate is not active, follow the behavior that was in place
-        // prior to #76570. This is a special case: some functions have a C ABI but are meant to
-        // unwind anyway. Don't stop them.
-        None => false, // FIXME(#58794); should be `!(abi == Abi::Rust || abi == Abi::RustCall)`
-    }
-}
-
 ///////////////////////////////////////////////////////////////////////////
 /// the main entry point for building MIR for a function
 
@@ -708,8 +648,7 @@ where
             }));
         let source_info = builder.source_info(fn_end);
         builder.cfg.terminate(return_block, source_info, TerminatorKind::Return);
-        let should_abort = should_abort_on_panic(tcx, fn_def.did, abi);
-        builder.build_drop_trees(should_abort);
+        builder.build_drop_trees();
         return_block.unit()
     }));
 
@@ -756,7 +695,7 @@ fn construct_const<'a, 'tcx>(
     let source_info = builder.source_info(span);
     builder.cfg.terminate(block, source_info, TerminatorKind::Return);
 
-    builder.build_drop_trees(false);
+    builder.build_drop_trees();
 
     builder.finish()
 }
@@ -877,8 +816,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             source_scopes: IndexVec::new(),
             source_scope: OUTERMOST_SOURCE_SCOPE,
             guard_context: vec![],
-            push_unsafe_count: 0,
-            unpushed_unsafe: safety,
+            in_scope_unsafe: safety,
             local_decls: IndexVec::from_elem_n(LocalDecl::new(return_ty, return_span), 1),
             canonical_user_type_annotations: IndexVec::new(),
             upvar_mutbls: vec![],
@@ -1136,3 +1074,5 @@ mod expr;
 mod matches;
 mod misc;
 mod scope;
+
+pub(crate) use expr::category::Category as ExprCategory;

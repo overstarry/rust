@@ -576,6 +576,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
         )];
 
         let mut has_unsized_tuple_coercion = false;
+        let mut has_trait_upcasting_coercion = false;
 
         // Keep resolving `CoerceUnsized` and `Unsize` predicates to avoid
         // emitting a coercion in cases like `Foo<$1>` -> `Foo<$2>`, where
@@ -590,7 +591,16 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                     if traits.contains(&trait_pred.def_id()) =>
                 {
                     if unsize_did == trait_pred.def_id() {
+                        let self_ty = trait_pred.self_ty();
                         let unsize_ty = trait_pred.trait_ref.substs[1].expect_ty();
+                        if let (ty::Dynamic(ref data_a, ..), ty::Dynamic(ref data_b, ..)) =
+                            (self_ty.kind(), unsize_ty.kind())
+                        {
+                            if data_a.principal_def_id() != data_b.principal_def_id() {
+                                debug!("coerce_unsized: found trait upcasting coercion");
+                                has_trait_upcasting_coercion = true;
+                            }
+                        }
                         if let ty::Tuple(..) = unsize_ty.kind() {
                             debug!("coerce_unsized: found unsized tuple coercion");
                             has_unsized_tuple_coercion = true;
@@ -640,7 +650,13 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
 
                 // Object safety violations or miscellaneous.
                 Err(err) => {
-                    self.report_selection_error(&obligation, &err, false, false);
+                    self.report_selection_error(
+                        obligation.clone(),
+                        &obligation,
+                        &err,
+                        false,
+                        false,
+                    );
                     // Treat this like an obligation and follow through
                     // with the unsizing - the lack of a coercion should
                     // be silent, as it causes a type mismatch later.
@@ -656,6 +672,16 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                 sym::unsized_tuple_coercion,
                 self.cause.span,
                 "unsized tuple coercion is not stable enough for use and is subject to change",
+            )
+            .emit();
+        }
+
+        if has_trait_upcasting_coercion && !self.tcx().features().trait_upcasting {
+            feature_err(
+                &self.tcx.sess.parse_sess,
+                sym::trait_upcasting,
+                self.cause.span,
+                "trait upcasting coercion is experimental",
             )
             .emit();
         }
@@ -1456,11 +1482,15 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
                 expected.is_unit(),
                 pointing_at_return_type,
             ) {
-                // If the block is from an external macro, then do not suggest
-                // adding a semicolon, because there's nowhere to put it.
-                // See issue #81943.
+                // If the block is from an external macro or try (`?`) desugaring, then
+                // do not suggest adding a semicolon, because there's nowhere to put it.
+                // See issues #81943 and #87051.
                 if cond_expr.span.desugaring_kind().is_none()
                     && !in_external_macro(fcx.tcx.sess, cond_expr.span)
+                    && !matches!(
+                        cond_expr.kind,
+                        hir::ExprKind::Match(.., hir::MatchSource::TryDesugar)
+                    )
                 {
                     err.span_label(cond_expr.span, "expected this to be `()`");
                     if expr.can_have_side_effects() {
@@ -1481,6 +1511,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
                     expected,
                     found,
                     can_suggest,
+                    fcx.tcx.hir().get_parent_item(id),
                 );
             }
             if !pointing_at_return_type {

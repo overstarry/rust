@@ -2,16 +2,36 @@ use crate::cmp;
 use crate::ffi::CStr;
 use crate::io;
 use crate::mem;
+use crate::num::NonZeroUsize;
 use crate::ptr;
 use crate::sys::{os, stack_overflow};
 use crate::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "solaris", target_os = "illumos"))]
+use crate::sys::weak::weak;
 #[cfg(not(any(target_os = "l4re", target_os = "vxworks")))]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "l4re")]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 1024 * 1024;
 #[cfg(target_os = "vxworks")]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 256 * 1024;
+
+#[cfg(target_os = "fuchsia")]
+mod zircon {
+    type zx_handle_t = u32;
+    type zx_status_t = i32;
+    pub const ZX_PROP_NAME: u32 = 3;
+
+    extern "C" {
+        pub fn zx_object_set_property(
+            handle: zx_handle_t,
+            property: u32,
+            value: *const libc::c_void,
+            value_size: libc::size_t,
+        ) -> zx_status_t;
+        pub fn zx_thread_self() -> zx_handle_t;
+    }
+}
 
 pub struct Thread {
     id: libc::pthread_t,
@@ -131,20 +151,36 @@ impl Thread {
         }
     }
 
+    #[cfg(target_os = "fuchsia")]
+    pub fn set_name(name: &CStr) {
+        use self::zircon::*;
+        unsafe {
+            zx_object_set_property(
+                zx_thread_self(),
+                ZX_PROP_NAME,
+                name.as_ptr() as *const libc::c_void,
+                name.to_bytes().len(),
+            );
+        }
+    }
+
+    #[cfg(target_os = "haiku")]
+    pub fn set_name(name: &CStr) {
+        unsafe {
+            let thread_self = libc::find_thread(ptr::null_mut());
+            libc::rename_thread(thread_self, name.as_ptr());
+        }
+    }
+
     #[cfg(any(
         target_env = "newlib",
-        target_os = "haiku",
         target_os = "l4re",
         target_os = "emscripten",
         target_os = "redox",
         target_os = "vxworks"
     ))]
     pub fn set_name(_name: &CStr) {
-        // Newlib, Haiku, Emscripten, and VxWorks have no way to set a thread name.
-    }
-    #[cfg(target_os = "fuchsia")]
-    pub fn set_name(_name: &CStr) {
-        // FIXME: determine whether Fuchsia has a way to set a thread name.
+        // Newlib, Emscripten, and VxWorks have no way to set a thread name.
     }
 
     pub fn sleep(dur: Duration) {
@@ -195,6 +231,88 @@ impl Drop for Thread {
     fn drop(&mut self) {
         let ret = unsafe { libc::pthread_detach(self.id) };
         debug_assert_eq!(ret, 0);
+    }
+}
+
+pub fn available_concurrency() -> io::Result<NonZeroUsize> {
+    cfg_if::cfg_if! {
+        if #[cfg(any(
+            target_os = "android",
+            target_os = "emscripten",
+            target_os = "fuchsia",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "solaris",
+            target_os = "illumos",
+        ))] {
+            match unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } {
+                -1 => Err(io::Error::last_os_error()),
+                0 => Err(io::Error::new_const(io::ErrorKind::NotFound, &"The number of hardware threads is not known for the target platform")),
+                cpus => Ok(unsafe { NonZeroUsize::new_unchecked(cpus as usize) }),
+            }
+        } else if #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))] {
+            use crate::ptr;
+
+            let mut cpus: libc::c_uint = 0;
+            let mut cpus_size = crate::mem::size_of_val(&cpus);
+
+            unsafe {
+                cpus = libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as libc::c_uint;
+            }
+
+            // Fallback approach in case of errors or no hardware threads.
+            if cpus < 1 {
+                let mut mib = [libc::CTL_HW, libc::HW_NCPU, 0, 0];
+                let res = unsafe {
+                    libc::sysctl(
+                        mib.as_mut_ptr(),
+                        2,
+                        &mut cpus as *mut _ as *mut _,
+                        &mut cpus_size as *mut _ as *mut _,
+                        ptr::null_mut(),
+                        0,
+                    )
+                };
+
+                // Handle errors if any.
+                if res == -1 {
+                    return Err(io::Error::last_os_error());
+                } else if cpus == 0 {
+                    return Err(io::Error::new_const(io::ErrorKind::NotFound, &"The number of hardware threads is not known for the target platform"));
+                }
+            }
+            Ok(unsafe { NonZeroUsize::new_unchecked(cpus as usize) })
+        } else if #[cfg(target_os = "openbsd")] {
+            use crate::ptr;
+
+            let mut cpus: libc::c_uint = 0;
+            let mut cpus_size = crate::mem::size_of_val(&cpus);
+            let mut mib = [libc::CTL_HW, libc::HW_NCPU, 0, 0];
+
+            let res = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    2,
+                    &mut cpus as *mut _ as *mut _,
+                    &mut cpus_size as *mut _ as *mut _,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+
+            // Handle errors if any.
+            if res == -1 {
+                return Err(io::Error::last_os_error());
+            } else if cpus == 0 {
+                return Err(io::Error::new_const(io::ErrorKind::NotFound, &"The number of hardware threads is not known for the target platform"));
+            }
+
+            Ok(unsafe { NonZeroUsize::new_unchecked(cpus as usize) })
+        } else {
+            // FIXME: implement on vxWorks, Redox, Haiku, l4re
+            Err(io::Error::new_const(io::ErrorKind::Unsupported, &"Getting the number of hardware threads is not supported on the target platform"))
+        }
     }
 }
 

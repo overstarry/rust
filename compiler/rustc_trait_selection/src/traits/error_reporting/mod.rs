@@ -55,9 +55,13 @@ pub trait InferCtxtExt<'tcx> {
 
     fn report_overflow_error_cycle(&self, cycle: &[PredicateObligation<'tcx>]) -> !;
 
+    /// The `root_obligation` parameter should be the `root_obligation` field
+    /// from a `FulfillmentError`. If no `FulfillmentError` is available,
+    /// then it should be the same as `obligation`.
     fn report_selection_error(
         &self,
-        obligation: &PredicateObligation<'tcx>,
+        obligation: PredicateObligation<'tcx>,
+        root_obligation: &PredicateObligation<'tcx>,
         error: &SelectionError<'tcx>,
         fallback_has_occurred: bool,
         points_at_arg: bool,
@@ -225,16 +229,29 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
 
     fn report_selection_error(
         &self,
-        obligation: &PredicateObligation<'tcx>,
+        mut obligation: PredicateObligation<'tcx>,
+        root_obligation: &PredicateObligation<'tcx>,
         error: &SelectionError<'tcx>,
         fallback_has_occurred: bool,
         points_at_arg: bool,
     ) {
         let tcx = self.tcx;
-        let span = obligation.cause.span;
+        let mut span = obligation.cause.span;
 
         let mut err = match *error {
             SelectionError::Unimplemented => {
+                // If this obligation was generated as a result of well-formedness checking, see if we
+                // can get a better error message by performing HIR-based well-formedness checking.
+                if let ObligationCauseCode::WellFormed(Some(wf_loc)) =
+                    root_obligation.cause.code.peel_derives()
+                {
+                    if let Some(cause) =
+                        self.tcx.diagnostic_hir_wf_check((obligation.predicate, wf_loc.clone()))
+                    {
+                        obligation.cause = cause;
+                        span = obligation.cause.span;
+                    }
+                }
                 if let ObligationCauseCode::CompareImplMethodObligation {
                     item_name,
                     impl_item_def_id,
@@ -279,7 +296,7 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                             .unwrap_or_default();
 
                         let OnUnimplementedNote { message, label, note, enclosing_scope } =
-                            self.on_unimplemented_note(trait_ref, obligation);
+                            self.on_unimplemented_note(trait_ref, &obligation);
                         let have_alt_message = message.is_some() || label.is_some();
                         let is_try_conversion = self.is_try_conversion(span, trait_ref.def_id());
                         let is_unsize =
@@ -338,7 +355,7 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                                     Applicability::MachineApplicable,
                                 );
                             }
-                            if let Some(ret_span) = self.return_type_span(obligation) {
+                            if let Some(ret_span) = self.return_type_span(&obligation) {
                                 err.span_label(
                                     ret_span,
                                     &format!(
@@ -368,7 +385,7 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                             points_at_arg,
                             have_alt_message,
                         ) {
-                            self.note_obligation_cause(&mut err, obligation);
+                            self.note_obligation_cause(&mut err, &obligation);
                             err.emit();
                             return;
                         }
@@ -512,6 +529,30 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
                                 );
                                 err.help("did you intend to use the type `()` here instead?");
                             }
+                        }
+
+                        // Return early if the trait is Debug or Display and the invocation
+                        // originates within a standard library macro, because the output
+                        // is otherwise overwhelming and unhelpful (see #85844 for an
+                        // example).
+
+                        let trait_is_debug =
+                            self.tcx.is_diagnostic_item(sym::debug_trait, trait_ref.def_id());
+                        let trait_is_display =
+                            self.tcx.is_diagnostic_item(sym::display_trait, trait_ref.def_id());
+
+                        let in_std_macro =
+                            match obligation.cause.span.ctxt().outer_expn_data().macro_def_id {
+                                Some(macro_def_id) => {
+                                    let crate_name = tcx.crate_name(macro_def_id.krate);
+                                    crate_name == sym::std || crate_name == sym::core
+                                }
+                                None => false,
+                            };
+
+                        if in_std_macro && (trait_is_debug || trait_is_display) {
+                            err.emit();
+                            return;
                         }
 
                         err
@@ -797,7 +838,7 @@ impl<'a, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'a, 'tcx> {
             }
         };
 
-        self.note_obligation_cause(&mut err, obligation);
+        self.note_obligation_cause(&mut err, &obligation);
         self.point_at_returns_when_relevant(&mut err, &obligation);
 
         err.emit();
@@ -1144,7 +1185,8 @@ impl<'a, 'tcx> InferCtxtPrivExt<'tcx> for InferCtxt<'a, 'tcx> {
         match error.code {
             FulfillmentErrorCode::CodeSelectionError(ref selection_error) => {
                 self.report_selection_error(
-                    &error.obligation,
+                    error.obligation.clone(),
+                    &error.root_obligation,
                     selection_error,
                     fallback_has_occurred,
                     error.points_at_arg_span,
@@ -1561,6 +1603,8 @@ impl<'a, 'tcx> InferCtxtPrivExt<'tcx> for InferCtxt<'a, 'tcx> {
                     let generics = self.tcx.generics_of(*def_id);
                     if generics.params.iter().any(|p| p.name != kw::SelfUpper)
                         && !snippet.ends_with('>')
+                        && !generics.has_impl_trait()
+                        && !self.tcx.fn_trait_kind_from_lang_item(*def_id).is_some()
                     {
                         // FIXME: To avoid spurious suggestions in functions where type arguments
                         // where already supplied, we check the snippet to make sure it doesn't

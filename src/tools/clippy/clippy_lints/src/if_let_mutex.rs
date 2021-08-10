@@ -9,16 +9,15 @@ use rustc_middle::hir::map::Map;
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for `Mutex::lock` calls in `if let` expression
+    /// ### What it does
+    /// Checks for `Mutex::lock` calls in `if let` expression
     /// with lock calls in any of the else blocks.
     ///
-    /// **Why is this bad?** The Mutex lock remains held for the whole
+    /// ### Why is this bad?
+    /// The Mutex lock remains held for the whole
     /// `if let ... else` block and deadlocks.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
-    ///
+    /// ### Example
     /// ```rust,ignore
     /// if let Ok(thing) = mutex.lock() {
     ///     do_thing();
@@ -83,7 +82,7 @@ impl<'tcx> LateLintPass<'tcx> for IfLetMutex {
     }
 }
 
-/// Checks if `Mutex::lock` is called in the `if let _ = expr.
+/// Checks if `Mutex::lock` is called in the `if let` expr.
 pub struct OppVisitor<'a, 'tcx> {
     mutex_lock_called: bool,
     found_mutex: Option<&'tcx Expr<'tcx>>,

@@ -180,13 +180,13 @@ needs to be specified in `rustfmt.toml`, e.g., with `edition = "2018"`.
 
 * For things you do not want rustfmt to mangle, use `#[rustfmt::skip]`
 * To prevent rustfmt from formatting a macro or an attribute,
-  use `#[rustfmt::skip::macros(target_macro_name)]` or 
+  use `#[rustfmt::skip::macros(target_macro_name)]` or
   `#[rustfmt::skip::attributes(target_attribute_name)]`
 
   Example:
 
     ```rust
-    #![rustfmt::skip::attributes(custom_attribute)]   
+    #![rustfmt::skip::attributes(custom_attribute)]
 
     #[custom_attribute(formatting , here , should , be , Skipped)]
     #[rustfmt::skip::macros(html)]
@@ -230,5 +230,5 @@ Apache License (Version 2.0).
 See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) for details.
 
 [rust]: https://github.com/rust-lang/rust
-[fmt rfcs]: https://github.com/rust-lang-nursery/fmt-rfcs
-[style guide]: https://github.com/rust-lang-nursery/fmt-rfcs/blob/master/guide/guide.md
+[fmt rfcs]: https://github.com/rust-dev-tools/fmt-rfcs
+[style guide]: https://github.com/rust-dev-tools/fmt-rfcs/blob/master/guide/guide.md

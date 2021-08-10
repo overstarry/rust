@@ -108,7 +108,7 @@ fn diagnostic_items<'tcx>(tcx: TyCtxt<'tcx>, cnum: CrateNum) -> FxHashMap<Symbol
     // Collect diagnostic items in this crate.
     tcx.hir().krate().visit_all_item_likes(&mut collector);
 
-    for m in tcx.hir().krate().exported_macros {
+    for m in tcx.hir().krate().exported_macros() {
         collector.observe_item(m.def_id);
     }
 
@@ -121,7 +121,7 @@ fn all_diagnostic_items<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> FxHashMap<Symbol, De
     let mut collector = FxHashMap::default();
 
     // Collect diagnostic items in other crates.
-    for &cnum in tcx.crates().iter().chain(std::iter::once(&LOCAL_CRATE)) {
+    for &cnum in tcx.crates(()).iter().chain(std::iter::once(&LOCAL_CRATE)) {
         for (&name, &def_id) in tcx.diagnostic_items(cnum).iter() {
             collect_item(tcx, &mut collector, name, def_id);
         }

@@ -102,6 +102,7 @@ pub enum Subcommand {
         paths: Vec<PathBuf>,
         /// Whether to automatically update stderr/stdout files
         bless: bool,
+        force_rerun: bool,
         compare_mode: Option<String>,
         pass: Option<String>,
         run: Option<String>,
@@ -152,7 +153,7 @@ Subcommands:
     fmt         Run rustfmt
     test, t     Build and run some test suites
     bench       Build and run some benchmarks
-    doc         Build documentation
+    doc, d      Build documentation
     clean       Clean out build directories
     dist        Build distribution artifacts
     install     Install distribution artifacts
@@ -244,6 +245,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`",
                 || (s == "t")
                 || (s == "bench")
                 || (s == "doc")
+                || (s == "d")
                 || (s == "clean")
                 || (s == "dist")
                 || (s == "install")
@@ -283,6 +285,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`",
                 opts.optflag("", "no-doc", "do not run doc tests");
                 opts.optflag("", "doc", "only run doc tests");
                 opts.optflag("", "bless", "update all stderr/stdout files of failing ui tests");
+                opts.optflag("", "force-rerun", "rerun tests even if the inputs are unchanged");
                 opts.optopt(
                     "",
                     "compare-mode",
@@ -312,7 +315,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`",
             "clippy" => {
                 opts.optflag("", "fix", "automatically apply lint suggestions");
             }
-            "doc" => {
+            "doc" | "d" => {
                 opts.optflag("", "open", "open the docs in a browser");
             }
             "clean" => {
@@ -487,7 +490,7 @@ Arguments:
         ./x.py test --stage 1",
                 );
             }
-            "doc" => {
+            "doc" | "d" => {
                 subcommand_help.push_str(
                     "\n
 Arguments:
@@ -557,6 +560,7 @@ Arguments:
             "test" | "t" => Subcommand::Test {
                 paths,
                 bless: matches.opt_present("bless"),
+                force_rerun: matches.opt_present("force-rerun"),
                 compare_mode: matches.opt_str("compare-mode"),
                 pass: matches.opt_str("pass"),
                 run: matches.opt_str("run"),
@@ -573,7 +577,7 @@ Arguments:
                 },
             },
             "bench" => Subcommand::Bench { paths, test_args: matches.opt_strs("test-args") },
-            "doc" => Subcommand::Doc { paths, open: matches.opt_present("open") },
+            "doc" | "d" => Subcommand::Doc { paths, open: matches.opt_present("open") },
             "clean" => {
                 if !paths.is_empty() {
                     println!("\nclean does not take a path argument\n");
@@ -721,6 +725,13 @@ impl Subcommand {
     pub fn bless(&self) -> bool {
         match *self {
             Subcommand::Test { bless, .. } => bless,
+            _ => false,
+        }
+    }
+
+    pub fn force_rerun(&self) -> bool {
+        match *self {
+            Subcommand::Test { force_rerun, .. } => force_rerun,
             _ => false,
         }
     }

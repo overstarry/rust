@@ -3,7 +3,7 @@ use super::HashMap;
 use super::RandomState;
 use crate::cell::RefCell;
 use rand::{thread_rng, Rng};
-use realstd::collections::TryReserveError::*;
+use realstd::collections::TryReserveErrorKind::*;
 
 // https://github.com/rust-lang/rust/issues/62301
 fn _assert_hashmap_is_unwind_safe() {
@@ -821,12 +821,12 @@ fn test_try_reserve() {
 
     const MAX_USIZE: usize = usize::MAX;
 
-    if let Err(CapacityOverflow) = empty_bytes.try_reserve(MAX_USIZE) {
+    if let Err(CapacityOverflow) = empty_bytes.try_reserve(MAX_USIZE).map_err(|e| e.kind()) {
     } else {
         panic!("usize::MAX should trigger an overflow!");
     }
 
-    if let Err(AllocError { .. }) = empty_bytes.try_reserve(MAX_USIZE / 8) {
+    if let Err(AllocError { .. }) = empty_bytes.try_reserve(MAX_USIZE / 8).map_err(|e| e.kind()) {
     } else {
         panic!("usize::MAX / 8 should trigger an OOM!")
     }
@@ -1084,4 +1084,16 @@ mod test_drain_filter {
         assert_eq!(DROPS.load(Ordering::SeqCst), 1);
         assert_eq!(map.len(), 2);
     }
+}
+
+#[test]
+fn from_array() {
+    let map = HashMap::from([(1, 2), (3, 4)]);
+    let unordered_duplicates = HashMap::from([(3, 4), (1, 2), (1, 2)]);
+    assert_eq!(map, unordered_duplicates);
+
+    // This next line must infer the hasher type parameter.
+    // If you make a change that causes this line to no longer infer,
+    // that's a problem!
+    let _must_not_require_type_annotation = HashMap::from([(1, 2)]);
 }

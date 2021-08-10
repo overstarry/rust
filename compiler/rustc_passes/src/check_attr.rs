@@ -97,6 +97,10 @@ impl CheckAttrVisitor<'tcx> {
                 | sym::rustc_dirty
                 | sym::rustc_if_this_changed
                 | sym::rustc_then_this_would_need => self.check_rustc_dirty_clean(&attr),
+                sym::cmse_nonsecure_entry => self.check_cmse_nonsecure_entry(attr, span, target),
+                sym::default_method_body_is_const => {
+                    self.check_default_method_body_is_const(attr, span, target)
+                }
                 _ => true,
             };
             // lint-only checks
@@ -220,6 +224,25 @@ impl CheckAttrVisitor<'tcx> {
                 self.inline_attr_str_error_with_macro_def(hir_id, attr, "naked");
                 true
             }
+            _ => {
+                self.tcx
+                    .sess
+                    .struct_span_err(
+                        attr.span,
+                        "attribute should be applied to a function definition",
+                    )
+                    .span_label(*span, "not a function definition")
+                    .emit();
+                false
+            }
+        }
+    }
+
+    /// Checks if `#[cmse_nonsecure_entry]` is applied to a function definition.
+    fn check_cmse_nonsecure_entry(&self, attr: &Attribute, span: &Span, target: Target) -> bool {
+        match target {
+            Target::Fn
+            | Target::Method(MethodKind::Trait { body: true } | MethodKind::Inherent) => true,
             _ => {
                 self.tcx
                     .sess
@@ -456,6 +479,8 @@ impl CheckAttrVisitor<'tcx> {
                     _ => None,
                 }
             }
+            // we check the validity of params elsewhere
+            Target::Param => return false,
             _ => None,
         } {
             return err_fn(meta.span(), &format!("isn't allowed on {}", err));
@@ -523,8 +548,11 @@ impl CheckAttrVisitor<'tcx> {
             self.doc_attr_str_error(meta, "keyword");
             return false;
         }
-        match self.tcx.hir().expect_item(hir_id).kind {
-            ItemKind::Mod(ref module) => {
+        match self.tcx.hir().find(hir_id).and_then(|node| match node {
+            hir::Node::Item(item) => Some(&item.kind),
+            _ => None,
+        }) {
+            Some(ItemKind::Mod(ref module)) => {
                 if !module.item_ids.is_empty() {
                     self.tcx
                         .sess
@@ -827,7 +855,7 @@ impl CheckAttrVisitor<'tcx> {
                         hir_id,
                         meta.span(),
                         |lint| {
-                            lint.build(&format!("invalid `doc` attribute")).emit();
+                            lint.build(&"invalid `doc` attribute").emit();
                         },
                     );
                     is_valid = false;
@@ -1440,6 +1468,29 @@ impl CheckAttrVisitor<'tcx> {
             }
         }
     }
+
+    /// default_method_body_is_const should only be applied to trait methods with default bodies.
+    fn check_default_method_body_is_const(
+        &self,
+        attr: &Attribute,
+        span: &Span,
+        target: Target,
+    ) -> bool {
+        match target {
+            Target::Method(MethodKind::Trait { body: true }) => true,
+            _ => {
+                self.tcx
+                    .sess
+                    .struct_span_err(
+                        attr.span,
+                        "attribute should be applied to a trait method with body",
+                    )
+                    .span_label(*span, "not a trait method or missing a body")
+                    .emit();
+                false
+            }
+        }
+    }
 }
 
 impl Visitor<'tcx> for CheckAttrVisitor<'tcx> {
@@ -1593,11 +1644,11 @@ fn check_invalid_macro_level_attr(tcx: TyCtxt<'_>, attrs: &[Attribute]) {
 fn check_mod_attrs(tcx: TyCtxt<'_>, module_def_id: LocalDefId) {
     let check_attr_visitor = &mut CheckAttrVisitor { tcx };
     tcx.hir().visit_item_likes_in_module(module_def_id, &mut check_attr_visitor.as_deep_visitor());
-    tcx.hir().visit_exported_macros_in_krate(check_attr_visitor);
-    check_invalid_macro_level_attr(tcx, tcx.hir().krate().non_exported_macro_attrs);
     if module_def_id.is_top_level_module() {
         check_attr_visitor.check_attributes(CRATE_HIR_ID, &DUMMY_SP, Target::Mod, None);
         check_invalid_crate_level_attr(tcx, tcx.hir().krate_attrs());
+        tcx.hir().visit_exported_macros_in_krate(check_attr_visitor);
+        check_invalid_macro_level_attr(tcx, tcx.hir().krate().non_exported_macro_attrs);
     }
 }
 

@@ -56,7 +56,7 @@ This API is completely unstable and subject to change.
 */
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bindings_after_at)]
+#![cfg_attr(bootstrap, feature(bindings_after_at))]
 #![feature(bool_to_option)]
 #![feature(box_syntax)]
 #![feature(crate_visibility_modifier)]
@@ -88,6 +88,7 @@ mod coherence;
 mod collect;
 mod constrained_generic_params;
 mod errors;
+pub mod hir_wf_check;
 mod impl_wf_check;
 mod mem_categorization;
 mod outlives;
@@ -462,6 +463,7 @@ pub fn provide(providers: &mut Providers) {
     variance::provide(providers);
     outlives::provide(providers);
     impl_wf_check::provide(providers);
+    hir_wf_check::provide(providers);
 }
 
 pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {

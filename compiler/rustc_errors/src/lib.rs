@@ -5,7 +5,6 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(crate_visibility_modifier)]
 #![feature(backtrace)]
-#![cfg_attr(bootstrap, feature(extended_key_value_attributes))]
 #![feature(format_args_capture)]
 #![feature(iter_zip)]
 #![feature(nll)]
@@ -24,7 +23,6 @@ use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::stable_hasher::StableHasher;
 use rustc_data_structures::sync::{self, Lock, Lrc};
 use rustc_data_structures::AtomicRef;
-use rustc_lint_defs::FutureBreakage;
 pub use rustc_lint_defs::{pluralize, Applicability};
 use rustc_serialize::json::Json;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
@@ -344,6 +342,9 @@ struct HandlerInner {
     deduplicated_warn_count: usize,
 
     future_breakage_diagnostics: Vec<Diagnostic>,
+
+    /// If set to `true`, no warning or error will be emitted.
+    quiet: bool,
 }
 
 /// A key denoting where from a diagnostic was stashed.
@@ -458,8 +459,17 @@ impl Handler {
                 emitted_diagnostics: Default::default(),
                 stashed_diagnostics: Default::default(),
                 future_breakage_diagnostics: Vec::new(),
+                quiet: false,
             }),
         }
+    }
+
+    pub fn with_disabled_diagnostic<T, F: FnOnce() -> T>(&self, f: F) -> T {
+        let prev = self.inner.borrow_mut().quiet;
+        self.inner.borrow_mut().quiet = true;
+        let ret = f();
+        self.inner.borrow_mut().quiet = prev;
+        ret
     }
 
     // This is here to not allow mutation of flags;
@@ -521,8 +531,24 @@ impl Handler {
     }
 
     /// Construct a builder at the `Warning` level at the given `span` and with the `msg`.
+    ///
+    /// The builder will be canceled if warnings cannot be emitted.
     pub fn struct_span_warn(&self, span: impl Into<MultiSpan>, msg: &str) -> DiagnosticBuilder<'_> {
         let mut result = self.struct_warn(msg);
+        result.set_span(span);
+        result
+    }
+
+    /// Construct a builder at the `Warning` level at the given `span` and with the `msg`.
+    ///
+    /// This will "force" the warning meaning it will not be canceled even
+    /// if warnings cannot be emitted.
+    pub fn struct_span_force_warn(
+        &self,
+        span: impl Into<MultiSpan>,
+        msg: &str,
+    ) -> DiagnosticBuilder<'_> {
+        let mut result = self.struct_force_warn(msg);
         result.set_span(span);
         result
     }
@@ -552,12 +578,22 @@ impl Handler {
     }
 
     /// Construct a builder at the `Warning` level with the `msg`.
+    ///
+    /// The builder will be canceled if warnings cannot be emitted.
     pub fn struct_warn(&self, msg: &str) -> DiagnosticBuilder<'_> {
         let mut result = DiagnosticBuilder::new(self, Level::Warning, msg);
         if !self.flags.can_emit_warnings {
             result.cancel();
         }
         result
+    }
+
+    /// Construct a builder at the `Warning` level with the `msg`.
+    ///
+    /// This will "force" a warning meaning it will not be canceled even
+    /// if warnings cannot be emitted.
+    pub fn struct_force_warn(&self, msg: &str) -> DiagnosticBuilder<'_> {
+        DiagnosticBuilder::new(self, Level::Warning, msg)
     }
 
     /// Construct a builder at the `Allow` level with the `msg`.
@@ -765,7 +801,7 @@ impl Handler {
         self.inner.borrow_mut().emit_artifact_notification(path, artifact_type)
     }
 
-    pub fn emit_future_breakage_report(&self, diags: Vec<(FutureBreakage, Diagnostic)>) {
+    pub fn emit_future_breakage_report(&self, diags: Vec<Diagnostic>) {
         self.inner.borrow_mut().emitter.emit_future_breakage_report(diags)
     }
 
@@ -794,7 +830,7 @@ impl HandlerInner {
     }
 
     fn emit_diagnostic(&mut self, diagnostic: &Diagnostic) {
-        if diagnostic.cancelled() {
+        if diagnostic.cancelled() || self.quiet {
             return;
         }
 
@@ -802,7 +838,10 @@ impl HandlerInner {
             self.future_breakage_diagnostics.push(diagnostic.clone());
         }
 
-        if diagnostic.level == Warning && !self.flags.can_emit_warnings {
+        if diagnostic.level == Warning
+            && !self.flags.can_emit_warnings
+            && !diagnostic.is_force_warn()
+        {
             if diagnostic.has_future_breakage() {
                 (*TRACK_DIAGNOSTICS)(diagnostic);
             }
@@ -874,7 +913,7 @@ impl HandlerInner {
 
         match (errors.len(), warnings.len()) {
             (0, 0) => return,
-            (0, _) => self.emit_diagnostic(&Diagnostic::new(Level::Warning, &warnings)),
+            (0, _) => self.emitter.emit_diagnostic(&Diagnostic::new(Level::Warning, &warnings)),
             (_, 0) => {
                 let _ = self.fatal(&errors);
             }
@@ -1008,6 +1047,9 @@ impl HandlerInner {
     }
 
     fn delay_as_bug(&mut self, diagnostic: Diagnostic) {
+        if self.quiet {
+            return;
+        }
         if self.flags.report_delayed_bugs {
             self.emit_diagnostic(&diagnostic);
         }

@@ -15,7 +15,7 @@ use crate::mir::{
 use crate::ty::subst::SubstsRef;
 use crate::ty::{self, List, Ty, TyCtxt};
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::def_id::{CrateNum, DefId};
+use rustc_hir::def_id::DefId;
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_span::Span;
 use std::hash::Hash;
@@ -178,8 +178,6 @@ pub trait TyDecoder<'tcx>: Decoder {
     fn with_position<F, R>(&mut self, pos: usize, f: F) -> R
     where
         F: FnOnce(&mut Self) -> R;
-
-    fn map_encoded_cnum_to_current(&self, cnum: CrateNum) -> CrateNum;
 
     fn positioned_at_shorthand(&self) -> bool {
         (self.peek_byte() & (SHORTHAND_OFFSET as u8)) != 0
@@ -387,7 +385,7 @@ impl<'tcx, D: TyDecoder<'tcx>> RefDecodable<'tcx, D> for [mir::abstract_const::N
 impl<'tcx, D: TyDecoder<'tcx>> RefDecodable<'tcx, D> for ty::List<ty::BoundVariableKind> {
     fn decode(decoder: &mut D) -> Result<&'tcx Self, D::Error> {
         let len = decoder.read_usize()?;
-        Ok(decoder.tcx().mk_bound_variable_kinds((0..len).map(|_| Decodable::decode(decoder)))?)
+        decoder.tcx().mk_bound_variable_kinds((0..len).map(|_| Decodable::decode(decoder)))
     }
 }
 

@@ -25,10 +25,16 @@ static FILES_UNVERSIONED: Lazy<FxHashMap<&str, &[u8]>> = Lazy::new(|| {
         "FiraSans-Regular.woff" => static_files::fira_sans::REGULAR,
         "FiraSans-Medium.woff" => static_files::fira_sans::MEDIUM,
         "FiraSans-LICENSE.txt" => static_files::fira_sans::LICENSE,
+        "SourceSerif4-Regular.ttf.woff2" => static_files::source_serif_4::REGULAR2,
+        "SourceSerif4-Bold.ttf.woff2" => static_files::source_serif_4::BOLD2,
+        "SourceSerif4-It.ttf.woff2" => static_files::source_serif_4::ITALIC2,
         "SourceSerif4-Regular.ttf.woff" => static_files::source_serif_4::REGULAR,
         "SourceSerif4-Bold.ttf.woff" => static_files::source_serif_4::BOLD,
         "SourceSerif4-It.ttf.woff" => static_files::source_serif_4::ITALIC,
         "SourceSerif4-LICENSE.md" => static_files::source_serif_4::LICENSE,
+        "SourceCodePro-Regular.ttf.woff2" => static_files::source_code_pro::REGULAR2,
+        "SourceCodePro-Semibold.ttf.woff2" => static_files::source_code_pro::SEMIBOLD2,
+        "SourceCodePro-It.ttf.woff2" => static_files::source_code_pro::ITALIC2,
         "SourceCodePro-Regular.ttf.woff" => static_files::source_code_pro::REGULAR,
         "SourceCodePro-Semibold.ttf.woff" => static_files::source_code_pro::SEMIBOLD,
         "SourceCodePro-It.ttf.woff" => static_files::source_code_pro::ITALIC,
@@ -169,9 +175,45 @@ pub(super) fn write_shared(
         cx.write_shared(SharedResource::InvocationSpecific { basename: p }, content, &options.emit)
     };
 
+    fn add_background_image_to_css(
+        cx: &Context<'_>,
+        css: &mut String,
+        rule: &str,
+        file: &'static str,
+    ) {
+        css.push_str(&format!(
+            "{} {{ background-image: url({}); }}",
+            rule,
+            SharedResource::ToolchainSpecific { basename: file }
+                .path(cx)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        ))
+    }
+
     // Add all the static files. These may already exist, but we just
     // overwrite them anyway to make sure that they're fresh and up-to-date.
-    write_minify("rustdoc.css", static_files::RUSTDOC_CSS)?;
+    let mut rustdoc_css = static_files::RUSTDOC_CSS.to_owned();
+    add_background_image_to_css(
+        cx,
+        &mut rustdoc_css,
+        "details.undocumented[open] > summary::before, \
+         details.rustdoc-toggle[open] > summary::before, \
+         details.rustdoc-toggle[open] > summary.hideme::before",
+        "toggle-minus.svg",
+    );
+    add_background_image_to_css(
+        cx,
+        &mut rustdoc_css,
+        "details.undocumented > summary::before, details.rustdoc-toggle > summary::before",
+        "toggle-plus.svg",
+    );
+    write_minify("rustdoc.css", &rustdoc_css)?;
+
+    // Add all the static files. These may already exist, but we just
+    // overwrite them anyway to make sure that they're fresh and up-to-date.
     write_minify("settings.css", static_files::SETTINGS_CSS)?;
     write_minify("noscript.css", static_files::NOSCRIPT_CSS)?;
 
@@ -211,6 +253,8 @@ pub(super) fn write_shared(
     write_toolchain("wheel.svg", static_files::WHEEL_SVG)?;
     write_toolchain("clipboard.svg", static_files::CLIPBOARD_SVG)?;
     write_toolchain("down-arrow.svg", static_files::DOWN_ARROW_SVG)?;
+    write_toolchain("toggle-minus.svg", static_files::TOGGLE_MINUS_PNG)?;
+    write_toolchain("toggle-plus.svg", static_files::TOGGLE_PLUS_PNG)?;
 
     let mut themes: Vec<&String> = themes.iter().collect();
     themes.sort();
@@ -228,7 +272,7 @@ pub(super) fn write_shared(
     write_minify("search.js", static_files::SEARCH_JS)?;
     write_minify("settings.js", static_files::SETTINGS_JS)?;
 
-    if cx.shared.include_sources {
+    if cx.include_sources {
         write_minify("source-script.js", static_files::sidebar::SOURCE_SCRIPT)?;
     }
 
@@ -354,7 +398,7 @@ pub(super) fn write_shared(
         }
     }
 
-    if cx.shared.include_sources {
+    if cx.include_sources {
         let mut hierarchy = Hierarchy::new(OsString::new());
         for source in cx
             .shared
@@ -460,7 +504,14 @@ pub(super) fn write_shared(
                     })
                     .collect::<String>()
             );
-            let v = layout::render(&cx.shared.layout, &page, "", content, &cx.shared.style_files);
+            let v = layout::render(
+                &cx.shared.templates,
+                &cx.shared.layout,
+                &page,
+                "",
+                content,
+                &cx.shared.style_files,
+            );
             cx.shared.fs.write(&dst, v.as_bytes())?;
         }
     }

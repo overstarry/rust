@@ -10,19 +10,23 @@ use rustc_span::source_map::Span;
 use rustc_span::BytePos;
 
 declare_clippy_lint! {
-    /// **What it does:** Checks for unit (`()`) expressions that can be removed.
+    /// ### What it does
+    /// Checks for unit (`()`) expressions that can be removed.
     ///
-    /// **Why is this bad?** Such expressions add no value, but can make the code
+    /// ### Why is this bad?
+    /// Such expressions add no value, but can make the code
     /// less readable. Depending on formatting they can make a `break` or `return`
     /// statement look like a function call.
     ///
-    /// **Known problems:** None.
-    ///
-    /// **Example:**
+    /// ### Example
     /// ```rust
     /// fn return_unit() -> () {
     ///     ()
     /// }
+    /// ```
+    /// is equivalent to
+    /// ```rust
+    /// fn return_unit() {}
     /// ```
     pub UNUSED_UNIT,
     style,
