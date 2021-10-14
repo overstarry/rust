@@ -129,6 +129,8 @@ impl<'infcx, 'tcx> InferCtxt<'infcx, 'tcx> {
     where
         R: ConstEquateRelation<'tcx>,
     {
+        let a = self.tcx.expose_default_const_substs(a);
+        let b = self.tcx.expose_default_const_substs(b);
         debug!("{}.consts({:?}, {:?})", relation.tag(), a, b);
         if a == b {
             return Ok(a);
@@ -200,7 +202,7 @@ impl<'infcx, 'tcx> InferCtxt<'infcx, 'tcx> {
     /// A good example of this is the following:
     ///
     /// ```rust
-    /// #![feature(const_generics)]
+    /// #![feature(generic_const_exprs)]
     ///
     /// fn bind<const N: usize>(value: [u8; N]) -> [u8; 3 + 4] {
     ///     todo!()
@@ -358,7 +360,8 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
             self.obligations.push(Obligation::new(
                 self.trace.cause.clone(),
                 self.param_env,
-                ty::PredicateKind::WellFormed(b_ty.into()).to_predicate(self.infcx.tcx),
+                ty::Binder::dummy(ty::PredicateKind::WellFormed(b_ty.into()))
+                    .to_predicate(self.infcx.tcx),
             ));
         }
 
@@ -461,7 +464,7 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
         self.obligations.push(Obligation::new(
             self.trace.cause.clone(),
             self.param_env,
-            predicate.to_predicate(self.tcx()),
+            ty::Binder::dummy(predicate).to_predicate(self.tcx()),
         ));
     }
 }
@@ -643,8 +646,13 @@ impl TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
                                 .inner
                                 .borrow_mut()
                                 .type_variables()
-                                .new_var(self.for_universe, false, origin);
+                                .new_var(self.for_universe, origin);
                             let u = self.tcx().mk_ty_var(new_var_id);
+
+                            // Record that we replaced `vid` with `new_var_id` as part of a generalization
+                            // operation. This is needed to detect cyclic types. To see why, see the
+                            // docs in the `type_variables` module.
+                            self.infcx.inner.borrow_mut().type_variables().sub(vid, new_var_id);
                             debug!("generalize: replacing original vid={:?} with new={:?}", vid, u);
                             Ok(u)
                         }
@@ -737,10 +745,9 @@ impl TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
                     }
                 }
             }
-            ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted })
-                if self.tcx().lazy_normalization() =>
-            {
-                assert_eq!(promoted, None);
+            ty::ConstKind::Unevaluated(uv) if self.tcx().lazy_normalization() => {
+                assert_eq!(uv.promoted, None);
+                let substs = uv.substs(self.tcx());
                 let substs = self.relate_with_variance(
                     ty::Variance::Invariant,
                     ty::VarianceDiagInfo::default(),
@@ -749,7 +756,7 @@ impl TypeRelation<'tcx> for Generalizer<'_, 'tcx> {
                 )?;
                 Ok(self.tcx().mk_const(ty::Const {
                     ty: c.ty,
-                    val: ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted }),
+                    val: ty::ConstKind::Unevaluated(ty::Unevaluated::new(uv.def, substs)),
                 }))
             }
             _ => relate::super_relate_consts(self, c, c),
@@ -879,11 +886,12 @@ impl TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
 
                         let origin =
                             *self.infcx.inner.borrow_mut().type_variables().var_origin(vid);
-                        let new_var_id = self.infcx.inner.borrow_mut().type_variables().new_var(
-                            self.for_universe,
-                            false,
-                            origin,
-                        );
+                        let new_var_id = self
+                            .infcx
+                            .inner
+                            .borrow_mut()
+                            .type_variables()
+                            .new_var(self.for_universe, origin);
                         let u = self.tcx().mk_ty_var(new_var_id);
                         debug!(
                             "ConstInferUnifier: replacing original vid={:?} with new={:?}",
@@ -971,10 +979,9 @@ impl TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
                     }
                 }
             }
-            ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted })
-                if self.tcx().lazy_normalization() =>
-            {
-                assert_eq!(promoted, None);
+            ty::ConstKind::Unevaluated(uv) if self.tcx().lazy_normalization() => {
+                assert_eq!(uv.promoted, None);
+                let substs = uv.substs(self.tcx());
                 let substs = self.relate_with_variance(
                     ty::Variance::Invariant,
                     ty::VarianceDiagInfo::default(),
@@ -983,7 +990,7 @@ impl TypeRelation<'tcx> for ConstInferUnifier<'_, 'tcx> {
                 )?;
                 Ok(self.tcx().mk_const(ty::Const {
                     ty: c.ty,
-                    val: ty::ConstKind::Unevaluated(ty::Unevaluated { def, substs, promoted }),
+                    val: ty::ConstKind::Unevaluated(ty::Unevaluated::new(uv.def, substs)),
                 }))
             }
             _ => relate::super_relate_consts(self, c, c),

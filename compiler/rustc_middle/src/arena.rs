@@ -9,9 +9,10 @@
 /// listed. These impls will appear in the implement_ty_decoder! macro.
 #[macro_export]
 macro_rules! arena_types {
-    ($macro:path, $args:tt, $tcx:lifetime) => (
-        $macro!($args, [
-            [] layouts: rustc_target::abi::Layout,
+    ($macro:path, $tcx:lifetime) => (
+        $macro!([
+            [] layout: rustc_target::abi::Layout,
+            [] fn_abi: rustc_target::abi::call::FnAbi<$tcx, rustc_middle::ty::Ty<$tcx>>,
             // AdtDef are interned and compared by address
             [] adt_def: rustc_middle::ty::AdtDef,
             [] steal_thir: rustc_data_structures::steal::Steal<rustc_middle::thir::Thir<$tcx>>,
@@ -78,8 +79,8 @@ macro_rules! arena_types {
                 >,
             [few] all_traits: Vec<rustc_hir::def_id::DefId>,
             [few] privacy_access_levels: rustc_middle::middle::privacy::AccessLevels,
-            [few] foreign_module: rustc_middle::middle::cstore::ForeignModule,
-            [few] foreign_modules: Vec<rustc_middle::middle::cstore::ForeignModule>,
+            [few] foreign_module: rustc_session::cstore::ForeignModule,
+            [few] foreign_modules: Vec<rustc_session::cstore::ForeignModule>,
             [] upvars_mentioned: rustc_data_structures::fx::FxIndexMap<rustc_hir::HirId, rustc_hir::Upvar>,
             [] object_safety_violations: rustc_middle::traits::ObjectSafetyViolation,
             [] codegen_unit: rustc_middle::mir::mono::CodegenUnit<$tcx>,
@@ -109,4 +110,4 @@ macro_rules! arena_types {
     )
 }
 
-arena_types!(rustc_arena::declare_arena, [], 'tcx);
+arena_types!(rustc_arena::declare_arena, 'tcx);

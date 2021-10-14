@@ -1,5 +1,6 @@
 use core::cell::Cell;
 use core::cmp::Ordering;
+use core::mem::MaybeUninit;
 use core::result::Result::{Err, Ok};
 
 #[test]
@@ -739,6 +740,10 @@ fn test_array_windows_count() {
     let v3: &[i32] = &[];
     let c3 = v3.array_windows::<2>();
     assert_eq!(c3.count(), 0);
+
+    let v4: &[()] = &[(); usize::MAX];
+    let c4 = v4.array_windows::<1>();
+    assert_eq!(c4.count(), usize::MAX);
 }
 
 #[test]
@@ -1050,6 +1055,10 @@ fn test_windows_count() {
     let v3: &[i32] = &[];
     let c3 = v3.windows(2);
     assert_eq!(c3.count(), 0);
+
+    let v4 = &[(); usize::MAX];
+    let c4 = v4.windows(1);
+    assert_eq!(c4.count(), usize::MAX);
 }
 
 #[test]
@@ -2135,4 +2144,11 @@ fn test_slice_run_destructors() {
     }
 
     assert_eq!(x.get(), 1);
+}
+
+#[test]
+fn test_slice_fill_with_uninit() {
+    // This should not UB. See #87891
+    let mut a = [MaybeUninit::<u8>::uninit(); 10];
+    a.fill(MaybeUninit::uninit());
 }

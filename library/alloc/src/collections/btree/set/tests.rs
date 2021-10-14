@@ -16,13 +16,6 @@ fn test_clone_eq() {
     assert_eq!(m.clone(), m);
 }
 
-#[allow(dead_code)]
-fn test_const() {
-    const SET: &'static BTreeSet<()> = &BTreeSet::new();
-    const LEN: usize = SET.len();
-    const IS_EMPTY: bool = SET.is_empty();
-}
-
 #[test]
 fn test_iter_min_max() {
     let mut a = BTreeSet::new();
@@ -614,7 +607,7 @@ fn test_send() {
     }
 }
 
-#[allow(dead_code)]
+#[test]
 fn test_ord_absence() {
     fn set<K>(mut set: BTreeSet<K>) {
         set.is_empty();
@@ -633,6 +626,12 @@ fn test_ord_absence() {
     fn set_clone<K: Clone>(mut set: BTreeSet<K>) {
         set.clone_from(&set.clone());
     }
+
+    #[derive(Debug, Clone)]
+    struct NonOrd;
+    set(BTreeSet::<NonOrd>::new());
+    set_debug(BTreeSet::<NonOrd>::new());
+    set_clone(BTreeSet::<NonOrd>::default());
 }
 
 #[test]

@@ -1,14 +1,15 @@
-#![feature(const_generics)]
 #![feature(type_alias_impl_trait)]
-#![allow(incomplete_features)]
 
 use std::fmt::Debug;
 
 fn main() {}
 
 type OneTy<T> = impl Debug;
+//~^ ERROR could not find defining uses
 type OneLifetime<'a> = impl Debug;
+//~^ ERROR could not find defining uses
 type OneConst<const X: usize> = impl Debug;
+//~^ ERROR could not find defining uses
 
 // Not defining uses, because they doesn't define *all* possible generics.
 

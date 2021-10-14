@@ -4,9 +4,8 @@ use rustc_driver::abort_on_err;
 use rustc_errors::emitter::{Emitter, EmitterWriter};
 use rustc_errors::json::JsonEmitter;
 use rustc_feature::UnstableFeatures;
-use rustc_hir::def::Namespace::TypeNS;
 use rustc_hir::def::Res;
-use rustc_hir::def_id::{DefId, LocalDefId, CRATE_DEF_INDEX};
+use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::HirId;
 use rustc_hir::{
     intravisit::{self, NestedVisitorMap, Visitor},
@@ -23,9 +22,10 @@ use rustc_session::DiagnosticOutput;
 use rustc_session::Session;
 use rustc_span::source_map;
 use rustc_span::symbol::sym;
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::Span;
 
 use std::cell::RefCell;
+use std::lazy::SyncLazy;
 use std::mem;
 use std::rc::Rc;
 
@@ -205,7 +205,6 @@ crate fn create_config(
         lint_opts,
         describe_lints,
         lint_cap,
-        display_warnings,
         ..
     }: RustdocOptions,
 ) -> rustc_interface::Config {
@@ -238,7 +237,7 @@ crate fn create_config(
         maybe_sysroot,
         search_paths: libs,
         crate_types,
-        lint_opts: if !display_warnings { lint_opts } else { vec![] },
+        lint_opts,
         lint_cap,
         cg: codegen_options,
         externs,
@@ -273,9 +272,8 @@ crate fn create_config(
             providers.typeck_item_bodies = |_, _| {};
             // hack so that `used_trait_imports` won't try to call typeck
             providers.used_trait_imports = |_, _| {
-                lazy_static! {
-                    static ref EMPTY_SET: FxHashSet<LocalDefId> = FxHashSet::default();
-                }
+                static EMPTY_SET: SyncLazy<FxHashSet<LocalDefId>> =
+                    SyncLazy::new(FxHashSet::default);
                 &EMPTY_SET
             };
             // In case typeck does end up being called, don't ICE in case there were name resolution errors
@@ -301,41 +299,13 @@ crate fn create_config(
 }
 
 crate fn create_resolver<'a>(
-    externs: config::Externs,
     queries: &Queries<'a>,
     sess: &Session,
 ) -> Rc<RefCell<interface::BoxedResolver>> {
-    let extern_names: Vec<String> = externs
-        .iter()
-        .filter(|(_, entry)| entry.add_prelude)
-        .map(|(name, _)| name)
-        .cloned()
-        .collect();
+    let (krate, resolver, _) = &*abort_on_err(queries.expansion(), sess).peek();
+    let resolver = resolver.clone();
 
-    let (_, resolver, _) = &*abort_on_err(queries.expansion(), sess).peek();
-
-    // Before we actually clone it, let's force all the extern'd crates to
-    // actually be loaded, just in case they're only referred to inside
-    // intra-doc links
-    resolver.borrow_mut().access(|resolver| {
-        sess.time("load_extern_crates", || {
-            for extern_name in &extern_names {
-                debug!("loading extern crate {}", extern_name);
-                if let Err(()) = resolver
-                    .resolve_str_path_error(
-                        DUMMY_SP,
-                        extern_name,
-                        TypeNS,
-                        LocalDefId { local_def_index: CRATE_DEF_INDEX }.to_def_id(),
-                  ) {
-                    warn!("unable to resolve external crate {} (do you have an unused `--extern` crate?)", extern_name)
-                  }
-            }
-        });
-    });
-
-    // Now we're good to clone the resolver because everything should be loaded
-    resolver.clone()
+    crate::passes::collect_intra_doc_links::load_intra_link_crates(resolver, krate)
 }
 
 crate fn run_global_ctxt(
@@ -359,18 +329,14 @@ crate fn run_global_ctxt(
 
     // NOTE: This is copy/pasted from typeck/lib.rs and should be kept in sync with those changes.
     tcx.sess.time("item_types_checking", || {
-        for &module in tcx.hir().krate().modules.keys() {
-            tcx.ensure().check_mod_item_types(module);
-        }
+        tcx.hir().for_each_module(|module| tcx.ensure().check_mod_item_types(module))
     });
     tcx.sess.abort_if_errors();
     tcx.sess.time("missing_docs", || {
         rustc_lint::check_crate(tcx, rustc_lint::builtin::MissingDoc::new);
     });
     tcx.sess.time("check_mod_attrs", || {
-        for &module in tcx.hir().krate().modules.keys() {
-            tcx.ensure().check_mod_attrs(module);
-        }
+        tcx.hir().for_each_module(|module| tcx.ensure().check_mod_attrs(module))
     });
     rustc_passes::stability::check_unused_or_stable_features(tcx);
 
@@ -528,9 +494,7 @@ crate fn run_global_ctxt(
 
     let render_options = ctxt.render_options;
     let mut cache = ctxt.cache;
-    krate = tcx.sess.time("create_format_cache", || {
-        cache.populate(krate, tcx, &render_options.extern_html_root_urls, &render_options.output)
-    });
+    krate = tcx.sess.time("create_format_cache", || cache.populate(krate, tcx, &render_options));
 
     // The main crate doc comments are always collapsed.
     krate.collapsed = true;

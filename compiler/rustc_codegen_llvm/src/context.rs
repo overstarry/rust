@@ -14,16 +14,22 @@ use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::base_n;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::small_c_str::SmallCStr;
-use rustc_middle::bug;
 use rustc_middle::mir::mono::CodegenUnit;
-use rustc_middle::ty::layout::{HasParamEnv, LayoutError, TyAndLayout};
+use rustc_middle::ty::layout::{
+    FnAbiError, FnAbiOfHelpers, FnAbiRequest, HasParamEnv, LayoutError, LayoutOfHelpers,
+    TyAndLayout,
+};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
+use rustc_middle::{bug, span_bug};
 use rustc_session::config::{CFGuard, CrateType, DebugInfo};
 use rustc_session::Session;
-use rustc_span::source_map::{Span, DUMMY_SP};
+use rustc_span::source_map::Span;
 use rustc_span::symbol::Symbol;
-use rustc_target::abi::{HasDataLayout, LayoutOf, PointeeInfo, Size, TargetDataLayout, VariantIdx};
+use rustc_target::abi::{
+    call::FnAbi, HasDataLayout, PointeeInfo, Size, TargetDataLayout, VariantIdx,
+};
 use rustc_target::spec::{HasTargetSpec, RelocModel, Target, TlsModel};
+use smallvec::SmallVec;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::CStr;
@@ -74,8 +80,16 @@ pub struct CodegenCx<'ll, 'tcx> {
     /// See <https://llvm.org/docs/LangRef.html#the-llvm-used-global-variable> for details
     pub used_statics: RefCell<Vec<&'ll Value>>,
 
-    pub lltypes: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), &'ll Type>>,
+    /// Statics that will be placed in the llvm.compiler.used variable
+    /// See <https://llvm.org/docs/LangRef.html#the-llvm-compiler-used-global-variable> for details
+    pub compiler_used_statics: RefCell<Vec<&'ll Value>>,
+
+    /// Mapping of non-scalar types to llvm types and field remapping if needed.
+    pub type_lowering: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), TypeLowering<'ll>>>,
+
+    /// Mapping of scalar types to llvm types.
     pub scalar_lltypes: RefCell<FxHashMap<Ty<'tcx>, &'ll Type>>,
+
     pub pointee_infos: RefCell<FxHashMap<(Ty<'tcx>, Size), Option<PointeeInfo>>>,
     pub isize_ty: &'ll Type,
 
@@ -92,6 +106,15 @@ pub struct CodegenCx<'ll, 'tcx> {
     local_gen_sym_counter: Cell<usize>,
 }
 
+pub struct TypeLowering<'ll> {
+    /// Associated LLVM type
+    pub lltype: &'ll Type,
+
+    /// If padding is used the slice maps fields from source order
+    /// to llvm order.
+    pub field_remapping: Option<SmallVec<[u32; 4]>>,
+}
+
 fn to_llvm_tls_model(tls_model: TlsModel) -> llvm::ThreadLocalMode {
     match tls_model {
         TlsModel::GeneralDynamic => llvm::ThreadLocalMode::GeneralDynamic,
@@ -99,10 +122,6 @@ fn to_llvm_tls_model(tls_model: TlsModel) -> llvm::ThreadLocalMode {
         TlsModel::InitialExec => llvm::ThreadLocalMode::InitialExec,
         TlsModel::LocalExec => llvm::ThreadLocalMode::LocalExec,
     }
-}
-
-fn strip_powerpc64_vectors(data_layout: String) -> String {
-    data_layout.replace("-v256:256:256-v512:512:512", "")
 }
 
 pub unsafe fn create_module(
@@ -116,7 +135,18 @@ pub unsafe fn create_module(
 
     let mut target_data_layout = sess.target.data_layout.clone();
     if llvm_util::get_version() < (12, 0, 0) && sess.target.arch == "powerpc64" {
-        target_data_layout = strip_powerpc64_vectors(target_data_layout);
+        target_data_layout = target_data_layout.replace("-v256:256:256-v512:512:512", "");
+    }
+    if llvm_util::get_version() < (13, 0, 0) {
+        if sess.target.arch == "powerpc64" {
+            target_data_layout = target_data_layout.replace("-S128", "");
+        }
+        if sess.target.arch == "wasm32" {
+            target_data_layout = "e-m:e-p:32:32-i64:64-n32:64-S128".to_string();
+        }
+        if sess.target.arch == "wasm64" {
+            target_data_layout = "e-m:e-p:64:64-i64:64-n32:64-S128".to_string();
+        }
     }
 
     // Ensure the data-layout values hardcoded remain the defaults.
@@ -165,11 +195,14 @@ pub unsafe fn create_module(
     let llvm_target = SmallCStr::new(&sess.target.llvm_target);
     llvm::LLVMRustSetNormalizedTarget(llmod, llvm_target.as_ptr());
 
-    if sess.relocation_model() == RelocModel::Pic {
+    let reloc_model = sess.relocation_model();
+    if matches!(reloc_model, RelocModel::Pic | RelocModel::Pie) {
         llvm::LLVMRustSetModulePICLevel(llmod);
         // PIE is potentially more effective than PIC, but can only be used in executables.
         // If all our outputs are executables, then we can relax PIC to PIE.
-        if sess.crate_types().iter().all(|ty| *ty == CrateType::Executable) {
+        if reloc_model == RelocModel::Pie
+            || sess.crate_types().iter().all(|ty| *ty == CrateType::Executable)
+        {
             llvm::LLVMRustSetModulePIELevel(llmod);
         }
     }
@@ -304,7 +337,8 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
             const_globals: Default::default(),
             statics_to_rauw: RefCell::new(Vec::new()),
             used_statics: RefCell::new(Vec::new()),
-            lltypes: Default::default(),
+            compiler_used_statics: RefCell::new(Vec::new()),
+            type_lowering: Default::default(),
             scalar_lltypes: Default::default(),
             pointee_infos: Default::default(),
             isize_ty,
@@ -325,6 +359,18 @@ impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     #[inline]
     pub fn coverage_context(&'a self) -> Option<&'a coverageinfo::CrateCoverageContext<'ll, 'tcx>> {
         self.coverage_cx.as_ref()
+    }
+
+    fn create_used_variable_impl(&self, name: &'static CStr, values: &[&'ll Value]) {
+        let section = cstr!("llvm.metadata");
+        let array = self.const_array(self.type_ptr_to(self.type_i8()), values);
+
+        unsafe {
+            let g = llvm::LLVMAddGlobal(self.llmod, self.val_ty(array), name.as_ptr());
+            llvm::LLVMSetInitializer(g, array);
+            llvm::LLVMRustSetLinkage(g, llvm::Linkage::AppendingLinkage);
+            llvm::LLVMSetSection(g, section.as_ptr());
+        }
     }
 }
 
@@ -401,7 +447,7 @@ impl MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     }
 
     fn sess(&self) -> &Session {
-        &self.tcx.sess
+        self.tcx.sess
     }
 
     fn check_overflow(&self) -> bool {
@@ -416,6 +462,10 @@ impl MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         &self.used_statics
     }
 
+    fn compiler_used_statics(&self) -> &RefCell<Vec<&'ll Value>> {
+        &self.compiler_used_statics
+    }
+
     fn set_frame_pointer_type(&self, llfn: &'ll Value) {
         attributes::set_frame_pointer_type(self, llfn)
     }
@@ -426,17 +476,14 @@ impl MiscMethods<'tcx> for CodegenCx<'ll, 'tcx> {
     }
 
     fn create_used_variable(&self) {
-        let name = cstr!("llvm.used");
-        let section = cstr!("llvm.metadata");
-        let array =
-            self.const_array(&self.type_ptr_to(self.type_i8()), &*self.used_statics.borrow());
+        self.create_used_variable_impl(cstr!("llvm.used"), &*self.used_statics.borrow());
+    }
 
-        unsafe {
-            let g = llvm::LLVMAddGlobal(self.llmod, self.val_ty(array), name.as_ptr());
-            llvm::LLVMSetInitializer(g, array);
-            llvm::LLVMRustSetLinkage(g, llvm::Linkage::AppendingLinkage);
-            llvm::LLVMSetSection(g, section.as_ptr());
-        }
+    fn create_compiler_used_variable(&self) {
+        self.create_used_variable_impl(
+            cstr!("llvm.compiler.used"),
+            &*self.compiler_used_statics.borrow(),
+        );
     }
 
     fn declare_c_main(&self, fn_type: Self::Type) -> Option<Self::Function> {
@@ -796,27 +843,58 @@ impl ty::layout::HasTyCtxt<'tcx> for CodegenCx<'ll, 'tcx> {
     }
 }
 
-impl LayoutOf for CodegenCx<'ll, 'tcx> {
-    type Ty = Ty<'tcx>;
-    type TyAndLayout = TyAndLayout<'tcx>;
-
-    fn layout_of(&self, ty: Ty<'tcx>) -> Self::TyAndLayout {
-        self.spanned_layout_of(ty, DUMMY_SP)
-    }
-
-    fn spanned_layout_of(&self, ty: Ty<'tcx>, span: Span) -> Self::TyAndLayout {
-        self.tcx.layout_of(ty::ParamEnv::reveal_all().and(ty)).unwrap_or_else(|e| {
-            if let LayoutError::SizeOverflow(_) = e {
-                self.sess().span_fatal(span, &e.to_string())
-            } else {
-                bug!("failed to get layout for `{}`: {}", ty, e)
-            }
-        })
-    }
-}
-
 impl<'tcx, 'll> HasParamEnv<'tcx> for CodegenCx<'ll, 'tcx> {
     fn param_env(&self) -> ty::ParamEnv<'tcx> {
         ty::ParamEnv::reveal_all()
+    }
+}
+
+impl LayoutOfHelpers<'tcx> for CodegenCx<'ll, 'tcx> {
+    type LayoutOfResult = TyAndLayout<'tcx>;
+
+    #[inline]
+    fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
+        if let LayoutError::SizeOverflow(_) = err {
+            self.sess().span_fatal(span, &err.to_string())
+        } else {
+            span_bug!(span, "failed to get layout for `{}`: {}", ty, err)
+        }
+    }
+}
+
+impl FnAbiOfHelpers<'tcx> for CodegenCx<'ll, 'tcx> {
+    type FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>;
+
+    #[inline]
+    fn handle_fn_abi_err(
+        &self,
+        err: FnAbiError<'tcx>,
+        span: Span,
+        fn_abi_request: FnAbiRequest<'tcx>,
+    ) -> ! {
+        if let FnAbiError::Layout(LayoutError::SizeOverflow(_)) = err {
+            self.sess().span_fatal(span, &err.to_string())
+        } else {
+            match fn_abi_request {
+                FnAbiRequest::OfFnPtr { sig, extra_args } => {
+                    span_bug!(
+                        span,
+                        "`fn_abi_of_fn_ptr({}, {:?})` failed: {}",
+                        sig,
+                        extra_args,
+                        err
+                    );
+                }
+                FnAbiRequest::OfInstance { instance, extra_args } => {
+                    span_bug!(
+                        span,
+                        "`fn_abi_of_instance({}, {:?})` failed: {}",
+                        instance,
+                        extra_args,
+                        err
+                    );
+                }
+            }
+        }
     }
 }

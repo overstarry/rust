@@ -195,6 +195,7 @@
     test(no_crate_inject, attr(deny(warnings))),
     test(attr(allow(dead_code, deprecated, unused_variables, unused_mut)))
 )]
+#![cfg_attr(not(bootstrap), doc(cfg_hide(not(test), not(any(test, bootstrap)))))]
 // Don't link to std. We are std.
 #![no_std]
 #![warn(deprecated_in_future)]
@@ -234,6 +235,7 @@
 #![feature(atomic_mut_ptr)]
 #![feature(auto_traits)]
 #![feature(bench_black_box)]
+#![feature(bool_to_option)]
 #![feature(box_syntax)]
 #![feature(c_unwind)]
 #![feature(c_variadic)]
@@ -247,22 +249,26 @@
 #![feature(const_cstr_unchecked)]
 #![feature(const_fn_floating_point_arithmetic)]
 #![feature(const_fn_fn_ptr_basics)]
-#![cfg_attr(bootstrap, feature(const_fn_transmute))]
 #![feature(const_format_args)]
 #![feature(const_io_structs)]
 #![feature(const_ip)]
 #![feature(const_ipv4)]
 #![feature(const_ipv6)]
+#![feature(const_option)]
 #![feature(const_raw_ptr_deref)]
 #![feature(const_socketaddr)]
+#![feature(const_trait_impl)]
 #![feature(container_error_extra)]
 #![feature(core_intrinsics)]
+#![feature(core_panic)]
 #![feature(custom_test_frameworks)]
 #![feature(decl_macro)]
 #![feature(doc_cfg)]
+#![cfg_attr(not(bootstrap), feature(doc_cfg_hide))]
 #![feature(doc_keyword)]
 #![feature(doc_masked)]
 #![feature(doc_notable_trait)]
+#![feature(doc_primitive)]
 #![feature(dropck_eyepatch)]
 #![feature(duration_checked_float)]
 #![feature(duration_constants)]
@@ -293,6 +299,8 @@
 #![feature(maybe_uninit_slice)]
 #![feature(maybe_uninit_uninit_array)]
 #![feature(min_specialization)]
+#![feature(mixed_integer_ops)]
+#![cfg_attr(not(bootstrap), feature(must_not_suspend))]
 #![feature(needs_panic_runtime)]
 #![feature(negative_impls)]
 #![feature(never_type)]
@@ -308,6 +316,8 @@
 #![feature(ptr_internals)]
 #![feature(rustc_attrs)]
 #![feature(rustc_private)]
+#![feature(saturating_div)]
+#![feature(saturating_int_impl)]
 #![feature(slice_concat_ext)]
 #![feature(slice_internals)]
 #![feature(slice_ptr_get)]
@@ -324,10 +334,8 @@
 #![feature(total_cmp)]
 #![feature(trace_macros)]
 #![feature(try_blocks)]
-#![feature(try_reserve)]
 #![feature(try_reserve_kind)]
 #![feature(unboxed_closures)]
-#![feature(unsafe_cell_raw_get)]
 #![feature(unwrap_infallible)]
 #![feature(vec_into_raw_parts)]
 #![feature(vec_spare_capacity)]
@@ -515,19 +523,19 @@ pub mod task {
     pub use alloc::task::*;
 }
 
-// Platform-abstraction modules
+// The runtime entry point and a few unstable public functions used by the
+// compiler
 #[macro_use]
-mod sys_common;
+pub mod rt;
+
+// Platform-abstraction modules
 mod sys;
+mod sys_common;
 
 pub mod alloc;
 
 // Private support modules
 mod panicking;
-
-// The runtime entry point and a few unstable public functions used by the
-// compiler
-pub mod rt;
 
 #[path = "../../backtrace/src/lib.rs"]
 #[allow(dead_code, unused_attributes)]

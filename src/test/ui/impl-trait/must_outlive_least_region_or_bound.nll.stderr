@@ -9,7 +9,7 @@ LL | fn elided(x: &i32) -> impl Copy { x }
 help: to allow this `impl Trait` to capture borrowed data with lifetime `'1`, add `'_` as a bound
    |
 LL | fn elided(x: &i32) -> impl Copy + '_ { x }
-   |                                 ^^^^
+   |                                 ++++
 
 error: lifetime may not live long enough
   --> $DIR/must_outlive_least_region_or_bound.rs:5:32
@@ -19,11 +19,10 @@ LL | fn explicit<'a>(x: &'a i32) -> impl Copy { x }
    |             |
    |             lifetime `'a` defined here
    |
-   = help: consider replacing `'a` with `'static`
 help: to allow this `impl Trait` to capture borrowed data with lifetime `'a`, add `'a` as a bound
    |
 LL | fn explicit<'a>(x: &'a i32) -> impl Copy + 'a { x }
-   |                                          ^^^^
+   |                                          ++++
 
 error: lifetime may not live long enough
   --> $DIR/must_outlive_least_region_or_bound.rs:7:46
@@ -41,7 +40,6 @@ error: lifetime may not live long enough
 LL | fn explicit2<'a>(x: &'a i32) -> impl Copy + 'static { x }
    |              -- lifetime `'a` defined here            ^ returning this value requires that `'a` must outlive `'static`
    |
-   = help: consider replacing `'a` with `'static`
    = help: consider replacing `'a` with `'static`
 
 error[E0621]: explicit lifetime required in the type of `x`
@@ -66,7 +64,6 @@ error: lifetime may not live long enough
 LL | fn with_bound<'a>(x: &'a i32) -> impl LifetimeTrait<'a> + 'static { x }
    |               -- lifetime `'a` defined here                         ^ returning this value requires that `'a` must outlive `'static`
    |
-   = help: consider replacing `'a` with `'static`
    = help: consider replacing `'a` with `'static`
 
 error: lifetime may not live long enough

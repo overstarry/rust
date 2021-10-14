@@ -348,7 +348,7 @@ macro_rules! make_mir_visitor {
                         ty::InstanceDef::VtableShim(_def_id) |
                         ty::InstanceDef::ReifyShim(_def_id) |
                         ty::InstanceDef::Virtual(_def_id, _) |
-                        ty::InstanceDef::ClosureOnceShim { call_once: _def_id } |
+                        ty::InstanceDef::ClosureOnceShim { call_once: _def_id, track_caller: _ } |
                         ty::InstanceDef::DropGlue(_def_id, None) => {}
 
                         ty::InstanceDef::FnPtrShim(_def_id, ty) |
@@ -587,14 +587,12 @@ macro_rules! make_mir_visitor {
                                 InlineAsmOperand::In { value, .. } => {
                                     self.visit_operand(value, location);
                                 }
-                                InlineAsmOperand::Out { place, .. } => {
-                                    if let Some(place) = place {
-                                        self.visit_place(
-                                            place,
-                                            PlaceContext::MutatingUse(MutatingUseContext::Store),
-                                            location,
-                                        );
-                                    }
+                                InlineAsmOperand::Out { place: Some(place), .. } => {
+                                    self.visit_place(
+                                        place,
+                                        PlaceContext::MutatingUse(MutatingUseContext::Store),
+                                        location,
+                                    );
                                 }
                                 InlineAsmOperand::InOut { in_value, out_place, .. } => {
                                     self.visit_operand(in_value, location);
@@ -610,7 +608,8 @@ macro_rules! make_mir_visitor {
                                 | InlineAsmOperand::SymFn { value } => {
                                     self.visit_constant(value, location);
                                 }
-                                InlineAsmOperand::SymStatic { def_id: _ } => {}
+                                InlineAsmOperand::Out { place: None, .. }
+                                | InlineAsmOperand::SymStatic { def_id: _ } => {}
                             }
                         }
                     }
@@ -753,6 +752,11 @@ macro_rules! make_mir_visitor {
                         for operand in operands {
                             self.visit_operand(operand, location);
                         }
+                    }
+
+                    Rvalue::ShallowInitBox(operand, ty) => {
+                        self.visit_operand(operand, location);
+                        self.visit_ty(ty, TyContext::Location(location));
                     }
                 }
             }
@@ -1202,7 +1206,7 @@ pub enum NonUseContext {
     StorageDead,
     /// User type annotation assertions for NLL.
     AscribeUserTy,
-    /// The data of an user variable, for debug info.
+    /// The data of a user variable, for debug info.
     VarDebugInfo,
 }
 

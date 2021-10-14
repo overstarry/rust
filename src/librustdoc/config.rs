@@ -137,7 +137,7 @@ crate struct Options {
     crate manual_passes: Vec<String>,
     /// Whether to display warnings during doc generation or while gathering doctests. By default,
     /// all non-rustdoc-specific lints are allowed when generating docs.
-    crate display_warnings: bool,
+    crate display_doctest_warnings: bool,
     /// Whether to run the `calculate-doc-coverage` pass, which counts the number of public items
     /// with and without documentation.
     crate show_coverage: bool,
@@ -192,7 +192,7 @@ impl fmt::Debug for Options {
             .field("persist_doctests", &self.persist_doctests)
             .field("default_passes", &self.default_passes)
             .field("manual_passes", &self.manual_passes)
-            .field("display_warnings", &self.display_warnings)
+            .field("display_doctest_warnings", &self.display_doctest_warnings)
             .field("show_coverage", &self.show_coverage)
             .field("crate_version", &self.crate_version)
             .field("render_options", &self.render_options)
@@ -233,6 +233,8 @@ crate struct RenderOptions {
     crate extension_css: Option<PathBuf>,
     /// A map of crate names to the URL to use instead of querying the crate's `html_root_url`.
     crate extern_html_root_urls: BTreeMap<String, String>,
+    /// Whether to give precedence to `html_root_url` or `--exten-html-root-url`.
+    crate extern_html_root_takes_precedence: bool,
     /// A map of the default settings (values are as for DOM storage API). Keys should lack the
     /// `rustdoc-` prefix.
     crate default_settings: FxHashMap<String, String>,
@@ -630,7 +632,7 @@ impl Options {
         let proc_macro_crate = crate_types.contains(&CrateType::ProcMacro);
         let playground_url = matches.opt_str("playground-url");
         let maybe_sysroot = matches.opt_str("sysroot").map(PathBuf::from);
-        let display_warnings = matches.opt_present("display-warnings");
+        let display_doctest_warnings = matches.opt_present("display-doctest-warnings");
         let sort_modules_alphabetically = !matches.opt_present("sort-modules-by-appearance");
         let resource_suffix = matches.opt_str("resource-suffix").unwrap_or_default();
         let enable_minification = !matches.opt_present("disable-minification");
@@ -658,6 +660,8 @@ impl Options {
         let show_type_layout = matches.opt_present("show-type-layout");
         let nocapture = matches.opt_present("nocapture");
         let generate_link_to_definition = matches.opt_present("generate-link-to-definition");
+        let extern_html_root_takes_precedence =
+            matches.opt_present("extern-html-root-takes-precedence");
 
         if generate_link_to_definition && (show_coverage || output_format != OutputFormat::Html) {
             diag.struct_err(
@@ -667,8 +671,7 @@ impl Options {
             return Err(1);
         }
 
-        let (lint_opts, describe_lints, lint_cap) =
-            get_cmd_lint_options(matches, error_format, &debugging_opts);
+        let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(matches, error_format);
 
         Ok(Options {
             input,
@@ -693,7 +696,7 @@ impl Options {
             test_args,
             default_passes,
             manual_passes,
-            display_warnings,
+            display_doctest_warnings,
             show_coverage,
             crate_version,
             test_run_directory,
@@ -714,6 +717,7 @@ impl Options {
                 themes,
                 extension_css,
                 extern_html_root_urls,
+                extern_html_root_takes_precedence,
                 default_settings,
                 resource_suffix,
                 enable_minification,

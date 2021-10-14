@@ -349,7 +349,7 @@ impl<T> Cell<T> {
         drop(old);
     }
 
-    /// Swaps the values of two Cells.
+    /// Swaps the values of two `Cell`s.
     /// Difference with `std::mem::swap` is that this function doesn't require `&mut` reference.
     ///
     /// # Examples
@@ -573,6 +573,26 @@ impl<T> Cell<[T]> {
     pub fn as_slice_of_cells(&self) -> &[Cell<T>] {
         // SAFETY: `Cell<T>` has the same memory layout as `T`.
         unsafe { &*(self as *const Cell<[T]> as *const [Cell<T>]) }
+    }
+}
+
+impl<T, const N: usize> Cell<[T; N]> {
+    /// Returns a `&[Cell<T>; N]` from a `&Cell<[T; N]>`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(as_array_of_cells)]
+    /// use std::cell::Cell;
+    ///
+    /// let mut array: [i32; 3] = [1, 2, 3];
+    /// let cell_array: &Cell<[i32; 3]> = Cell::from_mut(&mut array);
+    /// let array_cell: &[Cell<i32>; 3] = cell_array.as_array_of_cells();
+    /// ```
+    #[unstable(feature = "as_array_of_cells", issue = "88248")]
+    pub fn as_array_of_cells(&self) -> &[Cell<T>; N] {
+        // SAFETY: `Cell<T>` has the same memory layout as `T`.
+        unsafe { &*(self as *const Cell<[T; N]> as *const [Cell<T>; N]) }
     }
 }
 
@@ -1283,6 +1303,11 @@ impl Clone for BorrowRef<'_> {
 ///
 /// See the [module-level documentation](self) for more.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(
+    not(bootstrap),
+    must_not_suspend = "holding a Ref across suspend \
+                      points can cause BorrowErrors"
+)]
 pub struct Ref<'b, T: ?Sized + 'b> {
     value: &'b T,
     borrow: BorrowRef<'b>,
@@ -1659,6 +1684,11 @@ impl<'b> BorrowRefMut<'b> {
 ///
 /// See the [module-level documentation](self) for more.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(
+    not(bootstrap),
+    must_not_suspend = "holding a RefMut across suspend \
+                      points can cause BorrowErrors"
+)]
 pub struct RefMut<'b, T: ?Sized + 'b> {
     value: &'b mut T,
     borrow: BorrowRefMut<'b>,
@@ -1896,12 +1926,13 @@ impl<T: ?Sized> UnsafeCell<T> {
     /// ```
     #[inline(always)]
     #[stable(feature = "unsafe_cell_get_mut", since = "1.50.0")]
-    pub fn get_mut(&mut self) -> &mut T {
+    #[rustc_const_unstable(feature = "const_unsafecell_get_mut", issue = "88836")]
+    pub const fn get_mut(&mut self) -> &mut T {
         &mut self.value
     }
 
     /// Gets a mutable pointer to the wrapped value.
-    /// The difference to [`get`] is that this function accepts a raw pointer,
+    /// The difference from [`get`] is that this function accepts a raw pointer,
     /// which is useful to avoid the creation of temporary references.
     ///
     /// The result can be cast to a pointer of any kind.
@@ -1917,7 +1948,6 @@ impl<T: ?Sized> UnsafeCell<T> {
     /// calling `get` would require creating a reference to uninitialized data:
     ///
     /// ```
-    /// #![feature(unsafe_cell_raw_get)]
     /// use std::cell::UnsafeCell;
     /// use std::mem::MaybeUninit;
     ///
@@ -1928,7 +1958,7 @@ impl<T: ?Sized> UnsafeCell<T> {
     /// assert_eq!(uc.into_inner(), 5);
     /// ```
     #[inline(always)]
-    #[unstable(feature = "unsafe_cell_raw_get", issue = "66358")]
+    #[stable(feature = "unsafe_cell_raw_get", since = "1.56.0")]
     pub const fn raw_get(this: *const Self) -> *mut T {
         // We can just cast the pointer from `UnsafeCell<T>` to `T` because of
         // #[repr(transparent)]. This exploits libstd's special status, there is

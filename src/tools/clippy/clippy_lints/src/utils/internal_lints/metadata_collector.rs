@@ -82,7 +82,7 @@ This lint has the following configuration variables:
 /// `default`
 macro_rules! CONFIGURATION_VALUE_TEMPLATE {
     () => {
-        "* {name}: {ty}: {doc} (defaults to `{default}`)\n"
+        "* `{name}`: `{ty}`: {doc} (defaults to `{default}`)\n"
     };
 }
 
@@ -298,6 +298,7 @@ pub struct ClippyConfiguration {
     default: String,
     lints: Vec<String>,
     doc: String,
+    #[allow(dead_code)]
     deprecation_reason: Option<&'static str>,
 }
 
@@ -344,10 +345,15 @@ fn parse_config_field_doc(doc_comment: &str) -> Option<(Vec<String>, String)> {
         if let Some(split_pos) = doc_comment.find('.');
         then {
             let mut doc_comment = doc_comment.to_string();
-            let documentation = doc_comment.split_off(split_pos);
+            let mut documentation = doc_comment.split_off(split_pos);
 
+            // Extract lints
             doc_comment.make_ascii_lowercase();
             let lints: Vec<String> = doc_comment.split_off(DOC_START.len()).split(", ").map(str::to_string).collect();
+
+            // Format documentation correctly
+            // split off leading `.` from lint name list and indent for correct formatting
+            documentation = documentation.trim_start_matches('.').trim().replace("\n ", "\n    ");
 
             Some((lints, documentation))
         } else {
@@ -780,8 +786,6 @@ impl<'a, 'hir> intravisit::Visitor<'hir> for ApplicabilityResolver<'a, 'hir> {
                 intravisit::walk_expr(self, local_init);
             }
         };
-
-        // TODO xFrednet 2021-03-01: support function arguments?
 
         intravisit::walk_expr(self, expr);
     }

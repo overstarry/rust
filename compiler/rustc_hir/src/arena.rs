@@ -9,8 +9,8 @@
 /// where `T` is the type listed. These impls will appear in the implement_ty_decoder! macro.
 #[macro_export]
 macro_rules! arena_types {
-    ($macro:path, $args:tt, $tcx:lifetime) => (
-        $macro!($args, [
+    ($macro:path, $tcx:lifetime) => (
+        $macro!([
             // HIR types
             [few] hir_krate: rustc_hir::Crate<$tcx>,
             [] arm: rustc_hir::Arm<$tcx>,
@@ -28,14 +28,13 @@ macro_rules! arena_types {
             [] pat_field: rustc_hir::PatField<$tcx>,
             [] fn_decl: rustc_hir::FnDecl<$tcx>,
             [] foreign_item: rustc_hir::ForeignItem<$tcx>,
-            [few] foreign_item_ref: rustc_hir::ForeignItemRef<$tcx>,
+            [few] foreign_item_ref: rustc_hir::ForeignItemRef,
             [] impl_item: rustc_hir::ImplItem<$tcx>,
-            [] impl_item_ref: rustc_hir::ImplItemRef<$tcx>,
+            [] impl_item_ref: rustc_hir::ImplItemRef,
             [] item: rustc_hir::Item<$tcx>,
             [few] inline_asm: rustc_hir::InlineAsm<$tcx>,
             [few] llvm_inline_asm: rustc_hir::LlvmInlineAsm<$tcx>,
             [] local: rustc_hir::Local<$tcx>,
-            [few] macro_def: rustc_hir::MacroDef<$tcx>,
             [few] mod_: rustc_hir::Mod<$tcx>,
             [] param: rustc_hir::Param<$tcx>,
             [] pat: rustc_hir::Pat<$tcx>,

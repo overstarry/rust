@@ -2,7 +2,7 @@
 //! intrinsics that the compiler exposes.
 
 use crate::errors::{
-    SimdShuffleMissingLength, UnrecognizedAtomicOperation, UnrecognizedIntrinsicFunction,
+    UnrecognizedAtomicOperation, UnrecognizedIntrinsicFunction,
     WrongNumberOfGenericArgumentsToIntrinsic,
 };
 use crate::require_same_types;
@@ -102,6 +102,7 @@ pub fn intrinsic_operation_unsafety(intrinsic: Symbol) -> hir::Unsafety {
         | sym::maxnumf64
         | sym::type_name
         | sym::forget
+        | sym::black_box
         | sym::variant_count => hir::Unsafety::Normal,
         _ => hir::Unsafety::Unsafe,
     }
@@ -387,6 +388,8 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
                 (1, vec![param_ty; 2], tcx.types.bool)
             }
 
+            sym::black_box => (1, vec![param(0)], param(0)),
+
             other => {
                 tcx.sess.emit_err(UnrecognizedIntrinsicFunction { span: it.span, name: other });
                 return;
@@ -465,6 +468,7 @@ pub fn check_platform_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>)
         | sym::simd_reduce_max
         | sym::simd_reduce_min_nanless
         | sym::simd_reduce_max_nanless => (2, vec![param(0)], param(1)),
+        sym::simd_shuffle => (3, vec![param(0), param(0), param(1)], param(2)),
         name if name.as_str().starts_with("simd_shuffle") => {
             match name.as_str()["simd_shuffle".len()..].parse() {
                 Ok(n) => {
@@ -472,7 +476,9 @@ pub fn check_platform_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>)
                     (2, params, param(1))
                 }
                 Err(_) => {
-                    tcx.sess.emit_err(SimdShuffleMissingLength { span: it.span, name });
+                    let msg =
+                        format!("unrecognized platform-specific intrinsic function: `{}`", name);
+                    tcx.sess.struct_span_err(it.span, &msg).emit();
                     return;
                 }
             }

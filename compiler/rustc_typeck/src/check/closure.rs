@@ -33,6 +33,7 @@ struct ClosureSignatures<'tcx> {
 }
 
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
+    #[instrument(skip(self, expr, _capture, decl, body_id), level = "debug")]
     pub fn check_expr_closure(
         &self,
         expr: &hir::Expr<'_>,
@@ -42,7 +43,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         gen: Option<hir::Movability>,
         expected: Expectation<'tcx>,
     ) -> Ty<'tcx> {
-        debug!("check_expr_closure(expr={:?},expected={:?})", expr, expected);
+        trace!("decl = {:#?}", decl);
+        trace!("expr = {:#?}", expr);
 
         // It's always helpful for inference if we know the kind of
         // closure sooner rather than later, so first examine the expected
@@ -55,6 +57,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         self.check_closure(expr, expected_kind, decl, body, gen, expected_sig)
     }
 
+    #[instrument(skip(self, expr, body, decl), level = "debug")]
     fn check_closure(
         &self,
         expr: &hir::Expr<'_>,
@@ -64,17 +67,28 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         gen: Option<hir::Movability>,
         expected_sig: Option<ExpectedSig<'tcx>>,
     ) -> Ty<'tcx> {
-        debug!("check_closure(opt_kind={:?}, expected_sig={:?})", opt_kind, expected_sig);
-
+        trace!("decl = {:#?}", decl);
         let expr_def_id = self.tcx.hir().local_def_id(expr.hir_id);
+        debug!(?expr_def_id);
 
         let ClosureSignatures { bound_sig, liberated_sig } =
             self.sig_of_closure(expr.hir_id, expr_def_id.to_def_id(), decl, body, expected_sig);
 
-        debug!("check_closure: ty_of_closure returns {:?}", liberated_sig);
+        debug!(?bound_sig, ?liberated_sig);
 
-        let generator_types =
-            check_fn(self, self.param_env, liberated_sig, decl, expr.hir_id, body, gen).1;
+        let return_type_pre_known = !liberated_sig.output().is_ty_infer();
+
+        let generator_types = check_fn(
+            self,
+            self.param_env,
+            liberated_sig,
+            decl,
+            expr.hir_id,
+            body,
+            gen,
+            return_type_pre_known,
+        )
+        .1;
 
         let parent_substs = InternalSubsts::identity_for_item(
             self.tcx,
@@ -119,10 +133,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             )
         });
 
-        debug!(
-            "check_closure: expr_def_id={:?}, sig={:?}, opt_kind={:?}",
-            expr_def_id, sig, opt_kind
-        );
+        debug!(?sig, ?opt_kind);
 
         let closure_kind_ty = match opt_kind {
             Some(kind) => kind.to_ty(self.tcx),
@@ -148,19 +159,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         let closure_type = self.tcx.mk_closure(expr_def_id.to_def_id(), closure_substs.substs);
 
-        debug!("check_closure: expr.hir_id={:?} closure_type={:?}", expr.hir_id, closure_type);
+        debug!(?expr.hir_id, ?closure_type);
 
         closure_type
     }
 
     /// Given the expected type, figures out what it can about this closure we
     /// are about to type check:
+    #[instrument(skip(self), level = "debug")]
     fn deduce_expectations_from_expected_type(
         &self,
         expected_ty: Ty<'tcx>,
     ) -> (Option<ExpectedSig<'tcx>>, Option<ty::ClosureKind>) {
-        debug!("deduce_expectations_from_expected_type(expected_ty={:?})", expected_ty);
-
         match *expected_ty.kind() {
             ty::Dynamic(ref object_type, ..) => {
                 let sig = object_type.projection_bounds().find_map(|pb| {
@@ -303,6 +313,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     /// If there is no expected signature, then we will convert the
     /// types that the user gave into a signature.
+    #[instrument(skip(self, hir_id, expr_def_id, decl, body), level = "debug")]
     fn sig_of_closure_no_expectation(
         &self,
         hir_id: hir::HirId,
@@ -310,8 +321,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         decl: &hir::FnDecl<'_>,
         body: &hir::Body<'_>,
     ) -> ClosureSignatures<'tcx> {
-        debug!("sig_of_closure_no_expectation()");
-
         let bound_sig = self.supplied_sig_of_closure(hir_id, expr_def_id, decl, body);
 
         self.closure_sigs(expr_def_id, body, bound_sig)
@@ -364,6 +373,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// - `expected_sig`: the expected signature (if any). Note that
     ///   this is missing a binder: that is, there may be late-bound
     ///   regions with depth 1, which are bound then by the closure.
+    #[instrument(skip(self, hir_id, expr_def_id, decl, body), level = "debug")]
     fn sig_of_closure_with_expectation(
         &self,
         hir_id: hir::HirId,
@@ -372,8 +382,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         body: &hir::Body<'_>,
         expected_sig: ExpectedSig<'tcx>,
     ) -> ClosureSignatures<'tcx> {
-        debug!("sig_of_closure_with_expectation(expected_sig={:?})", expected_sig);
-
         // Watch out for some surprises and just ignore the
         // expectation if things don't see to match up with what we
         // expect.
@@ -542,6 +550,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// types that the user gave into a signature.
     ///
     /// Also, record this closure signature for later.
+    #[instrument(skip(self, decl, body), level = "debug")]
     fn supplied_sig_of_closure(
         &self,
         hir_id: hir::HirId,
@@ -551,10 +560,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) -> ty::PolyFnSig<'tcx> {
         let astconv: &dyn AstConv<'_> = self;
 
-        debug!(
-            "supplied_sig_of_closure(decl={:?}, body.generator_kind={:?})",
-            decl, body.generator_kind,
-        );
+        trace!("decl = {:#?}", decl);
+        debug!(?body.generator_kind);
 
         let bound_vars = self.tcx.late_bound_vars(hir_id);
 
@@ -567,7 +574,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // we expect the return type of the block to match that of the enclosing
                 // function.
                 Some(hir::GeneratorKind::Async(hir::AsyncGeneratorKind::Fn)) => {
-                    debug!("supplied_sig_of_closure: closure is async fn body");
+                    debug!("closure is async fn body");
                     self.deduce_future_output_from_obligations(expr_def_id).unwrap_or_else(|| {
                         // AFAIK, deducing the future output
                         // always succeeds *except* in error cases
@@ -595,7 +602,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             bound_vars,
         );
 
-        debug!("supplied_sig_of_closure: result={:?}", result);
+        debug!(?result);
 
         let c_result = self.inh.infcx.canonicalize_response(result);
         self.typeck_results.borrow_mut().user_provided_sigs.insert(expr_def_id, c_result);
@@ -606,7 +613,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Invoked when we are translating the generator that results
     /// from desugaring an `async fn`. Returns the "sugared" return
     /// type of the `async fn` -- that is, the return type that the
-    /// user specified. The "desugared" return type is a `impl
+    /// user specified. The "desugared" return type is an `impl
     /// Future<Output = T>`, so we do this by searching through the
     /// obligations to extract the `T`.
     fn deduce_future_output_from_obligations(&self, expr_def_id: DefId) -> Option<Ty<'tcx>> {

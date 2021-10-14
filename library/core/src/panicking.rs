@@ -57,6 +57,13 @@ pub fn panic_str(expr: &str) -> ! {
     panic_fmt(format_args!("{}", expr));
 }
 
+#[inline]
+#[track_caller]
+#[cfg_attr(not(bootstrap), lang = "panic_display")] // needed for const-evaluated panics
+pub fn panic_display<T: fmt::Display>(x: &T) -> ! {
+    panic_fmt(format_args!("{}", *x));
+}
+
 #[cold]
 #[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
 #[track_caller]
@@ -74,7 +81,7 @@ fn panic_bounds_check(index: usize, len: usize) -> ! {
 #[cfg_attr(not(feature = "panic_immediate_abort"), inline(never))]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
 #[track_caller]
-#[cfg_attr(not(bootstrap), lang = "panic_fmt")] // needed for const-evaluated panics
+#[lang = "panic_fmt"] // needed for const-evaluated panics
 pub fn panic_fmt(fmt: fmt::Arguments<'_>) -> ! {
     if cfg!(feature = "panic_immediate_abort") {
         super::intrinsics::abort()
@@ -94,7 +101,6 @@ pub fn panic_fmt(fmt: fmt::Arguments<'_>) -> ! {
 }
 
 /// This function is used instead of panic_fmt in const eval.
-#[cfg(not(bootstrap))]
 #[lang = "const_panic_fmt"]
 pub const fn const_panic_fmt(fmt: fmt::Arguments<'_>) -> ! {
     if let Some(msg) = fmt.as_str() {

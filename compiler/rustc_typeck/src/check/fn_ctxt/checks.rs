@@ -9,6 +9,7 @@ use crate::check::{
 };
 
 use rustc_ast as ast;
+use rustc_data_structures::sync::Lrc;
 use rustc_errors::{Applicability, DiagnosticBuilder, DiagnosticId};
 use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
@@ -29,6 +30,7 @@ use std::slice;
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     pub(in super::super) fn check_casts(&self) {
         let mut deferred_cast_checks = self.deferred_cast_checks.borrow_mut();
+        debug!("FnCtxt::check_casts: {} deferred checks", deferred_cast_checks.len());
         for cast in deferred_cast_checks.drain(..) {
             cast.check(self);
         }
@@ -323,6 +325,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     self.point_at_arg_instead_of_call_if_possible(
                         errors,
                         &final_arg_types[..],
+                        expr,
                         sp,
                         &args,
                     );
@@ -353,8 +356,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     continue;
                 }
 
-                debug!("checking the argument");
                 let formal_ty = formal_tys[i];
+                debug!("checking argument {}: {:?} = {:?}", i, arg, formal_ty);
 
                 // The special-cased logic below has three functions:
                 // 1. Provide as good of an expected type as possible.
@@ -366,6 +369,42 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 //    to, which is `expected_ty` if `rvalue_hint` returns an
                 //    `ExpectHasType(expected_ty)`, or the `formal_ty` otherwise.
                 let coerce_ty = expected.only_has_type(self).unwrap_or(formal_ty);
+
+                // Cause selection errors caused by resolving a single argument to point at the
+                // argument and not the call. This is otherwise redundant with the `demand_coerce`
+                // call immediately after, but it lets us customize the span pointed to in the
+                // fulfillment error to be more accurate.
+                let _ = self.resolve_vars_with_obligations_and_mutate_fulfillment(
+                    coerce_ty,
+                    |errors| {
+                        // This is not coming from a macro or a `derive`.
+                        if sp.desugaring_kind().is_none()
+                        && !arg.span.from_expansion()
+                        // Do not change the spans of `async fn`s.
+                        && !matches!(
+                            expr.kind,
+                            hir::ExprKind::Call(
+                                hir::Expr {
+                                    kind: hir::ExprKind::Path(hir::QPath::LangItem(_, _)),
+                                    ..
+                                },
+                                _
+                            )
+                        ) {
+                            for error in errors {
+                                error.obligation.cause.make_mut().span = arg.span;
+                                let code = error.obligation.cause.code.clone();
+                                error.obligation.cause.make_mut().code =
+                                    ObligationCauseCode::FunctionArgumentObligation {
+                                        arg_hir_id: arg.hir_id,
+                                        call_hir_id: expr.hir_id,
+                                        parent_code: Lrc::new(code),
+                                    };
+                            }
+                        }
+                    },
+                );
+
                 // We're processing function arguments so we definitely want to use
                 // two-phase borrows.
                 self.demand_coerce(&arg, checked_ty, coerce_ty, None, AllowTwoPhase::Yes);
@@ -493,15 +532,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
             Some((variant, ty))
         } else {
-            struct_span_err!(
-                self.tcx.sess,
-                path_span,
-                E0071,
-                "expected struct, variant or union type, found {}",
-                ty.sort_string(self.tcx)
-            )
-            .span_label(path_span, "not a struct")
-            .emit();
+            match ty.kind() {
+                ty::Error(_) => {
+                    // E0071 might be caused by a spelling error, which will have
+                    // already caused an error message and probably a suggestion
+                    // elsewhere. Refrain from emitting more unhelpful errors here
+                    // (issue #88844).
+                }
+                _ => {
+                    struct_span_err!(
+                        self.tcx.sess,
+                        path_span,
+                        E0071,
+                        "expected struct, variant or union type, found {}",
+                        ty.sort_string(self.tcx)
+                    )
+                    .span_label(path_span, "not a struct")
+                    .emit();
+                }
+            }
             None
         }
     }
@@ -906,6 +955,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         &self,
         errors: &mut Vec<traits::FulfillmentError<'tcx>>,
         final_arg_types: &[(usize, Ty<'tcx>, Ty<'tcx>)],
+        expr: &'tcx hir::Expr<'tcx>,
         call_sp: Span,
         args: &'tcx [hir::Expr<'tcx>],
     ) {
@@ -923,7 +973,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 continue;
             }
 
-            if let ty::PredicateKind::Trait(predicate, _) =
+            if let ty::PredicateKind::Trait(predicate) =
                 error.obligation.predicate.kind().skip_binder()
             {
                 // Collect the argument position for all arguments that could have caused this
@@ -936,7 +986,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         let ty = self.resolve_vars_if_possible(ty);
                         // We walk the argument type because the argument's type could have
                         // been `Option<T>`, but the `FulfillmentError` references `T`.
-                        if ty.walk().any(|arg| arg == predicate.self_ty().into()) {
+                        if ty.walk(self.tcx).any(|arg| arg == predicate.self_ty().into()) {
                             Some(i)
                         } else {
                             None
@@ -955,7 +1005,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     // We make sure that only *one* argument matches the obligation failure
                     // and we assign the obligation's span to its expression's.
                     error.obligation.cause.make_mut().span = args[ref_in].span;
-                    error.points_at_arg_span = true;
+                    let code = error.obligation.cause.code.clone();
+                    error.obligation.cause.make_mut().code =
+                        ObligationCauseCode::FunctionArgumentObligation {
+                            arg_hir_id: args[ref_in].hir_id,
+                            call_hir_id: expr.hir_id,
+                            parent_code: Lrc::new(code),
+                        };
                 }
             }
         }
@@ -974,7 +1030,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             if let hir::ExprKind::Path(qpath) = &path.kind {
                 if let hir::QPath::Resolved(_, path) = &qpath {
                     for error in errors {
-                        if let ty::PredicateKind::Trait(predicate, _) =
+                        if let ty::PredicateKind::Trait(predicate) =
                             error.obligation.predicate.kind().skip_binder()
                         {
                             // If any of the type arguments in this path segment caused the

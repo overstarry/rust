@@ -2,6 +2,7 @@ use crate::traits::query::evaluate_obligation::InferCtxtExt as _;
 use crate::traits::query::outlives_bounds::InferCtxtExt as _;
 use crate::traits::{self, TraitEngine, TraitEngineExt};
 
+use rustc_data_structures::stable_set::FxHashSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
@@ -44,6 +45,10 @@ pub trait InferCtxtExt<'tcx> {
     /// - the self type
     /// - the *other* type parameters of the trait, excluding the self-type
     /// - the parameter environment
+    ///
+    /// Invokes `evaluate_obligation`, so in the event that evaluating
+    /// `Ty: Trait` causes overflow, EvaluatedToRecur (or EvaluatedToUnknown)
+    /// will be returned.
     fn type_implements_trait(
         &self,
         trait_def_id: DefId,
@@ -115,9 +120,9 @@ impl<'cx, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'cx, 'tcx> {
             cause: traits::ObligationCause::dummy(),
             param_env,
             recursion_depth: 0,
-            predicate: trait_ref.without_const().to_predicate(self.tcx),
+            predicate: ty::Binder::dummy(trait_ref).without_const().to_predicate(self.tcx),
         };
-        self.evaluate_obligation_no_overflow(&obligation)
+        self.evaluate_obligation(&obligation).unwrap_or(traits::EvaluationResult::EvaluatedToErr)
     }
 }
 
@@ -180,7 +185,7 @@ pub trait OutlivesEnvironmentExt<'tcx> {
     fn add_implied_bounds(
         &mut self,
         infcx: &InferCtxt<'a, 'tcx>,
-        fn_sig_tys: &[Ty<'tcx>],
+        fn_sig_tys: FxHashSet<Ty<'tcx>>,
         body_id: hir::HirId,
         span: Span,
     );
@@ -206,13 +211,13 @@ impl<'tcx> OutlivesEnvironmentExt<'tcx> for OutlivesEnvironment<'tcx> {
     fn add_implied_bounds(
         &mut self,
         infcx: &InferCtxt<'a, 'tcx>,
-        fn_sig_tys: &[Ty<'tcx>],
+        fn_sig_tys: FxHashSet<Ty<'tcx>>,
         body_id: hir::HirId,
         span: Span,
     ) {
         debug!("add_implied_bounds()");
 
-        for &ty in fn_sig_tys {
+        for ty in fn_sig_tys {
             let ty = infcx.resolve_vars_if_possible(ty);
             debug!("add_implied_bounds: ty = {}", ty);
             let implied_bounds = infcx.implied_outlives_bounds(self.param_env, body_id, ty, span);

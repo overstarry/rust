@@ -248,7 +248,7 @@ impl Type {
     }
 
     fn ptr_to(&self, address_space: AddressSpace) -> &Type {
-        unsafe { llvm::LLVMPointerType(&self, address_space.0) }
+        unsafe { llvm::LLVMPointerType(self, address_space.0) }
     }
 }
 
@@ -266,7 +266,7 @@ impl LayoutTypeMethods<'tcx> for CodegenCx<'ll, 'tcx> {
         layout.is_llvm_scalar_pair()
     }
     fn backend_field_index(&self, layout: TyAndLayout<'tcx>, index: usize) -> u64 {
-        layout.llvm_field_index(index)
+        layout.llvm_field_index(self, index)
     }
     fn scalar_pair_element_backend_type(
         &self,

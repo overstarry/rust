@@ -7,12 +7,12 @@ use crate::{PathResult, PathSource, Segment};
 
 use rustc_ast::visit::FnKind;
 use rustc_ast::{
-    self as ast, Expr, ExprKind, GenericParam, GenericParamKind, Item, ItemKind, NodeId, Path, Ty,
-    TyKind,
+    self as ast, AssocItemKind, Expr, ExprKind, GenericParam, GenericParamKind, Item, ItemKind,
+    NodeId, Path, Ty, TyKind,
 };
 use rustc_ast_pretty::pprust::path_segment_to_string;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{pluralize, struct_span_err, Applicability, DiagnosticBuilder, SuggestionStyle};
+use rustc_errors::{pluralize, struct_span_err, Applicability, DiagnosticBuilder};
 use rustc_hir as hir;
 use rustc_hir::def::Namespace::{self, *};
 use rustc_hir::def::{self, CtorKind, CtorOf, DefKind};
@@ -207,6 +207,16 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
         let code = source.error_code(res.is_some());
         let mut err = self.r.session.struct_span_err_with_code(base_span, &base_msg, code);
 
+        if let Some(span) = self.diagnostic_metadata.current_block_could_be_bare_struct_literal {
+            err.multipart_suggestion(
+                "you might have meant to write a `struct` literal",
+                vec![
+                    (span.shrink_to_lo(), "{ SomeStruct ".to_string()),
+                    (span.shrink_to_hi(), "}".to_string()),
+                ],
+                Applicability::HasPlaceholders,
+            );
+        }
         match (source, self.diagnostic_metadata.in_if_condition) {
             (PathSource::Expr(_), Some(Expr { span, kind: ExprKind::Assign(..), .. })) => {
                 err.span_suggestion_verbose(
@@ -215,7 +225,6 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                     "let ".to_string(),
                     Applicability::MaybeIncorrect,
                 );
-                self.r.session.if_let_suggestions.borrow_mut().insert(*span);
             }
             _ => {}
         }
@@ -759,6 +768,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                                             args[1].span.lo(),
                                             args.last().unwrap().span.hi(),
                                             call_span.ctxt(),
+                                            None,
                                         ))
                                     } else {
                                         None
@@ -1016,9 +1026,15 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
 
                 self.suggest_using_enum_variant(err, source, def_id, span);
             }
-            (Res::Def(DefKind::Struct, def_id), _) if ns == ValueNS => {
+            (Res::Def(DefKind::Struct, def_id), source) if ns == ValueNS => {
                 let (ctor_def, ctor_vis, fields) =
                     if let Some(struct_ctor) = self.r.struct_constructors.get(&def_id).cloned() {
+                        if let PathSource::Expr(Some(parent)) = source {
+                            if let ExprKind::Field(..) | ExprKind::MethodCall(..) = parent.kind {
+                                bad_struct_syntax_suggestion(def_id);
+                                return true;
+                            }
+                        }
                         struct_ctor
                     } else {
                         bad_struct_syntax_suggestion(def_id);
@@ -1132,6 +1148,40 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
             _ => return false,
         }
         true
+    }
+
+    /// Given the target `ident` and `kind`, search for the similarly named associated item
+    /// in `self.current_trait_ref`.
+    crate fn find_similarly_named_assoc_item(
+        &mut self,
+        ident: Symbol,
+        kind: &AssocItemKind,
+    ) -> Option<Symbol> {
+        let module = if let Some((module, _)) = self.current_trait_ref {
+            module
+        } else {
+            return None;
+        };
+        if ident == kw::Underscore {
+            // We do nothing for `_`.
+            return None;
+        }
+
+        let resolutions = self.r.resolutions(module);
+        let targets = resolutions
+            .borrow()
+            .iter()
+            .filter_map(|(key, res)| res.borrow().binding.map(|binding| (key, binding.res())))
+            .filter(|(_, res)| match (kind, res) {
+                (AssocItemKind::Const(..), Res::Def(DefKind::AssocConst, _)) => true,
+                (AssocItemKind::Fn(_), Res::Def(DefKind::AssocFn, _)) => true,
+                (AssocItemKind::TyAlias(..), Res::Def(DefKind::AssocTy, _)) => true,
+                _ => false,
+            })
+            .map(|(key, _)| key.ident.name)
+            .collect::<Vec<_>>();
+
+        find_best_match_for_name(&targets, ident, None)
     }
 
     fn lookup_assoc_candidate<FilterFn>(
@@ -1441,7 +1491,7 @@ impl<'a: 'ast, 'ast> LateResolutionVisitor<'a, '_, 'ast> {
                     // form the path
                     let mut path_segments = path_segments.clone();
                     path_segments.push(ast::PathSegment::from_ident(ident));
-                    let module_def_id = module.def_id().unwrap();
+                    let module_def_id = module.def_id();
                     if module_def_id == def_id {
                         let path =
                             Path { span: name_binding.span, segments: path_segments, tokens: None };
@@ -1826,7 +1876,7 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
         err.emit();
     }
 
-    // FIXME(const_generics): This patches over a ICE caused by non-'static lifetimes in const
+    // FIXME(const_generics): This patches over an ICE caused by non-'static lifetimes in const
     // generics. We are disallowing this until we can decide on how we want to handle non-'static
     // lifetimes in const generics. See issue #74052 for discussion.
     crate fn emit_non_static_lt_in_const_generic_error(&self, lifetime_ref: &hir::Lifetime) {
@@ -1950,11 +2000,10 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
                             introduce_suggestion.push((*span, formatter(&lt_name)));
                         }
                     }
-                    err.multipart_suggestion_with_style(
+                    err.multipart_suggestion_verbose(
                         &msg,
                         introduce_suggestion,
                         Applicability::MaybeIncorrect,
-                        SuggestionStyle::ShowAlways,
                     );
                 }
 
@@ -1966,14 +2015,13 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
                     })
                     .map(|(formatter, span)| (*span, formatter(name)))
                     .collect();
-                err.multipart_suggestion_with_style(
+                err.multipart_suggestion_verbose(
                     &format!(
                         "consider using the `{}` lifetime",
                         lifetime_names.iter().next().unwrap()
                     ),
                     spans_suggs,
                     Applicability::MaybeIncorrect,
-                    SuggestionStyle::ShowAlways,
                 );
             };
         let suggest_new = |err: &mut DiagnosticBuilder<'_>, suggs: Vec<Option<String>>| {
@@ -2064,35 +2112,98 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
                             };
                             spans_suggs.push((span, sugg.to_string()));
                         }
-                        err.multipart_suggestion_with_style(
+                        err.multipart_suggestion_verbose(
                             "consider using the `'static` lifetime",
                             spans_suggs,
                             Applicability::MaybeIncorrect,
-                            SuggestionStyle::ShowAlways,
                         );
                         continue;
                     }
                 });
+
+                struct Lifetime(Span, String);
+                impl Lifetime {
+                    fn is_unnamed(&self) -> bool {
+                        self.1.starts_with('&') && !self.1.starts_with("&'")
+                    }
+                    fn is_underscore(&self) -> bool {
+                        self.1.starts_with("&'_ ")
+                    }
+                    fn is_named(&self) -> bool {
+                        self.1.starts_with("&'")
+                    }
+                    fn suggestion(&self, sugg: String) -> Option<(Span, String)> {
+                        Some(
+                            match (
+                                self.is_unnamed(),
+                                self.is_underscore(),
+                                self.is_named(),
+                                sugg.starts_with('&'),
+                            ) {
+                                (true, _, _, false) => (self.span_unnamed_borrow(), sugg),
+                                (true, _, _, true) => {
+                                    (self.span_unnamed_borrow(), sugg[1..].to_string())
+                                }
+                                (_, true, _, false) => {
+                                    (self.span_underscore_borrow(), sugg.trim().to_string())
+                                }
+                                (_, true, _, true) => {
+                                    (self.span_underscore_borrow(), sugg[1..].trim().to_string())
+                                }
+                                (_, _, true, false) => {
+                                    (self.span_named_borrow(), sugg.trim().to_string())
+                                }
+                                (_, _, true, true) => {
+                                    (self.span_named_borrow(), sugg[1..].trim().to_string())
+                                }
+                                _ => return None,
+                            },
+                        )
+                    }
+                    fn span_unnamed_borrow(&self) -> Span {
+                        let lo = self.0.lo() + BytePos(1);
+                        self.0.with_lo(lo).with_hi(lo)
+                    }
+                    fn span_named_borrow(&self) -> Span {
+                        let lo = self.0.lo() + BytePos(1);
+                        self.0.with_lo(lo)
+                    }
+                    fn span_underscore_borrow(&self) -> Span {
+                        let lo = self.0.lo() + BytePos(1);
+                        let hi = lo + BytePos(2);
+                        self.0.with_lo(lo).with_hi(hi)
+                    }
+                }
+
                 for param in params {
                     if let Ok(snippet) = self.tcx.sess.source_map().span_to_snippet(param.span) {
-                        if snippet.starts_with('&') && !snippet.starts_with("&'") {
-                            introduce_suggestion
-                                .push((param.span, format!("&'a {}", &snippet[1..])));
-                        } else if let Some(stripped) = snippet.strip_prefix("&'_ ") {
-                            introduce_suggestion.push((param.span, format!("&'a {}", &stripped)));
+                        if let Some((span, sugg)) =
+                            Lifetime(param.span, snippet).suggestion("'a ".to_string())
+                        {
+                            introduce_suggestion.push((span, sugg));
                         }
                     }
                 }
-                for ((span, _), sugg) in spans_with_counts.iter().copied().zip(suggs.iter()) {
-                    if let Some(sugg) = sugg {
-                        introduce_suggestion.push((span, sugg.to_string()));
-                    }
+                for (span, sugg) in spans_with_counts.iter().copied().zip(suggs.iter()).filter_map(
+                    |((span, _), sugg)| match &sugg {
+                        Some(sugg) => Some((span, sugg.to_string())),
+                        _ => None,
+                    },
+                ) {
+                    let (span, sugg) = self
+                        .tcx
+                        .sess
+                        .source_map()
+                        .span_to_snippet(span)
+                        .ok()
+                        .and_then(|snippet| Lifetime(span, snippet).suggestion(sugg.clone()))
+                        .unwrap_or((span, sugg));
+                    introduce_suggestion.push((span, sugg.to_string()));
                 }
-                err.multipart_suggestion_with_style(
+                err.multipart_suggestion_verbose(
                     &msg,
                     introduce_suggestion,
                     Applicability::MaybeIncorrect,
-                    SuggestionStyle::ShowAlways,
                 );
                 if should_break {
                     break;
@@ -2159,7 +2270,8 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
                 for ((span, _), snippet) in spans_with_counts.iter().copied().zip(snippets.iter()) {
                     match snippet.as_deref() {
                         Some("") => spans_suggs.push((span, "'lifetime, ".to_string())),
-                        Some("&") => spans_suggs.push((span, "&'lifetime ".to_string())),
+                        Some("&") => spans_suggs
+                            .push((span.with_lo(span.lo() + BytePos(1)), "'lifetime ".to_string())),
                         _ => {}
                     }
                 }
@@ -2167,11 +2279,10 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
                 if spans_suggs.len() > 0 {
                     // This happens when we have `Foo<T>` where we point at the space before `T`,
                     // but this can be confusing so we give a suggestion with placeholders.
-                    err.multipart_suggestion_with_style(
+                    err.multipart_suggestion_verbose(
                         "consider using one of the available lifetimes here",
                         spans_suggs,
                         Applicability::HasPlaceholders,
-                        SuggestionStyle::ShowAlways,
                     );
                 }
             }
@@ -2180,7 +2291,7 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
     }
 
     /// Non-static lifetimes are prohibited in anonymous constants under `min_const_generics`.
-    /// This function will emit an error if `const_generics` is not enabled, the body identified by
+    /// This function will emit an error if `generic_const_exprs` is not enabled, the body identified by
     /// `body_id` is an anonymous constant and `lifetime_ref` is non-static.
     crate fn maybe_emit_forbidden_non_static_lifetime_error(
         &self,
@@ -2199,7 +2310,7 @@ impl<'tcx> LifetimeContext<'_, 'tcx> {
         if !self.tcx.lazy_normalization() && is_anon_const && !is_allowed_lifetime {
             feature_err(
                 &self.tcx.sess.parse_sess,
-                sym::const_generics,
+                sym::generic_const_exprs,
                 lifetime_ref.span,
                 "a non-static lifetime is not allowed in a `const`",
             )

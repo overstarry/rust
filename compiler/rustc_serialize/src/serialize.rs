@@ -366,6 +366,18 @@ direct_serialize_impls! {
     char emit_char read_char
 }
 
+impl<S: Encoder> Encodable<S> for ! {
+    fn encode(&self, _s: &mut S) -> Result<(), S::Error> {
+        unreachable!()
+    }
+}
+
+impl<D: Decoder> Decodable<D> for ! {
+    fn decode(_d: &mut D) -> Result<!, D::Error> {
+        unreachable!()
+    }
+}
+
 impl<S: Encoder> Encodable<S> for ::std::num::NonZeroU32 {
     fn encode(&self, s: &mut S) -> Result<(), S::Error> {
         s.emit_u32(self.get())
@@ -488,8 +500,8 @@ impl<D: Decoder, const N: usize> Decodable<D> for [u8; N] {
         d.read_seq(|d, len| {
             assert!(len == N);
             let mut v = [0u8; N];
-            for i in 0..len {
-                v[i] = d.read_seq_elt(|d| Decodable::decode(d))?;
+            for x in &mut v {
+                *x = d.read_seq_elt(|d| Decodable::decode(d))?;
             }
             Ok(v)
         })
@@ -644,7 +656,7 @@ impl<D: Decoder, T: Decodable<D> + Copy> Decodable<D> for Cell<T> {
 }
 
 // FIXME: #15036
-// Should use `try_borrow`, returning a
+// Should use `try_borrow`, returning an
 // `encoder.error("attempting to Encode borrowed RefCell")`
 // from `encode` when `try_borrow` returns `None`.
 
@@ -679,6 +691,6 @@ impl<S: Encoder, T: ?Sized + Encodable<S>> Encodable<S> for Box<T> {
 }
 impl<D: Decoder, T: Decodable<D>> Decodable<D> for Box<T> {
     fn decode(d: &mut D) -> Result<Box<T>, D::Error> {
-        Ok(box Decodable::decode(d)?)
+        Ok(Box::new(Decodable::decode(d)?))
     }
 }

@@ -189,6 +189,7 @@ impl SocketCred {
     ///
     /// PID, UID and GID is set to 0.
     #[unstable(feature = "unix_socket_ancillary_data", issue = "76915")]
+    #[must_use]
     pub fn new() -> SocketCred {
         SocketCred(libc::ucred { pid: 0, uid: 0, gid: 0 })
     }
@@ -279,7 +280,7 @@ pub enum AncillaryData<'a> {
 }
 
 impl<'a> AncillaryData<'a> {
-    /// Create a `AncillaryData::ScmRights` variant.
+    /// Create an `AncillaryData::ScmRights` variant.
     ///
     /// # Safety
     ///
@@ -291,7 +292,7 @@ impl<'a> AncillaryData<'a> {
         AncillaryData::ScmRights(scm_rights)
     }
 
-    /// Create a `AncillaryData::ScmCredentials` variant.
+    /// Create an `AncillaryData::ScmCredentials` variant.
     ///
     /// # Safety
     ///

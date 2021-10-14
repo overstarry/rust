@@ -15,7 +15,7 @@ use rustc_middle::mir::*;
 use rustc_middle::thir::{BindingMode, Expr, ExprId, LintLevel, PatKind, Thir};
 use rustc_middle::ty::subst::Subst;
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeckResults};
-use rustc_span::symbol::{kw, sym};
+use rustc_span::symbol::sym;
 use rustc_span::Span;
 use rustc_target::spec::abi::Abi;
 
@@ -44,13 +44,18 @@ fn mir_build(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) -> Body<'_
     let body_owner_kind = tcx.hir().body_owner_kind(id);
     let typeck_results = tcx.typeck_opt_const_arg(def);
 
-    // Ensure unsafeck is ran before we steal the THIR.
+    // Ensure unsafeck and abstract const building is ran before we steal the THIR.
+    // We can't use `ensure()` for `thir_abstract_const` as it doesn't compute the query
+    // if inputs are green. This can cause ICEs when calling `thir_abstract_const` after
+    // THIR has been stolen if we haven't computed this query yet.
     match def {
         ty::WithOptConstParam { did, const_param_did: Some(const_param_did) } => {
-            tcx.ensure().thir_check_unsafety_for_const_arg((did, const_param_did))
+            tcx.ensure().thir_check_unsafety_for_const_arg((did, const_param_did));
+            drop(tcx.thir_abstract_const_of_const_arg((did, const_param_did)));
         }
         ty::WithOptConstParam { did, const_param_did: None } => {
-            tcx.ensure().thir_check_unsafety(did)
+            tcx.ensure().thir_check_unsafety(did);
+            drop(tcx.thir_abstract_const(did));
         }
     }
 
@@ -239,10 +244,10 @@ fn mir_build(tcx: TyCtxt<'_>, def: ty::WithOptConstParam<LocalDefId>) -> Body<'_
         // The exception is `body.user_type_annotations`, which is used unmodified
         // by borrow checking.
         debug_assert!(
-            !(body.local_decls.has_free_regions()
-                || body.basic_blocks().has_free_regions()
-                || body.var_debug_info.has_free_regions()
-                || body.yield_ty().has_free_regions()),
+            !(body.local_decls.has_free_regions(tcx)
+                || body.basic_blocks().has_free_regions(tcx)
+                || body.var_debug_info.has_free_regions(tcx)
+                || body.yield_ty().has_free_regions(tcx)),
             "Unexpected free regions in MIR: {:?}",
             body,
         );
@@ -700,7 +705,7 @@ fn construct_const<'a, 'tcx>(
     builder.finish()
 }
 
-/// Construct MIR for a item that has had errors in type checking.
+/// Construct MIR for an item that has had errors in type checking.
 ///
 /// This is required because we may still want to run MIR passes on an item
 /// with type errors, but normal MIR construction can't handle that in general.
@@ -755,6 +760,7 @@ fn construct_error<'a, 'tcx>(
     cfg.terminate(START_BLOCK, source_info, TerminatorKind::Unreachable);
 
     let mut body = Body::new(
+        tcx,
         MirSource::item(def.did.to_def_id()),
         cfg.basic_blocks,
         source_scopes,
@@ -843,6 +849,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
 
         Body::new(
+            self.tcx,
             MirSource::item(self.def_id),
             self.cfg.basic_blocks,
             self.source_scopes,
@@ -885,7 +892,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let tcx_hir = tcx.hir();
         let hir_typeck_results = self.typeck_results;
 
-        // In analyze_closure() in upvar.rs we gathered a list of upvars used by a
+        // In analyze_closure() in upvar.rs we gathered a list of upvars used by an
         // indexed closure and we stored in a map called closure_min_captures in TypeckResults
         // with the closure's DefId. Here, we run through that vec of UpvarIds for
         // the given closure and use the necessary information to create upvar
@@ -902,13 +909,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 ty::Generator(_, substs, _) => ty::UpvarSubsts::Generator(substs),
                 _ => span_bug!(self.fn_span, "upvars with non-closure env ty {:?}", closure_ty),
             };
+            let def_id = self.def_id.as_local().unwrap();
+            let capture_syms = tcx.symbols_for_closure_captures((def_id, fn_def_id));
             let capture_tys = upvar_substs.upvar_tys();
-            let captures_with_tys =
-                hir_typeck_results.closure_min_captures_flattened(fn_def_id).zip(capture_tys);
+            let captures_with_tys = hir_typeck_results
+                .closure_min_captures_flattened(fn_def_id)
+                .zip(capture_tys.zip(capture_syms));
 
             self.upvar_mutbls = captures_with_tys
                 .enumerate()
-                .map(|(i, (captured_place, ty))| {
+                .map(|(i, (captured_place, (ty, sym)))| {
                     let capture = captured_place.info.capture_kind;
                     let var_id = match captured_place.place.base {
                         HirPlaceBase::Upvar(upvar_id) => upvar_id.var_path.hir_id,
@@ -916,14 +926,6 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     };
 
                     let mutability = captured_place.mutability;
-
-                    // FIXME(project-rfc-2229#8): Store more precise information
-                    let mut name = kw::Empty;
-                    if let Some(Node::Binding(pat)) = tcx_hir.find(var_id) {
-                        if let hir::PatKind::Binding(_, _, ident, _) = pat.kind {
-                            name = ident.name;
-                        }
-                    }
 
                     let mut projs = closure_env_projs.clone();
                     projs.push(ProjectionElem::Field(Field::new(i), ty));
@@ -935,7 +937,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     };
 
                     self.var_debug_info.push(VarDebugInfo {
-                        name,
+                        name: sym,
                         source_info: SourceInfo::outermost(tcx_hir.span(var_id)),
                         value: VarDebugInfoContents::Place(Place {
                             local: ty::CAPTURE_STRUCT_LOCAL,
@@ -985,19 +987,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         self.local_decls[local].mutability = mutability;
                         self.local_decls[local].source_info.scope = self.source_scope;
                         self.local_decls[local].local_info = if let Some(kind) = self_binding {
-                            Some(box LocalInfo::User(ClearCrossCrate::Set(
+                            Some(Box::new(LocalInfo::User(ClearCrossCrate::Set(
                                 BindingForm::ImplicitSelf(*kind),
-                            )))
+                            ))))
                         } else {
                             let binding_mode = ty::BindingMode::BindByValue(mutability);
-                            Some(box LocalInfo::User(ClearCrossCrate::Set(BindingForm::Var(
+                            Some(Box::new(LocalInfo::User(ClearCrossCrate::Set(BindingForm::Var(
                                 VarBindingForm {
                                     binding_mode,
                                     opt_ty_info,
                                     opt_match_place: Some((Some(place), span)),
                                     pat_span: span,
                                 },
-                            ))))
+                            )))))
                         };
                         self.var_indices.insert(var, LocalsForNode::One(local));
                     }

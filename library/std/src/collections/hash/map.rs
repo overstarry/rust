@@ -203,8 +203,9 @@ use crate::sys;
 /// }
 /// ```
 
-#[cfg_attr(not(test), rustc_diagnostic_item = "hashmap_type")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "HashMap")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_insignificant_dtor]
 pub struct HashMap<K, V, S = RandomState> {
     base: base::HashMap<K, V, S>,
 }
@@ -222,6 +223,7 @@ impl<K, V> HashMap<K, V, RandomState> {
     /// let mut map: HashMap<&str, i32> = HashMap::new();
     /// ```
     #[inline]
+    #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn new() -> HashMap<K, V, RandomState> {
         Default::default()
@@ -239,6 +241,7 @@ impl<K, V> HashMap<K, V, RandomState> {
     /// let mut map: HashMap<&str, i32> = HashMap::with_capacity(10);
     /// ```
     #[inline]
+    #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn with_capacity(capacity: usize) -> HashMap<K, V, RandomState> {
         HashMap::with_capacity_and_hasher(capacity, Default::default())
@@ -624,14 +627,13 @@ where
     /// # Examples
     ///
     /// ```
-    /// #![feature(try_reserve)]
     /// use std::collections::HashMap;
     ///
     /// let mut map: HashMap<&str, isize> = HashMap::new();
     /// map.try_reserve(10).expect("why is the test harness OOMing on 10 bytes?");
     /// ```
     #[inline]
-    #[unstable(feature = "try_reserve", reason = "new API", issue = "48043")]
+    #[stable(feature = "try_reserve", since = "1.57.0")]
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
         self.base.try_reserve(additional).map_err(map_try_reserve_error)
     }
@@ -969,7 +971,11 @@ where
     /// map.insert("b", 2);
     /// map.insert("c", 3);
     ///
-    /// let vec: Vec<&str> = map.into_keys().collect();
+    /// let mut vec: Vec<&str> = map.into_keys().collect();
+    /// // The `IntoKeys` iterator produces keys in arbitrary order, so the
+    /// // keys must be sorted to test them against a sorted array.
+    /// vec.sort_unstable();
+    /// assert_eq!(vec, ["a", "b", "c"]);
     /// ```
     #[inline]
     #[stable(feature = "map_into_keys_values", since = "1.54.0")]
@@ -991,7 +997,11 @@ where
     /// map.insert("b", 2);
     /// map.insert("c", 3);
     ///
-    /// let vec: Vec<i32> = map.into_values().collect();
+    /// let mut vec: Vec<i32> = map.into_values().collect();
+    /// // The `IntoValues` iterator produces values in arbitrary order, so
+    /// // the values must be sorted to test them against a sorted array.
+    /// vec.sort_unstable();
+    /// assert_eq!(vec, [1, 2, 3]);
     /// ```
     #[inline]
     #[stable(feature = "map_into_keys_values", since = "1.54.0")]
@@ -1239,7 +1249,7 @@ pub struct IterMut<'a, K: 'a, V: 'a> {
 }
 
 impl<'a, K, V> IterMut<'a, K, V> {
-    /// Returns a iterator of references over the remaining items.
+    /// Returns an iterator of references over the remaining items.
     #[inline]
     pub(super) fn iter(&self) -> Iter<'_, K, V> {
         Iter { base: self.base.rustc_iter() }
@@ -1249,9 +1259,10 @@ impl<'a, K, V> IterMut<'a, K, V> {
 /// An owning iterator over the entries of a `HashMap`.
 ///
 /// This `struct` is created by the [`into_iter`] method on [`HashMap`]
-/// (provided by the `IntoIterator` trait). See its documentation for more.
+/// (provided by the [`IntoIterator`] trait). See its documentation for more.
 ///
 /// [`into_iter`]: IntoIterator::into_iter
+/// [`IntoIterator`]: crate::iter::IntoIterator
 ///
 /// # Example
 ///
@@ -1268,7 +1279,7 @@ pub struct IntoIter<K, V> {
 }
 
 impl<K, V> IntoIter<K, V> {
-    /// Returns a iterator of references over the remaining items.
+    /// Returns an iterator of references over the remaining items.
     #[inline]
     pub(super) fn iter(&self) -> Iter<'_, K, V> {
         Iter { base: self.base.rustc_iter() }
@@ -1371,7 +1382,7 @@ pub struct Drain<'a, K: 'a, V: 'a> {
 }
 
 impl<'a, K, V> Drain<'a, K, V> {
-    /// Returns a iterator of references over the remaining items.
+    /// Returns an iterator of references over the remaining items.
     #[inline]
     pub(super) fn iter(&self) -> Iter<'_, K, V> {
         Iter { base: self.base.rustc_iter() }
@@ -1711,6 +1722,7 @@ impl<'a, K, V, S> RawOccupiedEntryMut<'a, K, V, S> {
     /// Converts the entry into a mutable reference to the key in the entry
     /// with a lifetime bound to the map itself.
     #[inline]
+    #[must_use = "`self` will be dropped if the result is not used"]
     #[unstable(feature = "hash_raw_entry", issue = "56167")]
     pub fn into_key(self) -> &'a mut K {
         self.base.into_key()
@@ -1726,6 +1738,7 @@ impl<'a, K, V, S> RawOccupiedEntryMut<'a, K, V, S> {
     /// Converts the `OccupiedEntry` into a mutable reference to the value in the entry
     /// with a lifetime bound to the map itself.
     #[inline]
+    #[must_use = "`self` will be dropped if the result is not used"]
     #[unstable(feature = "hash_raw_entry", issue = "56167")]
     pub fn into_mut(self) -> &'a mut V {
         self.base.into_mut()
@@ -1755,6 +1768,7 @@ impl<'a, K, V, S> RawOccupiedEntryMut<'a, K, V, S> {
     /// Converts the `OccupiedEntry` into a mutable reference to the key and value in the entry
     /// with a lifetime bound to the map itself.
     #[inline]
+    #[must_use = "`self` will be dropped if the result is not used"]
     #[unstable(feature = "hash_raw_entry", issue = "56167")]
     pub fn into_key_value(self) -> (&'a mut K, &'a mut V) {
         self.base.into_key_value()
@@ -2882,6 +2896,7 @@ impl RandomState {
     #[inline]
     #[allow(deprecated)]
     // rand
+    #[must_use]
     #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
     pub fn new() -> RandomState {
         // Historically this function did not cache keys from the OS and instead
@@ -2934,6 +2949,7 @@ impl DefaultHasher {
     /// instances created through `new` or `default`.
     #[stable(feature = "hashmap_default_hasher", since = "1.13.0")]
     #[allow(deprecated)]
+    #[must_use]
     pub fn new() -> DefaultHasher {
         DefaultHasher(SipHasher13::new_with_keys(0, 0))
     }

@@ -9,12 +9,14 @@ use crate::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "solaris", target_os = "illumos"))]
 use crate::sys::weak::weak;
-#[cfg(not(any(target_os = "l4re", target_os = "vxworks")))]
+#[cfg(not(any(target_os = "l4re", target_os = "vxworks", target_os = "espidf")))]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "l4re")]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 1024 * 1024;
 #[cfg(target_os = "vxworks")]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 256 * 1024;
+#[cfg(target_os = "espidf")]
+pub const DEFAULT_MIN_STACK_SIZE: usize = 0; // 0 indicates that the stack size configured in the ESP-IDF menuconfig system should be used
 
 #[cfg(target_os = "fuchsia")]
 mod zircon {
@@ -50,22 +52,35 @@ impl Thread {
         let mut attr: libc::pthread_attr_t = mem::zeroed();
         assert_eq!(libc::pthread_attr_init(&mut attr), 0);
 
-        let stack_size = cmp::max(stack, min_stack_size(&attr));
+        #[cfg(target_os = "espidf")]
+        if stack > 0 {
+            // Only set the stack if a non-zero value is passed
+            // 0 is used as an indication that the default stack size configured in the ESP-IDF menuconfig system should be used
+            assert_eq!(
+                libc::pthread_attr_setstacksize(&mut attr, cmp::max(stack, min_stack_size(&attr))),
+                0
+            );
+        }
 
-        match libc::pthread_attr_setstacksize(&mut attr, stack_size) {
-            0 => {}
-            n => {
-                assert_eq!(n, libc::EINVAL);
-                // EINVAL means |stack_size| is either too small or not a
-                // multiple of the system page size.  Because it's definitely
-                // >= PTHREAD_STACK_MIN, it must be an alignment issue.
-                // Round up to the nearest page and try again.
-                let page_size = os::page_size();
-                let stack_size =
-                    (stack_size + page_size - 1) & (-(page_size as isize - 1) as usize - 1);
-                assert_eq!(libc::pthread_attr_setstacksize(&mut attr, stack_size), 0);
-            }
-        };
+        #[cfg(not(target_os = "espidf"))]
+        {
+            let stack_size = cmp::max(stack, min_stack_size(&attr));
+
+            match libc::pthread_attr_setstacksize(&mut attr, stack_size) {
+                0 => {}
+                n => {
+                    assert_eq!(n, libc::EINVAL);
+                    // EINVAL means |stack_size| is either too small or not a
+                    // multiple of the system page size.  Because it's definitely
+                    // >= PTHREAD_STACK_MIN, it must be an alignment issue.
+                    // Round up to the nearest page and try again.
+                    let page_size = os::page_size();
+                    let stack_size =
+                        (stack_size + page_size - 1) & (-(page_size as isize - 1) as usize - 1);
+                    assert_eq!(libc::pthread_attr_setstacksize(&mut attr, stack_size), 0);
+                }
+            };
+        }
 
         let ret = libc::pthread_create(&mut native, &attr, thread_start, p as *mut _);
         // Note: if the thread creation fails and this assert fails, then p will
@@ -183,6 +198,7 @@ impl Thread {
         // Newlib, Emscripten, and VxWorks have no way to set a thread name.
     }
 
+    #[cfg(not(target_os = "espidf"))]
     pub fn sleep(dur: Duration) {
         let mut secs = dur.as_secs();
         let mut nsecs = dur.subsec_nanos() as _;
@@ -204,6 +220,19 @@ impl Thread {
                 } else {
                     nsecs = 0;
                 }
+            }
+        }
+    }
+
+    #[cfg(target_os = "espidf")]
+    pub fn sleep(dur: Duration) {
+        let mut micros = dur.as_micros();
+        unsafe {
+            while micros > 0 {
+                let st = if micros > u32::MAX as u128 { u32::MAX } else { micros as u32 };
+                libc::usleep(st);
+
+                micros -= st as u128;
             }
         }
     }
@@ -234,7 +263,7 @@ impl Drop for Thread {
     }
 }
 
-pub fn available_concurrency() -> io::Result<NonZeroUsize> {
+pub fn available_parallelism() -> io::Result<NonZeroUsize> {
     cfg_if::cfg_if! {
         if #[cfg(any(
             target_os = "android",
@@ -309,8 +338,21 @@ pub fn available_concurrency() -> io::Result<NonZeroUsize> {
             }
 
             Ok(unsafe { NonZeroUsize::new_unchecked(cpus as usize) })
+        } else if #[cfg(target_os = "haiku")] {
+            // system_info cpu_count field gets the static data set at boot time with `smp_set_num_cpus`
+            // `get_system_info` calls then `smp_get_num_cpus`
+            unsafe {
+                let mut sinfo: libc::system_info = crate::mem::zeroed();
+                let res = libc::get_system_info(&mut sinfo);
+
+                if res != libc::B_OK {
+                    return Err(io::Error::new_const(io::ErrorKind::NotFound, &"The number of hardware threads is not known for the target platform"));
+                }
+
+                Ok(NonZeroUsize::new_unchecked(sinfo.cpu_count as usize))
+            }
         } else {
-            // FIXME: implement on vxWorks, Redox, Haiku, l4re
+            // FIXME: implement on vxWorks, Redox, l4re
             Err(io::Error::new_const(io::ErrorKind::Unsupported, &"Getting the number of hardware threads is not supported on the target platform"))
         }
     }
@@ -552,7 +594,8 @@ pub mod guard {
                 Some(stackaddr - guardsize..stackaddr)
             } else if cfg!(all(target_os = "linux", target_env = "musl")) {
                 Some(stackaddr - guardsize..stackaddr)
-            } else if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            } else if cfg!(all(target_os = "linux", any(target_env = "gnu", target_env = "uclibc")))
+            {
                 // glibc used to include the guard area within the stack, as noted in the BUGS
                 // section of `man pthread_attr_getguardsize`.  This has been corrected starting
                 // with glibc 2.27, and in some distro backports, so the guard is now placed at the

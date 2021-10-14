@@ -210,6 +210,7 @@ pub macro assert_matches {
 #[macro_export]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_diagnostic_item = "debug_assert_macro"]
+#[allow_internal_unstable(edition_panic)]
 macro_rules! debug_assert {
     ($($arg:tt)*) => (if $crate::cfg!(debug_assertions) { $crate::assert!($($arg)*); })
 }
@@ -828,6 +829,7 @@ pub(crate) mod builtin {
     /// assert_eq!(s, format!("hello {}", "world"));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[allow_internal_unsafe]
     #[allow_internal_unstable(fmt_internals)]
     #[rustc_builtin_macro]
     #[macro_export]
@@ -841,7 +843,6 @@ pub(crate) mod builtin {
     /// This macro is used by the panic macros for the `const_panic` feature.
     ///
     /// This macro will be removed once `format_args` is allowed in const contexts.
-    #[cfg(not(bootstrap))]
     #[unstable(feature = "const_format_args", issue = "none")]
     #[allow_internal_unstable(fmt_internals, const_fmt_arguments_new)]
     #[rustc_builtin_macro]
@@ -849,16 +850,6 @@ pub(crate) mod builtin {
     macro_rules! const_format_args {
         ($fmt:expr) => {{ /* compiler built-in */ }};
         ($fmt:expr, $($args:tt)*) => {{ /* compiler built-in */ }};
-    }
-
-    /// Same as `format_args`, but can be used in some const contexts.
-    #[cfg(bootstrap)]
-    #[unstable(feature = "const_format_args", issue = "none")]
-    #[macro_export]
-    macro_rules! const_format_args {
-        ($($t:tt)*) => {
-            $crate::format_args!($($t)*)
-        }
     }
 
     /// Same as `format_args`, but adds a newline in the end.
@@ -1346,6 +1337,10 @@ pub(crate) mod builtin {
         feature = "llvm_asm",
         issue = "70173",
         reason = "prefer using the new asm! syntax instead"
+    )]
+    #[rustc_deprecated(
+        since = "1.56",
+        reason = "will be removed from the compiler, use asm! instead"
     )]
     #[rustc_builtin_macro]
     #[macro_export]

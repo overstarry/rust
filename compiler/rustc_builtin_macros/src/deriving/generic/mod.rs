@@ -332,20 +332,27 @@ pub fn combine_substructure(
     RefCell::new(f)
 }
 
+struct TypeParameter {
+    bound_generic_params: Vec<ast::GenericParam>,
+    ty: P<ast::Ty>,
+}
+
 /// This method helps to extract all the type parameters referenced from a
 /// type. For a type parameter `<T>`, it looks for either a `TyPath` that
 /// is not global and starts with `T`, or a `TyQPath`.
+/// Also include bound generic params from the input type.
 fn find_type_parameters(
     ty: &ast::Ty,
     ty_param_names: &[Symbol],
     cx: &ExtCtxt<'_>,
-) -> Vec<P<ast::Ty>> {
+) -> Vec<TypeParameter> {
     use rustc_ast::visit;
 
     struct Visitor<'a, 'b> {
         cx: &'a ExtCtxt<'b>,
         ty_param_names: &'a [Symbol],
-        types: Vec<P<ast::Ty>>,
+        bound_generic_params_stack: Vec<ast::GenericParam>,
+        type_params: Vec<TypeParameter>,
     }
 
     impl<'a, 'b> visit::Visitor<'a> for Visitor<'a, 'b> {
@@ -353,7 +360,10 @@ fn find_type_parameters(
             if let ast::TyKind::Path(_, ref path) = ty.kind {
                 if let Some(segment) = path.segments.first() {
                     if self.ty_param_names.contains(&segment.ident.name) {
-                        self.types.push(P(ty.clone()));
+                        self.type_params.push(TypeParameter {
+                            bound_generic_params: self.bound_generic_params_stack.clone(),
+                            ty: P(ty.clone()),
+                        });
                     }
                 }
             }
@@ -361,15 +371,35 @@ fn find_type_parameters(
             visit::walk_ty(self, ty)
         }
 
+        // Place bound generic params on a stack, to extract them when a type is encountered.
+        fn visit_poly_trait_ref(
+            &mut self,
+            trait_ref: &'a ast::PolyTraitRef,
+            modifier: &'a ast::TraitBoundModifier,
+        ) {
+            let stack_len = self.bound_generic_params_stack.len();
+            self.bound_generic_params_stack
+                .extend(trait_ref.bound_generic_params.clone().into_iter());
+
+            visit::walk_poly_trait_ref(self, trait_ref, modifier);
+
+            self.bound_generic_params_stack.truncate(stack_len);
+        }
+
         fn visit_mac_call(&mut self, mac: &ast::MacCall) {
             self.cx.span_err(mac.span(), "`derive` cannot be used on items with type macros");
         }
     }
 
-    let mut visitor = Visitor { cx, ty_param_names, types: Vec::new() };
+    let mut visitor = Visitor {
+        cx,
+        ty_param_names,
+        bound_generic_params_stack: Vec::new(),
+        type_params: Vec::new(),
+    };
     visit::Visitor::visit_ty(&mut visitor, ty);
 
-    visitor.types
+    visitor.type_params
 }
 
 impl<'a> TraitDef<'a> {
@@ -527,12 +557,12 @@ impl<'a> TraitDef<'a> {
                     tokens: None,
                 },
                 attrs: Vec::new(),
-                kind: ast::AssocItemKind::TyAlias(box ast::TyAliasKind(
+                kind: ast::AssocItemKind::TyAlias(Box::new(ast::TyAliasKind(
                     ast::Defaultness::Final,
                     Generics::default(),
                     Vec::new(),
                     Some(type_def.to_ty(cx, self.span, type_ident, generics)),
-                )),
+                ))),
                 tokens: None,
             })
         });
@@ -564,7 +594,7 @@ impl<'a> TraitDef<'a> {
             GenericParamKind::Const { ty, kw_span, .. } => {
                 let const_nodefault_kind = GenericParamKind::Const {
                     ty: ty.clone(),
-                    kw_span: kw_span.clone(),
+                    kw_span: *kw_span,
 
                     // We can't have default values inside impl block
                     default: None,
@@ -617,11 +647,11 @@ impl<'a> TraitDef<'a> {
                     ty_params.map(|ty_param| ty_param.ident.name).collect();
 
                 for field_ty in field_tys {
-                    let tys = find_type_parameters(&field_ty, &ty_param_names, cx);
+                    let field_ty_params = find_type_parameters(&field_ty, &ty_param_names, cx);
 
-                    for ty in tys {
+                    for field_ty_param in field_ty_params {
                         // if we have already handled this type, skip it
-                        if let ast::TyKind::Path(_, ref p) = ty.kind {
+                        if let ast::TyKind::Path(_, ref p) = field_ty_param.ty.kind {
                             if p.segments.len() == 1
                                 && ty_param_names.contains(&p.segments[0].ident.name)
                             {
@@ -639,8 +669,8 @@ impl<'a> TraitDef<'a> {
 
                         let predicate = ast::WhereBoundPredicate {
                             span: self.span,
-                            bound_generic_params: Vec::new(),
-                            bounded_ty: ty,
+                            bound_generic_params: field_ty_param.bound_generic_params,
+                            bounded_ty: field_ty_param.ty,
                             bounds,
                         };
 
@@ -677,8 +707,6 @@ impl<'a> TraitDef<'a> {
         let self_type = cx.ty_path(path);
 
         let attr = cx.attribute(cx.meta_word(self.span, sym::automatically_derived));
-        // Just mark it now since we know that it'll end up used downstream
-        cx.sess.mark_attr_used(&attr);
         let opt_trait_ref = Some(trait_ref);
         let unused_qual = {
             let word = rustc_ast::attr::mk_nested_word_item(Ident::new(
@@ -698,7 +726,7 @@ impl<'a> TraitDef<'a> {
             self.span,
             Ident::invalid(),
             a,
-            ast::ItemKind::Impl(box ast::ImplKind {
+            ast::ItemKind::Impl(Box::new(ast::ImplKind {
                 unsafety,
                 polarity: ast::ImplPolarity::Positive,
                 defaultness: ast::Defaultness::Final,
@@ -707,7 +735,7 @@ impl<'a> TraitDef<'a> {
                 of_trait: opt_trait_ref,
                 self_ty: self_type,
                 items: methods.into_iter().chain(associated_types).collect(),
-            }),
+            })),
         )
     }
 
@@ -940,7 +968,12 @@ impl<'a> MethodDef<'a> {
                 tokens: None,
             },
             ident: method_ident,
-            kind: ast::AssocItemKind::Fn(box ast::FnKind(def, sig, fn_generics, Some(body_block))),
+            kind: ast::AssocItemKind::Fn(Box::new(ast::FnKind(
+                def,
+                sig,
+                fn_generics,
+                Some(body_block),
+            ))),
             tokens: None,
         })
     }
@@ -1695,7 +1728,7 @@ where
 /// One or more fields: call the base case function on the first value (which depends on
 /// `use_fold`), and use that as the base case. Then perform `cs_fold` on the remainder of the
 /// fields.
-/// When the `substructure` is a `EnumNonMatchingCollapsed`, the result of `enum_nonmatch_f`
+/// When the `substructure` is an `EnumNonMatchingCollapsed`, the result of `enum_nonmatch_f`
 /// is returned. Statics may not be folded over.
 /// See `cs_op` in `partial_ord.rs` for a model example.
 pub fn cs_fold1<F, B>(

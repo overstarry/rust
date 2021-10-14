@@ -16,7 +16,6 @@ macro_rules! declare_features {
                     since: $ver,
                     issue: to_nonzero($issue),
                     edition: None,
-                    description: concat!($($doc,)*),
                 }
             ),+
         ];
@@ -34,7 +33,6 @@ macro_rules! declare_features {
                     since: $ver,
                     issue: to_nonzero($issue),
                     edition: None,
-                    description: concat!($($doc,)*),
                 }
             ),+
         ];
@@ -102,6 +100,9 @@ declare_features! (
     (removed, extern_in_paths, "1.33.0", Some(55600), None,
      Some("subsumed by `::foo::bar` paths")),
     (removed, quote, "1.33.0", Some(29601), None, None),
+    /// Allows const generic types (e.g. `struct Foo<const N: usize>(...);`).
+    (removed, const_generics, "1.34.0", Some(44580), None,
+     Some("removed in favor of `#![feature(adt_const_params)]` and `#![feature(generic_const_exprs)]`")),
     /// Allows `[x; N]` where `x` is a constant (RFC 2203).
     (removed, const_in_array_repeat_expressions,  "1.37.0", Some(49147), None,
      Some("removed due to causing promotable bugs")),
@@ -123,11 +124,18 @@ declare_features! (
     /// Allows overlapping impls of marker traits.
     (removed, overlapping_marker_traits, "1.42.0", Some(29864), None,
      Some("removed in favor of `#![feature(marker_trait_attr)]`")),
+    /// Allows `T: ?const Trait` syntax in bounds.
+    (removed, const_trait_bound_opt_out, "1.42.0", Some(67794), None,
+     Some("Removed in favor of `~const` bound in #![feature(const_trait_impl)]")),
     /// Allows `#[no_debug]`.
     (removed, no_debug, "1.43.0", Some(29721), None, Some("removed due to lack of demand")),
+    /// Lazily evaluate constants. This allows constants to depend on type parameters.
+    (removed, lazy_normalization_consts, "1.46.0", Some(72219), None, Some("superseded by `generic_const_exprs`")),
     /// Allows comparing raw pointers during const eval.
     (removed, const_compare_raw_pointers, "1.46.0", Some(53020), None,
      Some("cannot be allowed in const eval in any meaningful way")),
+    /// Allows non-trivial generic constants which have to be manually propagated upwards.
+    (removed, const_evaluatable_checked, "1.48.0", Some(76560), None, Some("renamed to `generic_const_exprs`")),
     /// Allows using the `#[link_args]` attribute.
     (removed, link_args, "1.53.0", Some(29596), None,
      Some("removed in favor of using `-C link-arg=ARG` on command line, \
@@ -136,9 +144,12 @@ declare_features! (
     (removed, main, "1.53.0", Some(29634), None, None),
     (removed, pub_macro_rules, "1.53.0", Some(78855), None,
      Some("removed due to being incomplete, in particular it does not work across crates")),
-     /// Allows the definition of `const` functions with some advanced features.
+    /// Allows the definition of `const` functions with some advanced features.
     (removed, const_fn, "1.54.0", Some(57563), None,
      Some("split into finer-grained feature gates")),
+    /// Allows using `#[plugin_registrar]` on functions.
+    (removed, plugin_registrar, "1.54.0", Some(29597), None,
+     Some("a __rustc_plugin_registrar symbol must now be defined instead")),
 
     /// Allows `#[doc(include = "some-file")]`.
     (removed, external_doc, "1.54.0", Some(44732), None,

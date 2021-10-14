@@ -73,6 +73,8 @@ Tier Policy.
 
 All tier 2 targets with host tools support the full standard library.
 
+**NOTE:** Tier 2 targets currently do not build the `rust-docs` component.
+
 target | notes
 -------|-------
 `aarch64-apple-darwin` | ARM64 macOS (11.0+, Big Sur+)
@@ -112,9 +114,12 @@ The `std` column in the table below has the following meanings:
 
 [`no_std`]: https://rust-embedded.github.io/book/intro/no-std.html
 
+**NOTE:** Tier 2 targets currently do not build the `rust-docs` component.
+
 target | std | notes
 -------|:---:|-------
 `aarch64-apple-ios` | ✓ | ARM64 iOS
+[`aarch64-apple-ios-sim`](platform-support/aarch64-apple-ios-sim.md) | ✓ | Apple iOS Simulator on ARM64
 `aarch64-fuchsia` | ✓ | ARM64 Fuchsia
 `aarch64-linux-android` | ✓ | ARM64 Android
 `aarch64-unknown-none-softfloat` | * | Bare ARM64, softfloat
@@ -128,8 +133,8 @@ target | std | notes
 `armv5te-unknown-linux-musleabi` | ✓ | ARMv5TE Linux with MUSL
 `armv7-linux-androideabi` | ✓ | ARMv7a Android
 `armv7-unknown-linux-gnueabi` | ✓ |ARMv7 Linux (kernel 4.15, glibc 2.27)
-`armv7-unknown-linux-musleabi` | ✓ |ARMv7 Linux, MUSL
-`armv7-unknown-linux-musleabihf` | ✓ | ARMv7 Linux with MUSL
+`armv7-unknown-linux-musleabi` | ✓ |ARMv7 Linux with MUSL
+`armv7-unknown-linux-musleabihf` | ✓ | ARMv7 Linux with MUSL, hardfloat
 `armv7a-none-eabi` | * | Bare ARMv7-A
 `armv7r-none-eabi` | * | Bare ARMv7-R
 `armv7r-none-eabihf` | * | Bare ARMv7-R, hardfloat
@@ -165,7 +170,6 @@ target | std | notes
 `wasm32-unknown-unknown` | ✓ | WebAssembly
 `wasm32-wasi` | ✓ | WebAssembly with WASI
 `x86_64-apple-ios` | ✓ | 64-bit x86 iOS
-[`aarch64-apple-ios-sim`](platform-support/aarch64-apple-ios-sim.md) | ✓ |  | Apple iOS Simulator on ARM64
 `x86_64-fortanix-unknown-sgx` | ✓ | [Fortanix ABI] for 64-bit Intel SGX
 `x86_64-fuchsia` | ✓ | 64-bit Fuchsia
 `x86_64-linux-android` | ✓ | 64-bit x86 Android
@@ -198,6 +202,7 @@ target | std | host | notes
 -------|:---:|:----:|-------
 `aarch64-apple-ios-macabi` | ? |  | Apple Catalyst on ARM64
 `aarch64-apple-tvos` | * |  | ARM64 tvOS
+[`aarch64-kmc-solid_asp3`](platform-support/kmc-solid.md) | ✓ |  | ARM64 SOLID with TOPPERS/ASP3
 `aarch64-unknown-freebsd` | ✓ | ✓ | ARM64 FreeBSD
 `aarch64-unknown-hermit` | ? |  |
 `aarch64-unknown-uefi` | * |  | ARM64 UEFI
@@ -213,10 +218,14 @@ target | std | host | notes
 `armv5te-unknown-linux-uclibceabi` | ? |  | ARMv5TE Linux with uClibc
 `armv6-unknown-freebsd` | ✓ | ✓ | ARMv6 FreeBSD
 `armv6-unknown-netbsd-eabihf` | ? |  |
+`armv6k-nintendo-3ds` | * |  | ARMv6K Nintendo 3DS, Horizon (Requires devkitARM toolchain)
 `armv7-apple-ios` | ✓ |  | ARMv7 iOS, Cortex-a8
+`armv7-unknown-linux-uclibceabihf` | ✓ | ? | ARMv7 Linux uClibc
 `armv7-unknown-freebsd` | ✓ | ✓ | ARMv7 FreeBSD
 `armv7-unknown-netbsd-eabihf` | ✓ | ✓ |
 `armv7-wrs-vxworks-eabihf` | ? |  |
+[`armv7a-kmc-solid_asp3-eabi`](platform-support/kmc-solid.md) | ✓ |  | ARM SOLID with TOPPERS/ASP3
+[`armv7a-kmc-solid_asp3-eabihf`](platform-support/kmc-solid.md) | ✓ |  | ARM SOLID with TOPPERS/ASP3, hardfloat
 `armv7a-none-eabihf` | * | | ARM Cortex-A, hardfloat
 `armv7s-apple-ios` | ✓ |  |
 `avr-unknown-gnu-atmega328` | * |  | AVR. Requires `-Z build-std=core`
@@ -233,6 +242,7 @@ target | std | host | notes
 `i686-uwp-windows-gnu` | ? |  |
 `i686-uwp-windows-msvc` | ? |  |
 `i686-wrs-vxworks` | ? |  |
+`m68k-unknown-linux-gnu` | ? |  | Motorola 680x0 Linux
 `mips-unknown-linux-uclibc` | ✓ |  | MIPS Linux with uClibc
 `mipsel-sony-psp` | * |  | MIPS (LE) Sony PlayStation Portable (PSP)
 `mipsel-unknown-linux-uclibc` | ✓ |  | MIPS (LE) Linux with uClibc
@@ -256,6 +266,7 @@ target | std | host | notes
 `powerpc64le-unknown-linux-musl` | ? |  |
 `riscv32gc-unknown-linux-gnu` |   |   | RISC-V Linux (kernel 5.4, glibc 2.33)
 `riscv32gc-unknown-linux-musl` |   |   | RISC-V Linux (kernel 5.4, musl + RISCV32 support patches)
+`riscv32imc-esp-espidf` | ✓ |  | RISC-V ESP-IDF
 `riscv64gc-unknown-linux-musl` |   |   | RISC-V Linux (kernel 4.20, musl 1.2.0)
 `s390x-unknown-linux-musl` |  |  | S390x Linux (kernel 2.6.32, MUSL)
 `sparc-unknown-linux-gnu` | ✓ |  | 32-bit SPARC Linux

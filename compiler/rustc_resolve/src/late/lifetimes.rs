@@ -522,8 +522,7 @@ fn item_for(tcx: TyCtxt<'_>, local_def_id: LocalDefId) -> LocalDefId {
         _ => {}
     }
     let item = {
-        let hir = tcx.hir();
-        let mut parent_iter = hir.parent_iter(hir_id);
+        let mut parent_iter = tcx.hir().parent_iter(hir_id);
         loop {
             let node = parent_iter.next().map(|n| n.1);
             match node {
@@ -740,6 +739,7 @@ impl<'a, 'tcx> Visitor<'tcx> for LifetimeContext<'a, 'tcx> {
 
             hir::ItemKind::ExternCrate(_)
             | hir::ItemKind::Use(..)
+            | hir::ItemKind::Macro(..)
             | hir::ItemKind::Mod(..)
             | hir::ItemKind::ForeignMod { .. }
             | hir::ItemKind::GlobalAsm(..) => {
@@ -1651,7 +1651,11 @@ fn extract_labels(ctxt: &mut LifetimeContext<'_, '_>, body: &hir::Body<'_>) {
     }
 
     fn expression_label(ex: &hir::Expr<'_>) -> Option<Ident> {
-        if let hir::ExprKind::Loop(_, Some(label), ..) = ex.kind { Some(label.ident) } else { None }
+        match ex.kind {
+            hir::ExprKind::Loop(_, Some(label), ..) => Some(label.ident),
+            hir::ExprKind::Block(_, Some(label)) => Some(label.ident),
+            _ => None,
+        }
     }
 
     fn check_if_label_shadows_lifetime(tcx: TyCtxt<'_>, mut scope: ScopeRef<'_>, label: Ident) {
@@ -2023,7 +2027,7 @@ impl<'a, 'tcx> LifetimeContext<'a, 'tcx> {
         // ensure that we issue lints in a repeatable order
         def_ids.sort_by_cached_key(|&def_id| self.tcx.def_path_hash(def_id));
 
-        for def_id in def_ids {
+        'lifetimes: for def_id in def_ids {
             debug!("check_uses_for_lifetimes_defined_by_scope: def_id = {:?}", def_id);
 
             let lifetimeuseset = self.lifetime_uses.remove(&def_id);
@@ -2057,10 +2061,35 @@ impl<'a, 'tcx> LifetimeContext<'a, 'tcx> {
                             if let Some(def_id) = parent_def_id.as_local() {
                                 let parent_hir_id = self.tcx.hir().local_def_id_to_hir_id(def_id);
                                 // lifetimes in `derive` expansions don't count (Issue #53738)
-                                if self.tcx.hir().attrs(parent_hir_id).iter().any(|attr| {
-                                    self.tcx.sess.check_name(attr, sym::automatically_derived)
-                                }) {
+                                if self
+                                    .tcx
+                                    .hir()
+                                    .attrs(parent_hir_id)
+                                    .iter()
+                                    .any(|attr| attr.has_name(sym::automatically_derived))
+                                {
                                     continue;
+                                }
+
+                                // opaque types generated when desugaring an async function can have a single
+                                // use lifetime even if it is explicitly denied (Issue #77175)
+                                if let hir::Node::Item(hir::Item {
+                                    kind: hir::ItemKind::OpaqueTy(ref opaque),
+                                    ..
+                                }) = self.tcx.hir().get(parent_hir_id)
+                                {
+                                    if opaque.origin != hir::OpaqueTyOrigin::AsyncFn {
+                                        continue 'lifetimes;
+                                    }
+                                    // We want to do this only if the liftime identifier is already defined
+                                    // in the async function that generated this. Otherwise it could be
+                                    // an opaque type defined by the developer and we still want this
+                                    // lint to fail compilation
+                                    for p in opaque.generics.params {
+                                        if defined_by.contains_key(&p.name) {
+                                            continue 'lifetimes;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2296,7 +2325,7 @@ impl<'a, 'tcx> LifetimeContext<'a, 'tcx> {
             match *scope {
                 Scope::Body { id, s } => {
                     // Non-static lifetimes are prohibited in anonymous constants without
-                    // `const_generics`.
+                    // `generic_const_exprs`.
                     self.maybe_emit_forbidden_non_static_lifetime_error(id, lifetime_ref);
 
                     outermost_body = Some(id);
@@ -2600,8 +2629,10 @@ impl<'a, 'tcx> LifetimeContext<'a, 'tcx> {
                     binding.ident,
                 );
                 self.with(scope, |_, this| {
-                    let scope =
-                        Scope::Supertrait { lifetimes: lifetimes.unwrap_or(vec![]), s: this.scope };
+                    let scope = Scope::Supertrait {
+                        lifetimes: lifetimes.unwrap_or_default(),
+                        s: this.scope,
+                    };
                     this.with(scope, |_, this| this.visit_assoc_type_binding(binding));
                 });
             } else {
@@ -2657,7 +2688,7 @@ impl<'a, 'tcx> LifetimeContext<'a, 'tcx> {
             let obligations = predicates.predicates.iter().filter_map(|&(pred, _)| {
                 let bound_predicate = pred.kind();
                 match bound_predicate.skip_binder() {
-                    ty::PredicateKind::Trait(data, _) => {
+                    ty::PredicateKind::Trait(data) => {
                         // The order here needs to match what we would get from `subst_supertrait`
                         let pred_bound_vars = bound_predicate.bound_vars();
                         let mut all_bound_vars = bound_vars.clone();
@@ -2709,6 +2740,7 @@ impl<'a, 'tcx> LifetimeContext<'a, 'tcx> {
         for input in inputs {
             gather.visit_ty(input);
         }
+        trace!(?gather.anon_count);
         let late_bound_vars = self.map.late_bound_vars.entry(hir_id).or_default();
         let named_late_bound_vars = late_bound_vars.len() as u32;
         late_bound_vars.extend(
@@ -2997,6 +3029,7 @@ impl<'a, 'tcx> LifetimeContext<'a, 'tcx> {
                 NestedVisitorMap::None
             }
 
+            #[instrument(skip(self), level = "trace")]
             fn visit_ty(&mut self, ty: &hir::Ty<'_>) {
                 // If we enter a `BareFn`, then we enter a *new* binding scope
                 if let hir::TyKind::BareFn(_) = ty.kind {
@@ -3017,6 +3050,7 @@ impl<'a, 'tcx> LifetimeContext<'a, 'tcx> {
                 intravisit::walk_generic_args(self, path_span, generic_args)
             }
 
+            #[instrument(skip(self), level = "trace")]
             fn visit_lifetime(&mut self, lifetime_ref: &hir::Lifetime) {
                 if lifetime_ref.is_elided() {
                     self.anon_count += 1;

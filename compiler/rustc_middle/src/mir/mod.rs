@@ -40,19 +40,30 @@ use self::graph_cyclic_cache::GraphIsCyclicCache;
 use self::predecessors::{PredecessorCache, Predecessors};
 pub use self::query::*;
 
-pub mod abstract_const;
 pub mod coverage;
+mod generic_graph;
+pub mod generic_graphviz;
 mod graph_cyclic_cache;
+pub mod graphviz;
 pub mod interpret;
 pub mod mono;
+pub mod patch;
 mod predecessors;
+pub mod pretty;
 mod query;
+pub mod spanview;
 pub mod tcx;
 pub mod terminator;
 pub use terminator::*;
 pub mod traversal;
 mod type_foldable;
 pub mod visit;
+
+pub use self::generic_graph::graphviz_safe_def_name;
+pub use self::graphviz::write_mir_graphviz;
+pub use self::pretty::{
+    create_dump_file, display_allocation, dump_enabled, dump_mir, write_mir_pretty, PassWhere,
+};
 
 /// Types for locals
 pub type LocalDecls<'tcx> = IndexVec<Local, LocalDecl<'tcx>>;
@@ -73,6 +84,22 @@ impl<'tcx> HasLocalDecls<'tcx> for Body<'tcx> {
     fn local_decls(&self) -> &LocalDecls<'tcx> {
         &self.local_decls
     }
+}
+
+/// A streamlined trait that you can implement to create a pass; the
+/// pass will be named after the type, and it will consist of a main
+/// loop that goes over each available MIR and applies `run_pass`.
+pub trait MirPass<'tcx> {
+    fn name(&self) -> Cow<'_, str> {
+        let name = std::any::type_name::<Self>();
+        if let Some(tail) = name.rfind(':') {
+            Cow::from(&name[tail + 1..])
+        } else {
+            Cow::from(name)
+        }
+    }
+
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>);
 }
 
 /// The various "big phases" that MIR goes through.
@@ -242,6 +269,7 @@ pub struct Body<'tcx> {
 
 impl<'tcx> Body<'tcx> {
     pub fn new(
+        tcx: TyCtxt<'tcx>,
         source: MirSource<'tcx>,
         basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>,
         source_scopes: IndexVec<SourceScope, SourceScopeData<'tcx>>,
@@ -284,7 +312,7 @@ impl<'tcx> Body<'tcx> {
             predecessor_cache: PredecessorCache::new(),
             is_cyclic: GraphIsCyclicCache::new(),
         };
-        body.is_polymorphic = body.has_param_types_or_consts();
+        body.is_polymorphic = body.definitely_has_param_types_or_consts(tcx);
         body
     }
 
@@ -294,7 +322,7 @@ impl<'tcx> Body<'tcx> {
     /// is only useful for testing but cannot be `#[cfg(test)]` because it is used in a different
     /// crate.
     pub fn new_cfg_only(basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>) -> Self {
-        let mut body = Body {
+        Body {
             phase: MirPhase::Build,
             source: MirSource::item(DefId::local(CRATE_DEF_INDEX)),
             basic_blocks,
@@ -310,9 +338,7 @@ impl<'tcx> Body<'tcx> {
             is_polymorphic: false,
             predecessor_cache: PredecessorCache::new(),
             is_cyclic: GraphIsCyclicCache::new(),
-        };
-        body.is_polymorphic = body.has_param_types_or_consts();
-        body
+        }
     }
 
     #[inline]
@@ -412,8 +438,7 @@ impl<'tcx> Body<'tcx> {
     /// Returns an iterator over all function arguments.
     #[inline]
     pub fn args_iter(&self) -> impl Iterator<Item = Local> + ExactSizeIterator {
-        let arg_count = self.arg_count;
-        (1..arg_count + 1).map(Local::new)
+        (1..self.arg_count + 1).map(Local::new)
     }
 
     /// Returns an iterator over all user-defined variables and compiler-generated temporaries (all
@@ -422,9 +447,12 @@ impl<'tcx> Body<'tcx> {
     pub fn vars_and_temps_iter(
         &self,
     ) -> impl DoubleEndedIterator<Item = Local> + ExactSizeIterator {
-        let arg_count = self.arg_count;
-        let local_count = self.local_decls.len();
-        (arg_count + 1..local_count).map(Local::new)
+        (self.arg_count + 1..self.local_decls.len()).map(Local::new)
+    }
+
+    #[inline]
+    pub fn drain_vars_and_temps<'a>(&'a mut self) -> impl Iterator<Item = LocalDecl<'tcx>> + 'a {
+        self.local_decls.drain(self.arg_count + 1..)
     }
 
     /// Changes a statement to a nop. This is both faster than deleting instructions and avoids
@@ -775,8 +803,8 @@ pub enum ImplicitSelfKind {
 TrivialTypeFoldableAndLiftImpls! { BindingForm<'tcx>, }
 
 mod binding_form_impl {
-    use crate::ich::StableHashingContext;
     use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
+    use rustc_query_system::ich::StableHashingContext;
 
     impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for super::BindingForm<'tcx> {
         fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
@@ -964,6 +992,9 @@ pub enum LocalInfo<'tcx> {
     StaticRef { def_id: DefId, is_thread_local: bool },
     /// A temporary created that references the const with the given `DefId`
     ConstRef { def_id: DefId },
+    /// A temporary created during the creation of an aggregate
+    /// (e.g. a temporary for `foo` in `MyStruct { my_field: foo }`)
+    AggregateTemp,
 }
 
 impl<'tcx> LocalDecl<'tcx> {
@@ -1141,7 +1172,7 @@ rustc_index::newtype_index! {
     /// [CFG]: https://rustc-dev-guide.rust-lang.org/appendix/background.html#cfg
     /// [data-flow analyses]:
     ///     https://rustc-dev-guide.rust-lang.org/appendix/background.html#what-is-a-dataflow-analysis
-    /// [`CriticalCallEdges`]: ../../rustc_mir/transform/add_call_guards/enum.AddCallGuards.html#variant.CriticalCallEdges
+    /// [`CriticalCallEdges`]: ../../rustc_const_eval/transform/add_call_guards/enum.AddCallGuards.html#variant.CriticalCallEdges
     /// [guide-mir]: https://rustc-dev-guide.rust-lang.org/mir/
     pub struct BasicBlock {
         derive [HashStable]
@@ -1664,13 +1695,10 @@ impl Debug for Statement<'_> {
             AscribeUserType(box (ref place, ref c_ty), ref variance) => {
                 write!(fmt, "AscribeUserType({:?}, {:?}, {:?})", place, variance, c_ty)
             }
-            Coverage(box ref coverage) => {
-                if let Some(rgn) = &coverage.code_region {
-                    write!(fmt, "Coverage::{:?} for {:?}", coverage.kind, rgn)
-                } else {
-                    write!(fmt, "Coverage::{:?}", coverage.kind)
-                }
+            Coverage(box self::Coverage { ref kind, code_region: Some(ref rgn) }) => {
+                write!(fmt, "Coverage::{:?} for {:?}", kind, rgn)
             }
+            Coverage(box ref coverage) => write!(fmt, "Coverage::{:?}", coverage.kind),
             CopyNonOverlapping(box crate::mir::CopyNonOverlapping {
                 ref src,
                 ref dst,
@@ -1710,7 +1738,7 @@ pub struct Place<'tcx> {
     pub projection: &'tcx List<PlaceElem<'tcx>>,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 static_assert_size!(Place<'_>, 16);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2036,7 +2064,7 @@ pub enum Operand<'tcx> {
     Constant(Box<Constant<'tcx>>),
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 static_assert_size!(Operand<'_>, 24);
 
 impl<'tcx> Debug for Operand<'tcx> {
@@ -2061,11 +2089,11 @@ impl<'tcx> Operand<'tcx> {
         span: Span,
     ) -> Self {
         let ty = tcx.type_of(def_id).subst(tcx, substs);
-        Operand::Constant(box Constant {
+        Operand::Constant(Box::new(Constant {
             span,
             user_ty: None,
             literal: ConstantKind::Ty(ty::Const::zero_sized(tcx, ty)),
-        })
+        }))
     }
 
     pub fn is_move(&self) -> bool {
@@ -2092,11 +2120,11 @@ impl<'tcx> Operand<'tcx> {
             };
             scalar_size == type_size
         });
-        Operand::Constant(box Constant {
+        Operand::Constant(Box::new(Constant {
             span,
             user_ty: None,
             literal: ConstantKind::Val(ConstValue::Scalar(val), ty),
-        })
+        }))
     }
 
     pub fn to_copy(&self) -> Self {
@@ -2172,9 +2200,15 @@ pub enum Rvalue<'tcx> {
     /// that `Foo` has a destructor. These rvalues can be optimized
     /// away after type-checking and before lowering.
     Aggregate(Box<AggregateKind<'tcx>>, Vec<Operand<'tcx>>),
+
+    /// Transmutes a `*mut u8` into shallow-initialized `Box<T>`.
+    ///
+    /// This is different a normal transmute because dataflow analysis will treat the box
+    /// as initialized but its content as uninitialized.
+    ShallowInitBox(Operand<'tcx>, Ty<'tcx>),
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 static_assert_size!(Rvalue<'_>, 40);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
@@ -2200,7 +2234,7 @@ pub enum AggregateKind<'tcx> {
     Generator(DefId, SubstsRef<'tcx>, hir::Movability),
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
 static_assert_size!(AggregateKind<'_>, 48);
 
 #[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
@@ -2252,6 +2286,8 @@ impl BinOp {
 pub enum NullOp {
     /// Returns the size of a value of that type
     SizeOf,
+    /// Returns the minimum alignment of a type
+    AlignOf,
     /// Creates a new uninitialized box for a value of that type
     Box,
 }
@@ -2419,6 +2455,10 @@ impl<'tcx> Debug for Rvalue<'tcx> {
                         }
                     }),
                 }
+            }
+
+            ShallowInitBox(ref place, ref ty) => {
+                write!(fmt, "ShallowInitBox({:?}, {:?})", place, ty)
             }
         }
     }

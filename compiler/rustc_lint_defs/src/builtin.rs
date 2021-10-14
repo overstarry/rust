@@ -6,6 +6,7 @@
 
 use crate::{declare_lint, declare_lint_pass, FutureIncompatibilityReason};
 use rustc_span::edition::Edition;
+use rustc_span::symbol::sym;
 
 declare_lint! {
     /// The `forbidden_lint_groups` lint detects violations of
@@ -312,6 +313,44 @@ declare_lint! {
     pub UNUSED_IMPORTS,
     Warn,
     "imports that are never used"
+}
+
+declare_lint! {
+    /// The `must_not_suspend` lint guards against values that shouldn't be held across suspend points
+    /// (`.await`)
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// #![feature(must_not_suspend)]
+    ///
+    /// #[must_not_suspend]
+    /// struct SyncThing {}
+    ///
+    /// async fn yield_now() {}
+    ///
+    /// pub async fn uhoh() {
+    ///     let guard = SyncThing {};
+    ///     yield_now().await;
+    /// }
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// The `must_not_suspend` lint detects values that are marked with the `#[must_not_suspend]`
+    /// attribute being held across suspend points. A "suspend" point is usually a `.await` in an async
+    /// function.
+    ///
+    /// This attribute can be used to mark values that are semantically incorrect across suspends
+    /// (like certain types of timers), values that have async alternatives, and values that
+    /// regularly cause problems with the `Send`-ness of async fn's returned futures (like
+    /// `MutexGuard`'s)
+    ///
+    pub MUST_NOT_SUSPEND,
+    Warn,
+    "use of a `#[must_not_suspend]` value across a yield point",
 }
 
 declare_lint! {
@@ -1584,7 +1623,7 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust
+    /// ```rust,edition2018
     /// trait Trait { }
     ///
     /// fn takes_trait_object(_: Box<Trait>) {
@@ -1605,7 +1644,7 @@ declare_lint! {
     Warn,
     "suggest using `dyn Trait` for trait objects",
     @future_incompatible = FutureIncompatibleInfo {
-        reference: "issue #80165 <https://github.com/rust-lang/rust/issues/80165>",
+        reference: "<https://doc.rust-lang.org/nightly/edition-guide/rust-2021/warnings-promoted-to-error.html>",
         reason: FutureIncompatibilityReason::EditionError(Edition::Edition2021),
     };
 }
@@ -1922,6 +1961,7 @@ declare_lint! {
     "detects proc macro derives using inaccessible names from parent modules",
     @future_incompatible = FutureIncompatibleInfo {
         reference: "issue #83583 <https://github.com/rust-lang/rust/issues/83583>",
+        reason: FutureIncompatibilityReason::FutureReleaseErrorReportNow,
     };
 }
 
@@ -2993,6 +3033,7 @@ declare_lint_pass! {
         CENUM_IMPL_DROP_CAST,
         CONST_EVALUATABLE_UNCHECKED,
         INEFFECTIVE_UNSTABLE_TRAIT_IMPL,
+        MUST_NOT_SUSPEND,
         UNINHABITED_STATIC,
         FUNCTION_ITEM_REFERENCES,
         USELESS_DEPRECATED,
@@ -3009,6 +3050,9 @@ declare_lint_pass! {
         RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX,
         UNSUPPORTED_CALLING_CONVENTIONS,
         BREAK_WITH_LABEL_AND_LOOP,
+        UNUSED_ATTRIBUTES,
+        NON_EXHAUSTIVE_OMITTED_PATTERNS,
+        DEREF_INTO_DYN_SUPERTRAIT,
     ]
 }
 
@@ -3037,16 +3081,19 @@ declare_lint! {
 
 declare_lint! {
     /// The `rust_2021_incompatible_closure_captures` lint detects variables that aren't completely
-    /// captured in Rust 2021 and affect the Drop order of at least one path starting at this variable.
-    /// It can also detect when a variable implements a trait, but one of its field does not and
-    /// the field is captured by a closure and used with the assumption that said field implements
+    /// captured in Rust 2021, such that the `Drop` order of their fields may differ between
+    /// Rust 2018 and 2021.
+    ///
+    /// It can also detect when a variable implements a trait like `Send`, but one of its fields does not,
+    /// and the field is captured by a closure and used with the assumption that said field implements
     /// the same trait as the root variable.
     ///
     /// ### Example of drop reorder
     ///
     /// ```rust,compile_fail
-    /// # #![deny(rust_2021_incompatible_closure_captures)]
+    /// #![deny(rust_2021_incompatible_closure_captures)]
     /// # #![allow(unused)]
+    ///
     /// struct FancyInteger(i32);
     ///
     /// impl Drop for FancyInteger {
@@ -3100,8 +3147,8 @@ declare_lint! {
     /// ### Explanation
     ///
     /// In the above example, only `fptr.0` is captured in Rust 2021.
-    /// The field is of type *mut i32 which doesn't implement Send, making the code invalid as the
-    /// field cannot be sent between thread safely.
+    /// The field is of type `*mut i32`, which doesn't implement `Send`,
+    /// making the code invalid as the field cannot be sent between threads safely.
     pub RUST_2021_INCOMPATIBLE_CLOSURE_CAPTURES,
     Allow,
     "detects closures affected by Rust 2021 changes",
@@ -3221,6 +3268,7 @@ declare_lint! {
     ///
     /// ```rust,compile_fail
     /// #![deny(rust_2021_incompatible_or_patterns)]
+    ///
     /// macro_rules! match_any {
     ///     ( $expr:expr , $( $( $pat:pat )|+ => $expr_arm:expr ),+ ) => {
     ///         match $expr {
@@ -3242,12 +3290,12 @@ declare_lint! {
     ///
     /// ### Explanation
     ///
-    /// In Rust 2021, the pat matcher will match new patterns, which include the | character.
+    /// In Rust 2021, the `pat` matcher will match additional patterns, which include the `|` character.
     pub RUST_2021_INCOMPATIBLE_OR_PATTERNS,
     Allow,
     "detects usage of old versions of or-patterns",
     @future_incompatible = FutureIncompatibleInfo {
-        reference: "issue #84869 <https://github.com/rust-lang/rust/issues/84869>",
+        reference: "<https://doc.rust-lang.org/nightly/edition-guide/rust-2021/or-patterns-macro-rules.html>",
         reason: FutureIncompatibilityReason::EditionError(Edition::Edition2021),
     };
 }
@@ -3287,8 +3335,8 @@ declare_lint! {
     /// In Rust 2021, one of the important introductions is the [prelude changes], which add
     /// `TryFrom`, `TryInto`, and `FromIterator` into the standard library's prelude. Since this
     /// results in an ambiguity as to which method/function to call when an existing `try_into`
-    ///  method is called via dot-call syntax or a `try_from`/`from_iter` associated function
-    ///  is called directly on a type.
+    /// method is called via dot-call syntax or a `try_from`/`from_iter` associated function
+    /// is called directly on a type.
     ///
     /// [prelude changes]: https://blog.rust-lang.org/inside-rust/2021/03/04/planning-rust-2021.html#prelude-changes
     pub RUST_2021_PRELUDE_COLLISIONS,
@@ -3296,7 +3344,7 @@ declare_lint! {
     "detects the usage of trait methods which are ambiguous with traits added to the \
         prelude in future editions",
     @future_incompatible = FutureIncompatibleInfo {
-        reference: "issue #85684 <https://github.com/rust-lang/rust/issues/85684>",
+        reference: "<https://doc.rust-lang.org/nightly/edition-guide/rust-2021/prelude.html>",
         reason: FutureIncompatibilityReason::EditionError(Edition::Edition2021),
     };
 }
@@ -3307,7 +3355,7 @@ declare_lint! {
     ///
     /// ### Example
     ///
-    /// ```rust,compile_fail
+    /// ```rust,edition2018,compile_fail
     /// #![deny(rust_2021_prefixes_incompatible_syntax)]
     ///
     /// macro_rules! m {
@@ -3327,18 +3375,20 @@ declare_lint! {
     ///
     /// This lint suggests to add whitespace between the `z` and `"hey"` tokens
     /// to keep them separated in Rust 2021.
+    // Allow this lint -- rustdoc doesn't yet support threading edition into this lint's parser.
+    #[allow(rustdoc::invalid_rust_codeblocks)]
     pub RUST_2021_PREFIXES_INCOMPATIBLE_SYNTAX,
     Allow,
     "identifiers that will be parsed as a prefix in Rust 2021",
     @future_incompatible = FutureIncompatibleInfo {
-        reference: "issue #84978 <https://github.com/rust-lang/rust/issues/84978>",
+        reference: "<https://doc.rust-lang.org/nightly/edition-guide/rust-2021/reserving-syntax.html>",
         reason: FutureIncompatibilityReason::EditionError(Edition::Edition2021),
     };
     crate_level_only
 }
 
 declare_lint! {
-    /// The `unsupported_calling_conventions` lint is output whenever there is an use of the
+    /// The `unsupported_calling_conventions` lint is output whenever there is a use of the
     /// `stdcall`, `fastcall`, `thiscall`, `vectorcall` calling conventions (or their unwind
     /// variants) on targets that cannot meaningfully be supported for the requested target.
     ///
@@ -3379,7 +3429,7 @@ declare_lint! {
     Warn,
     "use of unsupported calling convention",
     @future_incompatible = FutureIncompatibleInfo {
-        reference: "issue #00000 <https://github.com/rust-lang/rust/issues/00000>",
+        reference: "issue #87678 <https://github.com/rust-lang/rust/issues/87678>",
     };
 }
 
@@ -3410,4 +3460,105 @@ declare_lint! {
     pub BREAK_WITH_LABEL_AND_LOOP,
     Warn,
     "`break` expression with label and unlabeled loop as value expression"
+}
+
+declare_lint! {
+    /// The `non_exhaustive_omitted_patterns` lint detects when a wildcard (`_` or `..`) in a
+    /// pattern for a `#[non_exhaustive]` struct or enum is reachable.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,ignore (needs separate crate)
+    /// // crate A
+    /// #[non_exhaustive]
+    /// pub enum Bar {
+    ///     A,
+    ///     B, // added variant in non breaking change
+    /// }
+    ///
+    /// // in crate B
+    /// #![feature(non_exhaustive_omitted_patterns_lint)]
+    ///
+    /// match Bar::A {
+    ///     Bar::A => {},
+    ///     #[warn(non_exhaustive_omitted_patterns)]
+    ///     _ => {},
+    /// }
+    /// ```
+    ///
+    /// This will produce:
+    ///
+    /// ```text
+    /// warning: reachable patterns not covered of non exhaustive enum
+    ///    --> $DIR/reachable-patterns.rs:70:9
+    ///    |
+    /// LL |         _ => {}
+    ///    |         ^ pattern `B` not covered
+    ///    |
+    ///  note: the lint level is defined here
+    ///   --> $DIR/reachable-patterns.rs:69:16
+    ///    |
+    /// LL |         #[warn(non_exhaustive_omitted_patterns)]
+    ///    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ///    = help: ensure that all possible cases are being handled by adding the suggested match arms
+    ///    = note: the matched value is of type `Bar` and the `non_exhaustive_omitted_patterns` attribute was found
+    /// ```
+    ///
+    /// ### Explanation
+    ///
+    /// Structs and enums tagged with `#[non_exhaustive]` force the user to add a
+    /// (potentially redundant) wildcard when pattern-matching, to allow for future
+    /// addition of fields or variants. The `non_exhaustive_omitted_patterns` lint
+    /// detects when such a wildcard happens to actually catch some fields/variants.
+    /// In other words, when the match without the wildcard would not be exhaustive.
+    /// This lets the user be informed if new fields/variants were added.
+    pub NON_EXHAUSTIVE_OMITTED_PATTERNS,
+    Allow,
+    "detect when patterns of types marked `non_exhaustive` are missed",
+    @feature_gate = sym::non_exhaustive_omitted_patterns_lint;
+}
+
+declare_lint! {
+    /// The `deref_into_dyn_supertrait` lint is output whenever there is a use of the
+    /// `Deref` implementation with a `dyn SuperTrait` type as `Output`.
+    ///
+    /// These implementations will become shadowed when the `trait_upcasting` feature is stablized.
+    /// The `deref` functions will no longer be called implicitly, so there might be behavior change.
+    ///
+    /// ### Example
+    ///
+    /// ```rust,compile_fail
+    /// #![deny(deref_into_dyn_supertrait)]
+    /// #![allow(dead_code)]
+    ///
+    /// use core::ops::Deref;
+    ///
+    /// trait A {}
+    /// trait B: A {}
+    /// impl<'a> Deref for dyn 'a + B {
+    ///     type Target = dyn A;
+    ///     fn deref(&self) -> &Self::Target {
+    ///         todo!()
+    ///     }
+    /// }
+    ///
+    /// fn take_a(_: &dyn A) { }
+    ///
+    /// fn take_b(b: &dyn B) {
+    ///     take_a(b);
+    /// }
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// The dyn upcasting coercion feature adds new coercion rules, taking priority
+    /// over certain other coercion rules, which will cause some behavior change.
+    pub DEREF_INTO_DYN_SUPERTRAIT,
+    Warn,
+    "`Deref` implementation usage with a supertrait trait object for output might be shadowed in the future",
+    @future_incompatible = FutureIncompatibleInfo {
+        reference: "issue #89460 <https://github.com/rust-lang/rust/issues/89460>",
+    };
 }

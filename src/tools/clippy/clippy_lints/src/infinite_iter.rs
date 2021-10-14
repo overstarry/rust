@@ -172,7 +172,7 @@ fn is_infinite(cx: &LateContext<'_>, expr: &Expr<'_>) -> Finiteness {
                 Finite
             }
         },
-        ExprKind::Struct(..) => higher::range(expr).map_or(false, |r| r.end.is_none()).into(),
+        ExprKind::Struct(..) => higher::Range::hir(expr).map_or(false, |r| r.end.is_none()).into(),
         _ => Finite,
     }
 }
@@ -210,11 +210,11 @@ const INFINITE_COLLECTORS: &[Symbol] = &[
     sym::BinaryHeap,
     sym::BTreeMap,
     sym::BTreeSet,
-    sym::hashmap_type,
-    sym::hashset_type,
+    sym::HashMap,
+    sym::HashSet,
     sym::LinkedList,
-    sym::vec_type,
-    sym::vecdeque_type,
+    sym::Vec,
+    sym::VecDeque,
 ];
 
 fn complete_infinite_iter(cx: &LateContext<'_>, expr: &Expr<'_>) -> Finiteness {

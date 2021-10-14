@@ -8,10 +8,9 @@
     html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/",
     test(attr(deny(warnings)))
 )]
-#![feature(box_syntax)]
 #![feature(box_patterns)]
-#![cfg_attr(bootstrap, feature(const_fn_transmute))]
 #![feature(crate_visibility_modifier)]
+#![feature(if_let_guard)]
 #![feature(iter_zip)]
 #![feature(label_break_value)]
 #![feature(nll)]
@@ -20,16 +19,6 @@
 
 #[macro_use]
 extern crate rustc_macros;
-
-#[macro_export]
-macro_rules! unwrap_or {
-    ($opt:expr, $default:expr) => {
-        match $opt {
-            Some(x) => x,
-            None => $default,
-        }
-    };
-}
 
 pub mod util {
     pub mod classify;

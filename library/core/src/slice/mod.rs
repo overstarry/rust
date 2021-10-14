@@ -98,7 +98,6 @@ impl<T> [T] {
     #[rustc_const_stable(feature = "const_slice_len", since = "1.39.0")]
     #[inline]
     // SAFETY: const sound because we transmute out the length field as a usize (which it must be)
-    #[cfg_attr(bootstrap, rustc_allow_const_fn_unstable(const_fn_union))]
     pub const fn len(&self) -> usize {
         // FIXME: Replace with `crate::ptr::metadata(self)` when that is const-stable.
         // As of this writing this causes a "Const-stable functions can only call other
@@ -1557,7 +1556,7 @@ impl<T> [T] {
     ///
     /// # Examples
     ///
-    /// ```compile_fail
+    /// ```
     /// #![feature(slice_split_at_unchecked)]
     ///
     /// let v = [1, 2, 3, 4, 5, 6];
@@ -1582,7 +1581,7 @@ impl<T> [T] {
     /// ```
     #[unstable(feature = "slice_split_at_unchecked", reason = "new API", issue = "76014")]
     #[inline]
-    unsafe fn split_at_unchecked(&self, mid: usize) -> (&[T], &[T]) {
+    pub unsafe fn split_at_unchecked(&self, mid: usize) -> (&[T], &[T]) {
         // SAFETY: Caller has to check that `0 <= mid <= self.len()`
         unsafe { (self.get_unchecked(..mid), self.get_unchecked(mid..)) }
     }
@@ -1606,7 +1605,7 @@ impl<T> [T] {
     ///
     /// # Examples
     ///
-    /// ```compile_fail
+    /// ```
     /// #![feature(slice_split_at_unchecked)]
     ///
     /// let mut v = [1, 0, 3, 0, 5, 6];
@@ -1622,7 +1621,7 @@ impl<T> [T] {
     /// ```
     #[unstable(feature = "slice_split_at_unchecked", reason = "new API", issue = "76014")]
     #[inline]
-    unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut [T], &mut [T]) {
+    pub unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut [T], &mut [T]) {
         let len = self.len();
         let ptr = self.as_mut_ptr();
 
@@ -2258,9 +2257,9 @@ impl<T> [T] {
     /// assert!(match r { Ok(1..=4) => true, _ => false, });
     /// ```
     // Lint rustdoc::broken_intra_doc_links is allowed as `slice::sort_by_key` is
-    // in crate `alloc`, and as such doesn't exists yet when building `core`.
-    // links to downstream crate: #74481. Since primitives are only documented in
-    // libstd (#73423), this never leads to broken links in practice.
+    // in crate `alloc`, and as such doesn't exists yet when building `core`: #74481.
+    // This breaks links when slice is displayed in core, but changing it to use relative links
+    // would break when the item is re-exported. So allow the core links to be broken for now.
     #[allow(rustdoc::broken_intra_doc_links)]
     #[stable(feature = "slice_binary_search_by_key", since = "1.10.0")]
     #[inline]
@@ -3501,7 +3500,8 @@ where
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> Default for &[T] {
+#[rustc_const_unstable(feature = "const_default_impls", issue = "87864")]
+impl<T> const Default for &[T] {
     /// Creates an empty slice.
     fn default() -> Self {
         &[]
@@ -3509,7 +3509,8 @@ impl<T> Default for &[T] {
 }
 
 #[stable(feature = "mut_slice_default", since = "1.5.0")]
-impl<T> Default for &mut [T] {
+#[rustc_const_unstable(feature = "const_default_impls", issue = "87864")]
+impl<T> const Default for &mut [T] {
     /// Creates a mutable empty slice.
     fn default() -> Self {
         &mut []

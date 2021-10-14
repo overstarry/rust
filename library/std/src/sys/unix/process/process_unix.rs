@@ -97,7 +97,9 @@ impl Command {
         drop(env_lock);
         drop(output);
 
-        let mut p = Process::new(pid, pidfd);
+        // Safety: We obtained the pidfd from calling `clone3` with
+        // `CLONE_PIDFD` so it's valid an otherwise unowned.
+        let mut p = unsafe { Process::new(pid, pidfd) };
         let mut bytes = [0; 8];
 
         // loop to handle EINTR
@@ -331,9 +333,19 @@ impl Command {
             let mut set = MaybeUninit::<libc::sigset_t>::uninit();
             cvt(sigemptyset(set.as_mut_ptr()))?;
             cvt(libc::pthread_sigmask(libc::SIG_SETMASK, set.as_ptr(), ptr::null_mut()))?;
-            let ret = sys::signal(libc::SIGPIPE, libc::SIG_DFL);
-            if ret == libc::SIG_ERR {
-                return Err(io::Error::last_os_error());
+
+            #[cfg(target_os = "android")] // see issue #88585
+            {
+                let mut action: libc::sigaction = mem::zeroed();
+                action.sa_sigaction = libc::SIG_DFL;
+                cvt(libc::sigaction(libc::SIGPIPE, &action, ptr::null_mut()))?;
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                let ret = sys::signal(libc::SIGPIPE, libc::SIG_DFL);
+                if ret == libc::SIG_ERR {
+                    return Err(io::Error::last_os_error());
+                }
             }
         }
 
@@ -446,7 +458,8 @@ impl Command {
             None => None,
         };
 
-        let mut p = Process::new(0, -1);
+        // Safety: -1 indicates we don't have a pidfd.
+        let mut p = unsafe { Process::new(0, -1) };
 
         struct PosixSpawnFileActions<'a>(&'a mut MaybeUninit<libc::posix_spawn_file_actions_t>);
 
@@ -545,14 +558,16 @@ pub struct Process {
 
 impl Process {
     #[cfg(target_os = "linux")]
-    fn new(pid: pid_t, pidfd: pid_t) -> Self {
+    unsafe fn new(pid: pid_t, pidfd: pid_t) -> Self {
+        use crate::os::unix::io::FromRawFd;
         use crate::sys_common::FromInner;
-        let pidfd = (pidfd >= 0).then(|| PidFd::from_inner(sys::fd::FileDesc::new(pidfd)));
+        // Safety: If `pidfd` is nonnegative, we assume it's valid and otherwise unowned.
+        let pidfd = (pidfd >= 0).then(|| PidFd::from_inner(sys::fd::FileDesc::from_raw_fd(pidfd)));
         Process { pid, status: None, pidfd }
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn new(pid: pid_t, _pidfd: pid_t) -> Self {
+    unsafe fn new(pid: pid_t, _pidfd: pid_t) -> Self {
         Process { pid, status: None }
     }
 
@@ -601,8 +616,14 @@ impl Process {
 }
 
 /// Unix exit statuses
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub struct ExitStatus(c_int);
+
+impl fmt::Debug for ExitStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("unix_wait_status").field(&self.0).finish()
+    }
+}
 
 impl ExitStatus {
     pub fn new(status: c_int) -> ExitStatus {
@@ -677,12 +698,18 @@ impl fmt::Display for ExitStatus {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub struct ExitStatusError(NonZero_c_int);
 
 impl Into<ExitStatus> for ExitStatusError {
     fn into(self) -> ExitStatus {
         ExitStatus(self.0.into())
+    }
+}
+
+impl fmt::Debug for ExitStatusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("unix_wait_status").field(&self.0).finish()
     }
 }
 

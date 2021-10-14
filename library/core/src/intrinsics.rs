@@ -1013,7 +1013,7 @@ extern "rust-intrinsic" {
     /// let val_casts = unsafe { &mut *(ptr as *mut i32 as *mut u32) };
     /// ```
     ///
-    /// Turning an `&str` into an `&[u8]`:
+    /// Turning an `&str` into a `&[u8]`:
     ///
     /// ```
     /// // this is not a good way to do this.
@@ -1933,6 +1933,11 @@ extern "rust-intrinsic" {
     /// which is UB if any of their inputs are `undef`.)
     #[rustc_const_unstable(feature = "const_intrinsic_raw_eq", issue = "none")]
     pub fn raw_eq<T>(a: &T, b: &T) -> bool;
+
+    /// See documentation of [`std::hint::black_box`] for details.
+    ///
+    /// [`std::hint::black_box`]: crate::hint::black_box
+    pub fn black_box<T>(dummy: T) -> T;
 }
 
 // Some functions are defined here because they accidentally got made

@@ -195,7 +195,7 @@ fn coherent_trait(tcx: TyCtxt<'_>, def_id: DefId) {
 }
 
 pub fn check_coherence(tcx: TyCtxt<'_>) {
-    for &trait_def_id in tcx.hir().krate().trait_impls.keys() {
+    for &trait_def_id in tcx.all_local_trait_impls(()).keys() {
         tcx.ensure().coherent_trait(trait_def_id);
     }
 
@@ -221,7 +221,7 @@ fn check_object_overlap<'tcx>(
     }
 
     // check for overlap with the automatic `impl Trait for dyn Trait`
-    if let ty::Dynamic(ref data, ..) = trait_ref.self_ty().kind() {
+    if let ty::Dynamic(data, ..) = trait_ref.self_ty().kind() {
         // This is something like impl Trait1 for Trait2. Illegal
         // if Trait1 is a supertrait of Trait2 or Trait2 is not object safe.
 

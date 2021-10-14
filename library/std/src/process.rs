@@ -115,7 +115,7 @@ use crate::path::Path;
 use crate::str;
 use crate::sys::pipe::{read2, AnonPipe};
 use crate::sys::process as imp;
-#[unstable(feature = "command_access", issue = "44434")]
+#[stable(feature = "command_access", since = "1.57.0")]
 pub use crate::sys_common::process::CommandEnvs;
 use crate::sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
 
@@ -258,6 +258,12 @@ pub struct ChildStdin {
     inner: AnonPipe,
 }
 
+// In addition to the `impl`s here, `ChildStdin` also has `impl`s for
+// `AsFd`/`From<OwnedFd>`/`Into<OwnedFd>` and
+// `AsRawFd`/`IntoRawFd`/`FromRawFd`, on Unix and WASI, and
+// `AsHandle`/`From<OwnedHandle>`/`Into<OwnedHandle>` and
+// `AsRawHandle`/`IntoRawHandle`/`FromRawHandle` on Windows.
+
 #[stable(feature = "process", since = "1.0.0")]
 impl Write for ChildStdin {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -335,6 +341,12 @@ pub struct ChildStdout {
     inner: AnonPipe,
 }
 
+// In addition to the `impl`s here, `ChildStdout` also has `impl`s for
+// `AsFd`/`From<OwnedFd>`/`Into<OwnedFd>` and
+// `AsRawFd`/`IntoRawFd`/`FromRawFd`, on Unix and WASI, and
+// `AsHandle`/`From<OwnedHandle>`/`Into<OwnedHandle>` and
+// `AsRawHandle`/`IntoRawHandle`/`FromRawHandle` on Windows.
+
 #[stable(feature = "process", since = "1.0.0")]
 impl Read for ChildStdout {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -395,6 +407,12 @@ impl fmt::Debug for ChildStdout {
 pub struct ChildStderr {
     inner: AnonPipe,
 }
+
+// In addition to the `impl`s here, `ChildStderr` also has `impl`s for
+// `AsFd`/`From<OwnedFd>`/`Into<OwnedFd>` and
+// `AsRawFd`/`IntoRawFd`/`FromRawFd`, on Unix and WASI, and
+// `AsHandle`/`From<OwnedHandle>`/`Into<OwnedHandle>` and
+// `AsRawHandle`/`IntoRawHandle`/`FromRawHandle` on Windows.
 
 #[stable(feature = "process", since = "1.0.0")]
 impl Read for ChildStderr {
@@ -925,13 +943,12 @@ impl Command {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(command_access)]
     /// use std::process::Command;
     ///
     /// let cmd = Command::new("echo");
     /// assert_eq!(cmd.get_program(), "echo");
     /// ```
-    #[unstable(feature = "command_access", issue = "44434")]
+    #[stable(feature = "command_access", since = "1.57.0")]
     pub fn get_program(&self) -> &OsStr {
         self.inner.get_program()
     }
@@ -945,7 +962,6 @@ impl Command {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(command_access)]
     /// use std::ffi::OsStr;
     /// use std::process::Command;
     ///
@@ -954,7 +970,7 @@ impl Command {
     /// let args: Vec<&OsStr> = cmd.get_args().collect();
     /// assert_eq!(args, &["first", "second"]);
     /// ```
-    #[unstable(feature = "command_access", issue = "44434")]
+    #[stable(feature = "command_access", since = "1.57.0")]
     pub fn get_args(&self) -> CommandArgs<'_> {
         CommandArgs { inner: self.inner.get_args() }
     }
@@ -974,7 +990,6 @@ impl Command {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(command_access)]
     /// use std::ffi::OsStr;
     /// use std::process::Command;
     ///
@@ -986,7 +1001,7 @@ impl Command {
     ///     (OsStr::new("TZ"), None)
     /// ]);
     /// ```
-    #[unstable(feature = "command_access", issue = "44434")]
+    #[stable(feature = "command_access", since = "1.57.0")]
     pub fn get_envs(&self) -> CommandEnvs<'_> {
         self.inner.get_envs()
     }
@@ -998,7 +1013,6 @@ impl Command {
     /// # Examples
     ///
     /// ```
-    /// # #![feature(command_access)]
     /// use std::path::Path;
     /// use std::process::Command;
     ///
@@ -1007,7 +1021,7 @@ impl Command {
     /// cmd.current_dir("/bin");
     /// assert_eq!(cmd.get_current_dir(), Some(Path::new("/bin")));
     /// ```
-    #[unstable(feature = "command_access", issue = "44434")]
+    #[stable(feature = "command_access", since = "1.57.0")]
     pub fn get_current_dir(&self) -> Option<&Path> {
         self.inner.get_current_dir()
     }
@@ -1039,13 +1053,13 @@ impl AsInnerMut<imp::Command> for Command {
 ///
 /// This struct is created by [`Command::get_args`]. See its documentation for
 /// more.
-#[unstable(feature = "command_access", issue = "44434")]
+#[stable(feature = "command_access", since = "1.57.0")]
 #[derive(Debug)]
 pub struct CommandArgs<'a> {
     inner: imp::CommandArgs<'a>,
 }
 
-#[unstable(feature = "command_access", issue = "44434")]
+#[stable(feature = "command_access", since = "1.57.0")]
 impl<'a> Iterator for CommandArgs<'a> {
     type Item = &'a OsStr;
     fn next(&mut self) -> Option<&'a OsStr> {
@@ -1056,7 +1070,7 @@ impl<'a> Iterator for CommandArgs<'a> {
     }
 }
 
-#[unstable(feature = "command_access", issue = "44434")]
+#[stable(feature = "command_access", since = "1.57.0")]
 impl<'a> ExactSizeIterator for CommandArgs<'a> {
     fn len(&self) -> usize {
         self.inner.len()
@@ -1889,7 +1903,7 @@ impl Child {
 /// [platform-specific behavior]: #platform-specific-behavior
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn exit(code: i32) -> ! {
-    crate::sys_common::rt::cleanup();
+    crate::rt::cleanup();
     crate::sys::os::exit(code)
 }
 

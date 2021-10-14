@@ -26,8 +26,7 @@ impl<'a> Parser<'a> {
     /// Parses a source module as a crate. This is the main entry point for the parser.
     pub fn parse_crate_mod(&mut self) -> PResult<'a, ast::Crate> {
         let (attrs, items, span) = self.parse_mod(&token::Eof)?;
-        let proc_macros = Vec::new(); // Filled in by `proc_macro_harness::inject()`.
-        Ok(ast::Crate { attrs, items, span, proc_macros })
+        Ok(ast::Crate { attrs, items, span })
     }
 
     /// Parses a `mod <foo> { ... }` or `mod <foo>;` item.
@@ -221,7 +220,7 @@ impl<'a> Parser<'a> {
         } else if self.check_fn_front_matter(def_final) {
             // FUNCTION ITEM
             let (ident, sig, generics, body) = self.parse_fn(attrs, req_name, lo)?;
-            (ident, ItemKind::Fn(box FnKind(def(), sig, generics, body)))
+            (ident, ItemKind::Fn(Box::new(FnKind(def(), sig, generics, body))))
         } else if self.eat_keyword(kw::Extern) {
             if self.eat_keyword(kw::Crate) {
                 // EXTERN CRATE
@@ -494,7 +493,20 @@ impl<'a> Parser<'a> {
         let ty_first = if self.token.is_keyword(kw::For) && self.look_ahead(1, |t| t != &token::Lt)
         {
             let span = self.prev_token.span.between(self.token.span);
-            self.struct_span_err(span, "missing trait in a trait impl").emit();
+            self.struct_span_err(span, "missing trait in a trait impl")
+                .span_suggestion(
+                    span,
+                    "add a trait here",
+                    " Trait ".into(),
+                    Applicability::HasPlaceholders,
+                )
+                .span_suggestion(
+                    span.to(self.token.span),
+                    "for an inherent impl, drop this `for`",
+                    "".into(),
+                    Applicability::MaybeIncorrect,
+                )
+                .emit();
             P(Ty {
                 kind: TyKind::Path(None, err_path(span)),
                 span,
@@ -548,7 +560,7 @@ impl<'a> Parser<'a> {
                 };
                 let trait_ref = TraitRef { path, ref_id: ty_first.id };
 
-                ItemKind::Impl(box ImplKind {
+                ItemKind::Impl(Box::new(ImplKind {
                     unsafety,
                     polarity,
                     defaultness,
@@ -557,11 +569,11 @@ impl<'a> Parser<'a> {
                     of_trait: Some(trait_ref),
                     self_ty: ty_second,
                     items: impl_items,
-                })
+                }))
             }
             None => {
                 // impl Type
-                ItemKind::Impl(box ImplKind {
+                ItemKind::Impl(Box::new(ImplKind {
                     unsafety,
                     polarity,
                     defaultness,
@@ -570,7 +582,7 @@ impl<'a> Parser<'a> {
                     of_trait: None,
                     self_ty: ty_first,
                     items: impl_items,
-                })
+                }))
             }
         };
 
@@ -710,7 +722,7 @@ impl<'a> Parser<'a> {
             // It's a normal trait.
             tps.where_clause = self.parse_where_clause()?;
             let items = self.parse_item_list(attrs, |p| p.parse_trait_item(ForceCollect::No))?;
-            Ok((ident, ItemKind::Trait(box TraitKind(is_auto, unsafety, tps, bounds, items))))
+            Ok((ident, ItemKind::Trait(Box::new(TraitKind(is_auto, unsafety, tps, bounds, items)))))
         }
     }
 
@@ -769,7 +781,7 @@ impl<'a> Parser<'a> {
         let default = if self.eat(&token::Eq) { Some(self.parse_ty()?) } else { None };
         self.expect_semi()?;
 
-        Ok((ident, ItemKind::TyAlias(box TyAliasKind(def, generics, bounds, default))))
+        Ok((ident, ItemKind::TyAlias(Box::new(TyAliasKind(def, generics, bounds, default)))))
     }
 
     /// Parses a `UseTree`.
@@ -1235,7 +1247,7 @@ impl<'a> Parser<'a> {
         Ok((class_name, ItemKind::Union(vdata, generics)))
     }
 
-    pub(super) fn parse_record_struct_body(
+    fn parse_record_struct_body(
         &mut self,
         adt_ty: &str,
     ) -> PResult<'a, (Vec<FieldDef>, /* recovered */ bool)> {
@@ -1469,28 +1481,22 @@ impl<'a> Parser<'a> {
     fn parse_field_ident(&mut self, adt_ty: &str, lo: Span) -> PResult<'a, Ident> {
         let (ident, is_raw) = self.ident_or_err()?;
         if !is_raw && ident.is_reserved() {
-            if ident.name == kw::Underscore {
-                self.sess.gated_spans.gate(sym::unnamed_fields, lo);
+            let err = if self.check_fn_front_matter(false) {
+                // We use `parse_fn` to get a span for the function
+                if let Err(mut db) = self.parse_fn(&mut Vec::new(), |_| true, lo) {
+                    db.delay_as_bug();
+                }
+                let mut err = self.struct_span_err(
+                    lo.to(self.prev_token.span),
+                    &format!("functions are not allowed in {} definitions", adt_ty),
+                );
+                err.help("unlike in C++, Java, and C#, functions are declared in `impl` blocks");
+                err.help("see https://doc.rust-lang.org/book/ch05-03-method-syntax.html for more information");
+                err
             } else {
-                let err = if self.check_fn_front_matter(false) {
-                    // We use `parse_fn` to get a span for the function
-                    if let Err(mut db) = self.parse_fn(&mut Vec::new(), |_| true, lo) {
-                        db.delay_as_bug();
-                    }
-                    let mut err = self.struct_span_err(
-                        lo.to(self.prev_token.span),
-                        &format!("functions are not allowed in {} definitions", adt_ty),
-                    );
-                    err.help(
-                        "unlike in C++, Java, and C#, functions are declared in `impl` blocks",
-                    );
-                    err.help("see https://doc.rust-lang.org/book/ch05-03-method-syntax.html for more information");
-                    err
-                } else {
-                    self.expected_ident_found()
-                };
-                return Err(err);
-            }
+                self.expected_ident_found()
+            };
+            return Err(err);
         }
         self.bump();
         Ok(ident)
@@ -1541,6 +1547,20 @@ impl<'a> Parser<'a> {
         self.expect(&token::Not)?; // `!`
 
         let ident = self.parse_ident()?;
+
+        if self.eat(&token::Not) {
+            // Handle macro_rules! foo!
+            let span = self.prev_token.span;
+            self.struct_span_err(span, "macro names aren't followed by a `!`")
+                .span_suggestion(
+                    span,
+                    "remove the `!`",
+                    "".to_owned(),
+                    Applicability::MachineApplicable,
+                )
+                .emit();
+        }
+
         let body = self.parse_mac_args()?;
         self.eat_semi_for_macro_if_needed(&body);
         self.complain_if_pub_macro(vis, true);

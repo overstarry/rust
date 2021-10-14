@@ -377,6 +377,7 @@ bootstrap_tool!(
     LintDocs, "src/tools/lint-docs", "lint-docs";
     JsonDocCk, "src/tools/jsondocck", "jsondocck";
     HtmlChecker, "src/tools/html-checker", "html-checker";
+    BumpStage0, "src/tools/bump-stage0", "bump-stage0";
 );
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
@@ -660,6 +661,38 @@ impl Step for Cargo {
             "src/tools/cargo/crates/credential/cargo-credential-1password",
         );
         cargo_bin_path
+    }
+}
+
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct LldWrapper {
+    pub compiler: Compiler,
+    pub target: TargetSelection,
+    pub flavor_feature: &'static str,
+}
+
+impl Step for LldWrapper {
+    type Output = PathBuf;
+
+    fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
+        run.never()
+    }
+
+    fn run(self, builder: &Builder<'_>) -> PathBuf {
+        let src_exe = builder
+            .ensure(ToolBuild {
+                compiler: self.compiler,
+                target: self.target,
+                tool: "lld-wrapper",
+                mode: Mode::ToolStd,
+                path: "src/tools/lld-wrapper",
+                is_optional_tool: false,
+                source_type: SourceType::InTree,
+                extra_features: vec![self.flavor_feature.to_owned()],
+            })
+            .expect("expected to build -- essential tool");
+
+        src_exe
     }
 }
 

@@ -143,8 +143,8 @@ macro validate_simd_type($fx:ident, $intrinsic:ident, $span:ident, $ty:expr) {
 }
 
 pub(crate) fn clif_vector_type<'tcx>(tcx: TyCtxt<'tcx>, layout: TyAndLayout<'tcx>) -> Option<Type> {
-    let (element, count) = match &layout.abi {
-        Abi::Vector { element, count } => (element.clone(), *count),
+    let (element, count) = match layout.abi {
+        Abi::Vector { element, count } => (element, count),
         _ => unreachable!(),
     };
 
@@ -789,7 +789,7 @@ pub(crate) fn codegen_intrinsic_call<'tcx>(
                 return;
             }
 
-            if intrinsic == sym::assert_zero_valid && !layout.might_permit_raw_init(fx, /*zero:*/ true).unwrap() {
+            if intrinsic == sym::assert_zero_valid && !layout.might_permit_raw_init(fx, /*zero:*/ true) {
                 with_no_trimmed_paths(|| crate::base::codegen_panic(
                     fx,
                     &format!("attempted to zero-initialize type `{}`, which is invalid", T),
@@ -798,7 +798,7 @@ pub(crate) fn codegen_intrinsic_call<'tcx>(
                 return;
             }
 
-            if intrinsic == sym::assert_uninit_valid && !layout.might_permit_raw_init(fx, /*zero:*/ false).unwrap() {
+            if intrinsic == sym::assert_uninit_valid && !layout.might_permit_raw_init(fx, /*zero:*/ false) {
                 with_no_trimmed_paths(|| crate::base::codegen_panic(
                     fx,
                     &format!("attempted to leave type `{}` uninitialized, which is invalid", T),
@@ -823,7 +823,7 @@ pub(crate) fn codegen_intrinsic_call<'tcx>(
             dest.write_cvalue(fx, val);
         };
 
-        pref_align_of | min_align_of | needs_drop | type_id | type_name | variant_count, () {
+        pref_align_of | needs_drop | type_id | type_name | variant_count, () {
             let const_val =
                 fx.tcx.const_eval_instance(ParamEnv::reveal_all(), instance, None).unwrap();
             let val = crate::constant::codegen_const_value(
@@ -1135,6 +1135,11 @@ pub(crate) fn codegen_intrinsic_call<'tcx>(
                     fx.bcx.ins().bint(types::I8, eq)
                 };
             ret.write_cvalue(fx, CValue::by_val(is_eq_value, ret.layout()));
+        };
+
+        black_box, (c a) {
+            // FIXME implement black_box semantics
+            ret.write_cvalue(fx, a);
         };
     }
 

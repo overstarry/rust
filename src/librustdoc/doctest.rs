@@ -40,7 +40,7 @@ crate struct TestOptions {
     crate no_crate_inject: bool,
     /// Whether to emit compilation warnings when compiling doctests. Setting this will suppress
     /// the default `#![allow(unused)]`.
-    crate display_warnings: bool,
+    crate display_doctest_warnings: bool,
     /// Additional crate-level attributes to add to doctests.
     crate attrs: Vec<String>,
 }
@@ -72,8 +72,8 @@ crate fn run(options: Options) -> Result<(), ErrorReported> {
         maybe_sysroot: options.maybe_sysroot.clone(),
         search_paths: options.libs.clone(),
         crate_types,
-        lint_opts: if !options.display_warnings { lint_opts } else { vec![] },
-        lint_cap: Some(options.lint_cap.clone().unwrap_or_else(|| lint::Forbid)),
+        lint_opts: if !options.display_doctest_warnings { lint_opts } else { vec![] },
+        lint_cap: Some(options.lint_cap.unwrap_or_else(|| lint::Forbid)),
         cg: options.codegen_options.clone(),
         externs: options.externs.clone(),
         unstable_features: options.render_options.unstable_features,
@@ -106,7 +106,7 @@ crate fn run(options: Options) -> Result<(), ErrorReported> {
     };
 
     let test_args = options.test_args.clone();
-    let display_warnings = options.display_warnings;
+    let display_doctest_warnings = options.display_doctest_warnings;
     let nocapture = options.nocapture;
     let externs = options.externs.clone();
     let json_unused_externs = options.json_unused_externs;
@@ -116,11 +116,10 @@ crate fn run(options: Options) -> Result<(), ErrorReported> {
             let mut global_ctxt = queries.global_ctxt()?.take();
 
             let collector = global_ctxt.enter(|tcx| {
-                let krate = tcx.hir().krate();
                 let crate_attrs = tcx.hir().attrs(CRATE_HIR_ID);
 
                 let mut opts = scrape_test_config(crate_attrs);
-                opts.display_warnings |= options.display_warnings;
+                opts.display_doctest_warnings |= options.display_doctest_warnings;
                 let enable_per_target_ignores = options.enable_per_target_ignores;
                 let mut collector = Collector::new(
                     tcx.crate_name(LOCAL_CRATE),
@@ -144,10 +143,8 @@ crate fn run(options: Options) -> Result<(), ErrorReported> {
                 hir_collector.visit_testable(
                     "".to_string(),
                     CRATE_HIR_ID,
-                    krate.module().inner,
-                    |this| {
-                        intravisit::walk_crate(this, krate);
-                    },
+                    tcx.hir().span(CRATE_HIR_ID),
+                    |this| tcx.hir().walk_toplevel_module(this),
                 );
 
                 collector
@@ -166,7 +163,7 @@ crate fn run(options: Options) -> Result<(), ErrorReported> {
         Err(ErrorReported) => return Err(ErrorReported),
     };
 
-    run_tests(test_args, nocapture, display_warnings, tests);
+    run_tests(test_args, nocapture, display_doctest_warnings, tests);
 
     // Collect and warn about unused externs, but only if we've gotten
     // reports for each doctest
@@ -212,14 +209,18 @@ crate fn run(options: Options) -> Result<(), ErrorReported> {
 crate fn run_tests(
     mut test_args: Vec<String>,
     nocapture: bool,
-    display_warnings: bool,
+    display_doctest_warnings: bool,
     tests: Vec<test::TestDescAndFn>,
 ) {
     test_args.insert(0, "rustdoctest".to_string());
     if nocapture {
         test_args.push("--nocapture".to_string());
     }
-    test::test_main(&test_args, tests, Some(test::Options::new().display_output(display_warnings)));
+    test::test_main(
+        &test_args,
+        tests,
+        Some(test::Options::new().display_output(display_doctest_warnings)),
+    );
 }
 
 // Look for `#![doc(test(no_crate_inject))]`, used by crates in the std facade.
@@ -227,7 +228,7 @@ fn scrape_test_config(attrs: &[ast::Attribute]) -> TestOptions {
     use rustc_ast_pretty::pprust;
 
     let mut opts =
-        TestOptions { no_crate_inject: false, display_warnings: false, attrs: Vec::new() };
+        TestOptions { no_crate_inject: false, display_doctest_warnings: false, attrs: Vec::new() };
 
     let test_attrs: Vec<_> = attrs
         .iter()
@@ -361,7 +362,7 @@ fn run_test(
     for debugging_option_str in &options.debugging_opts_strs {
         compiler.arg("-Z").arg(&debugging_option_str);
     }
-    if no_run && !compile_fail {
+    if no_run && !compile_fail && options.persist_doctests.is_none() {
         compiler.arg("--emit=metadata");
     }
     compiler.arg("--target").arg(match target {
@@ -507,7 +508,7 @@ crate fn make_test(
     let mut prog = String::new();
     let mut supports_color = false;
 
-    if opts.attrs.is_empty() && !opts.display_warnings {
+    if opts.attrs.is_empty() && !opts.display_doctest_warnings {
         // If there aren't any attributes supplied by #![doc(test(attr(...)))], then allow some
         // lints that are commonly triggered in doctests. The crate-level test attributes are
         // commonly used to make tests fail in case they trigger warnings, so having this there in
@@ -852,6 +853,7 @@ impl Collector {
 
     fn generate_name(&self, line: usize, filename: &FileName) -> String {
         let mut item_path = self.names.join("::");
+        item_path.retain(|c| c != ' ');
         if !item_path.is_empty() {
             item_path.push(' ');
         }
@@ -1121,7 +1123,7 @@ impl<'a, 'hir, 'tcx> HirCollector<'a, 'hir, 'tcx> {
         let ast_attrs = self.tcx.hir().attrs(hir_id);
         let mut attrs = Attributes::from_ast(ast_attrs, None);
 
-        if let Some(ref cfg) = ast_attrs.cfg(self.sess) {
+        if let Some(ref cfg) = ast_attrs.cfg(self.tcx, &FxHashSet::default()) {
             if !cfg.matches(&self.sess.parse_sess, Some(&self.sess.features_untracked())) {
                 return;
             }
@@ -1171,10 +1173,21 @@ impl<'a, 'hir, 'tcx> intravisit::Visitor<'hir> for HirCollector<'a, 'hir, 'tcx> 
     }
 
     fn visit_item(&mut self, item: &'hir hir::Item<'_>) {
-        let name = if let hir::ItemKind::Impl(impl_) = &item.kind {
-            rustc_hir_pretty::id_to_string(&self.map, impl_.self_ty.hir_id)
-        } else {
-            item.ident.to_string()
+        let name = match &item.kind {
+            hir::ItemKind::Macro(ref macro_def) => {
+                // FIXME(#88038): Non exported macros have historically not been tested,
+                // but we really ought to start testing them.
+                let def_id = item.def_id.to_def_id();
+                if macro_def.macro_rules && !self.tcx.has_attr(def_id, sym::macro_export) {
+                    intravisit::walk_item(self, item);
+                    return;
+                }
+                item.ident.to_string()
+            }
+            hir::ItemKind::Impl(impl_) => {
+                rustc_hir_pretty::id_to_string(&self.map, impl_.self_ty.hir_id)
+            }
+            _ => item.ident.to_string(),
         };
 
         self.visit_testable(name, item.hir_id(), item.span, |this| {
@@ -1215,15 +1228,6 @@ impl<'a, 'hir, 'tcx> intravisit::Visitor<'hir> for HirCollector<'a, 'hir, 'tcx> 
         self.visit_testable(f.ident.to_string(), f.hir_id, f.span, |this| {
             intravisit::walk_field_def(this, f);
         });
-    }
-
-    fn visit_macro_def(&mut self, macro_def: &'hir hir::MacroDef<'_>) {
-        self.visit_testable(
-            macro_def.ident.to_string(),
-            macro_def.hir_id(),
-            macro_def.span,
-            |_| (),
-        );
     }
 }
 

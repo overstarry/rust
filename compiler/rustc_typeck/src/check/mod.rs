@@ -75,6 +75,7 @@ mod diverges;
 pub mod dropck;
 mod expectation;
 mod expr;
+mod fallback;
 mod fn_ctxt;
 mod gather_locals;
 mod generator_interior;
@@ -270,22 +271,22 @@ fn primary_body_of(
 ) -> Option<(hir::BodyId, Option<&hir::Ty<'_>>, Option<&hir::FnSig<'_>>)> {
     match tcx.hir().get(id) {
         Node::Item(item) => match item.kind {
-            hir::ItemKind::Const(ref ty, body) | hir::ItemKind::Static(ref ty, _, body) => {
+            hir::ItemKind::Const(ty, body) | hir::ItemKind::Static(ty, _, body) => {
                 Some((body, Some(ty), None))
             }
-            hir::ItemKind::Fn(ref sig, .., body) => Some((body, None, Some(&sig))),
+            hir::ItemKind::Fn(ref sig, .., body) => Some((body, None, Some(sig))),
             _ => None,
         },
         Node::TraitItem(item) => match item.kind {
-            hir::TraitItemKind::Const(ref ty, Some(body)) => Some((body, Some(ty), None)),
+            hir::TraitItemKind::Const(ty, Some(body)) => Some((body, Some(ty), None)),
             hir::TraitItemKind::Fn(ref sig, hir::TraitFn::Provided(body)) => {
-                Some((body, None, Some(&sig)))
+                Some((body, None, Some(sig)))
             }
             _ => None,
         },
         Node::ImplItem(item) => match item.kind {
-            hir::ImplItemKind::Const(ref ty, body) => Some((body, Some(ty), None)),
-            hir::ImplItemKind::Fn(ref sig, body) => Some((body, None, Some(&sig))),
+            hir::ImplItemKind::Const(ty, body) => Some((body, Some(ty), None)),
+            hir::ImplItemKind::Fn(ref sig, body) => Some((body, None, Some(sig))),
             _ => None,
         },
         Node::AnonConst(constant) => Some((constant.body, None, None)),
@@ -363,7 +364,7 @@ fn typeck_with_fallback<'tcx>(
 
     let typeck_results = Inherited::build(tcx, def_id).enter(|inh| {
         let param_env = tcx.param_env(def_id);
-        let fcx = if let Some(hir::FnSig { header, decl, .. }) = fn_sig {
+        let (fcx, wf_tys) = if let Some(hir::FnSig { header, decl, .. }) = fn_sig {
             let fn_sig = if crate::collect::get_infer_ret_ty(&decl.output).is_some() {
                 let fcx = FnCtxt::new(&inh, param_env, body.value.hir_id);
                 <dyn AstConv<'_>>::ty_of_fn(
@@ -382,17 +383,25 @@ fn typeck_with_fallback<'tcx>(
 
             check_abi(tcx, id, span, fn_sig.abi());
 
+            // When normalizing the function signature, we assume all types are
+            // well-formed. So, we don't need to worry about the obligations
+            // from normalization. We could just discard these, but to align with
+            // compare_method and elsewhere, we just add implied bounds for
+            // these types.
+            let mut wf_tys = FxHashSet::default();
             // Compute the fty from point of view of inside the fn.
             let fn_sig = tcx.liberate_late_bound_regions(def_id.to_def_id(), fn_sig);
+            wf_tys.extend(fn_sig.inputs_and_output.iter());
             let fn_sig = inh.normalize_associated_types_in(
                 body.value.span,
                 body_id.hir_id,
                 param_env,
                 fn_sig,
             );
+            wf_tys.extend(fn_sig.inputs_and_output.iter());
 
-            let fcx = check_fn(&inh, param_env, fn_sig, decl, id, body, None).0;
-            fcx
+            let fcx = check_fn(&inh, param_env, fn_sig, decl, id, body, None, true).0;
+            (fcx, wf_tys)
         } else {
             let fcx = FnCtxt::new(&inh, param_env, body.value.hir_id);
             let expected_type = body_ty
@@ -442,57 +451,15 @@ fn typeck_with_fallback<'tcx>(
 
             fcx.write_ty(id, expected_type);
 
-            fcx
+            (fcx, FxHashSet::default())
         };
 
-        // All type checking constraints were added, try to fallback unsolved variables.
-        fcx.select_obligations_where_possible(false, |_| {});
-        let mut fallback_has_occurred = false;
-
-        // We do fallback in two passes, to try to generate
-        // better error messages.
-        // The first time, we do *not* replace opaque types.
-        for ty in &fcx.unsolved_variables() {
-            fallback_has_occurred |= fcx.fallback_if_possible(ty, FallbackMode::NoOpaque);
-        }
-        // We now see if we can make progress. This might
-        // cause us to unify inference variables for opaque types,
-        // since we may have unified some other type variables
-        // during the first phase of fallback.
-        // This means that we only replace inference variables with their underlying
-        // opaque types as a last resort.
-        //
-        // In code like this:
-        //
-        // ```rust
-        // type MyType = impl Copy;
-        // fn produce() -> MyType { true }
-        // fn bad_produce() -> MyType { panic!() }
-        // ```
-        //
-        // we want to unify the opaque inference variable in `bad_produce`
-        // with the diverging fallback for `panic!` (e.g. `()` or `!`).
-        // This will produce a nice error message about conflicting concrete
-        // types for `MyType`.
-        //
-        // If we had tried to fallback the opaque inference variable to `MyType`,
-        // we will generate a confusing type-check error that does not explicitly
-        // refer to opaque types.
-        fcx.select_obligations_where_possible(fallback_has_occurred, |_| {});
-
-        // We now run fallback again, but this time we allow it to replace
-        // unconstrained opaque type variables, in addition to performing
-        // other kinds of fallback.
-        for ty in &fcx.unsolved_variables() {
-            fallback_has_occurred |= fcx.fallback_if_possible(ty, FallbackMode::All);
-        }
-
-        // See if we can make any more progress.
-        fcx.select_obligations_where_possible(fallback_has_occurred, |_| {});
+        let fallback_has_occurred = fcx.type_inference_fallback();
 
         // Even though coercion casts provide type hints, we check casts after fallback for
         // backwards compatibility. This makes fallback a stronger type hint than a cast coercion.
         fcx.check_casts();
+        fcx.select_obligations_where_possible(fallback_has_occurred, |_| {});
 
         // Closure and generator analysis may run after fallback
         // because they don't constrain other type variables.
@@ -508,7 +475,7 @@ fn typeck_with_fallback<'tcx>(
         fcx.select_all_obligations_or_error();
 
         if fn_sig.is_some() {
-            fcx.regionck_fn(id, body);
+            fcx.regionck_fn(id, body, span, wf_tys);
         } else {
             fcx.regionck_expr(body);
         }
@@ -588,16 +555,13 @@ fn maybe_check_static_with_link_section(tcx: TyCtxt<'_>, id: LocalDefId, span: S
     // `#[link_section]` may contain arbitrary, or even undefined bytes, but it is
     // the consumer's responsibility to ensure all bytes that have been read
     // have defined values.
-    match tcx.eval_static_initializer(id.to_def_id()) {
-        Ok(alloc) => {
-            if alloc.relocations().len() != 0 {
-                let msg = "statics with a custom `#[link_section]` must be a \
+    if let Ok(alloc) = tcx.eval_static_initializer(id.to_def_id()) {
+        if alloc.relocations().len() != 0 {
+            let msg = "statics with a custom `#[link_section]` must be a \
                            simple list of bytes on the wasm target with no \
                            extra levels of indirection such as references";
-                tcx.sess.span_err(span, msg);
-            }
+            tcx.sess.span_err(span, msg);
         }
-        Err(_) => {}
     }
 }
 
@@ -664,7 +628,7 @@ fn missing_items_err(
     let padding: String = " ".repeat(indentation);
 
     for trait_item in missing_items {
-        let snippet = suggestion_signature(&trait_item, tcx);
+        let snippet = suggestion_signature(trait_item, tcx);
         let code = format!("{}{}\n{}", padding, snippet, padding);
         let msg = format!("implement the missing item: `{}`", snippet);
         let appl = Applicability::HasPlaceholders;
@@ -689,7 +653,7 @@ fn bounds_from_generic_predicates<'tcx>(
         debug!("predicate {:?}", predicate);
         let bound_predicate = predicate.kind();
         match bound_predicate.skip_binder() {
-            ty::PredicateKind::Trait(trait_predicate, _) => {
+            ty::PredicateKind::Trait(trait_predicate) => {
                 let entry = types.entry(trait_predicate.self_ty()).or_default();
                 let def_id = trait_predicate.def_id();
                 if Some(def_id) != tcx.lang_items().sized_trait() {
@@ -914,16 +878,6 @@ enum TupleArgumentsFlag {
     TupleArguments,
 }
 
-/// Controls how we perform fallback for unconstrained
-/// type variables.
-enum FallbackMode {
-    /// Do not fallback type variables to opaque types.
-    NoOpaque,
-    /// Perform all possible kinds of fallback, including
-    /// turning type variables to opaque types.
-    All,
-}
-
 /// A wrapper for `InferCtxt`'s `in_progress_typeck_results` field.
 #[derive(Copy, Clone)]
 struct MaybeInProgressTables<'a, 'tcx> {
@@ -964,9 +918,7 @@ impl ItemLikeVisitor<'tcx> for CheckItemTypesVisitor<'tcx> {
 }
 
 fn typeck_item_bodies(tcx: TyCtxt<'_>, (): ()) {
-    tcx.par_body_owners(|body_owner_def_id| {
-        tcx.ensure().typeck(body_owner_def_id);
-    });
+    tcx.hir().par_body_owners(|body_owner_def_id| tcx.ensure().typeck(body_owner_def_id));
 }
 
 fn fatally_break_rust(sess: &Session) {

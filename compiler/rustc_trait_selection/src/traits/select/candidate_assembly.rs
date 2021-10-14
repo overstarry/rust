@@ -6,14 +6,19 @@
 //!
 //! [rustc dev guide]:https://rustc-dev-guide.rust-lang.org/traits/resolution.html#candidate-assembly
 use rustc_hir as hir;
+use rustc_hir::def_id::DefId;
+use rustc_infer::traits::TraitEngine;
 use rustc_infer::traits::{Obligation, SelectionError, TraitObligation};
+use rustc_lint_defs::builtin::DEREF_INTO_DYN_SUPERTRAIT;
 use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self, TypeFoldable};
+use rustc_middle::ty::{self, ToPredicate, Ty, TypeFoldable, WithConstness};
 use rustc_target::spec::abi::Abi;
 
+use crate::traits;
 use crate::traits::coherence::Conflict;
+use crate::traits::query::evaluate_obligation::InferCtxtExt;
 use crate::traits::{util, SelectionResult};
-use crate::traits::{Overflow, Unimplemented};
+use crate::traits::{ErrorReporting, Overflow, Unimplemented};
 
 use super::BuiltinImplConditions;
 use super::IntercrateAmbiguityCause;
@@ -144,7 +149,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         // Instead, we select the right impl now but report "`Bar` does
         // not implement `Clone`".
         if candidates.len() == 1 {
-            return self.filter_negative_and_reservation_impls(candidates.pop().unwrap());
+            return self.filter_impls(candidates.pop().unwrap(), stack.obligation);
         }
 
         // Winnow, but record the exact outcome of evaluation, which
@@ -156,7 +161,8 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     Ok(Some(EvaluatedCandidate { candidate: c, evaluation: eval }))
                 }
                 Ok(_) => Ok(None),
-                Err(OverflowError) => Err(Overflow),
+                Err(OverflowError::Canonical) => Err(Overflow),
+                Err(OverflowError::ErrorReporting) => Err(ErrorReporting),
             })
             .flat_map(Result::transpose)
             .collect::<Result<Vec<_>, _>>()?;
@@ -217,9 +223,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         }
 
         // Just one candidate left.
-        self.filter_negative_and_reservation_impls(candidates.pop().unwrap().candidate)
+        self.filter_impls(candidates.pop().unwrap().candidate, stack.obligation)
     }
 
+    #[instrument(skip(self, stack), level = "debug")]
     pub(super) fn assemble_candidates<'o>(
         &mut self,
         stack: &TraitObligationStack<'o, 'tcx>,
@@ -277,6 +284,16 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             self.assemble_builtin_bound_candidates(sized_conditions, &mut candidates);
         } else if lang_items.unsize_trait() == Some(def_id) {
             self.assemble_candidates_for_unsizing(obligation, &mut candidates);
+        } else if lang_items.drop_trait() == Some(def_id)
+            && obligation.predicate.skip_binder().constness == ty::BoundConstness::ConstIfConst
+        {
+            if self.is_in_const_context {
+                self.assemble_const_drop_candidates(obligation, &mut candidates)?;
+            } else {
+                debug!("passing ~const Drop bound; in non-const context");
+                // `~const Drop` when we are not in a const context has no effect.
+                candidates.vec.push(ConstDropCandidate)
+            }
         } else {
             if lang_items.clone_trait() == Some(def_id) {
                 // Same builtin conditions as `Copy`, i.e., every type which has builtin support
@@ -465,7 +482,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     ..
                 } = self_ty.fn_sig(self.tcx()).skip_binder()
                 {
-                    candidates.vec.push(FnPointerCandidate);
+                    candidates.vec.push(FnPointerCandidate { is_const: false });
                 }
             }
             // Provide an impl for suitable functions, rejecting `#[target_feature]` functions (RFC 2396).
@@ -478,7 +495,9 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 } = self_ty.fn_sig(self.tcx()).skip_binder()
                 {
                     if self.tcx().codegen_fn_attrs(def_id).target_features.is_empty() {
-                        candidates.vec.push(FnPointerCandidate);
+                        candidates
+                            .vec
+                            .push(FnPointerCandidate { is_const: self.tcx().is_const_fn(def_id) });
                     }
                 }
             }
@@ -659,6 +678,55 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         })
     }
 
+    /// Temporary migration for #89190
+    fn need_migrate_deref_output_trait_object(
+        &mut self,
+        ty: Ty<'tcx>,
+        cause: &traits::ObligationCause<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+    ) -> Option<(Ty<'tcx>, DefId)> {
+        let tcx = self.tcx();
+        if tcx.features().trait_upcasting {
+            return None;
+        }
+
+        // <ty as Deref>
+        let trait_ref = ty::TraitRef {
+            def_id: tcx.lang_items().deref_trait()?,
+            substs: tcx.mk_substs_trait(ty, &[]),
+        };
+
+        let obligation = traits::Obligation::new(
+            cause.clone(),
+            param_env,
+            ty::Binder::dummy(trait_ref).without_const().to_predicate(tcx),
+        );
+        if !self.infcx.predicate_may_hold(&obligation) {
+            return None;
+        }
+
+        let mut fulfillcx = traits::FulfillmentContext::new_in_snapshot();
+        let normalized_ty = fulfillcx.normalize_projection_type(
+            &self.infcx,
+            param_env,
+            ty::ProjectionTy {
+                item_def_id: tcx.lang_items().deref_target()?,
+                substs: trait_ref.substs,
+            },
+            cause.clone(),
+        );
+
+        let data = if let ty::Dynamic(ref data, ..) = normalized_ty.kind() {
+            data
+        } else {
+            return None;
+        };
+
+        let def_id = data.principal_def_id()?;
+
+        return Some((normalized_ty, def_id));
+    }
+
     /// Searches for unsizing that might apply to `obligation`.
     fn assemble_candidates_for_unsizing(
         &mut self,
@@ -690,19 +758,74 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         debug!(?source, ?target, "assemble_candidates_for_unsizing");
 
-        let may_apply = match (source.kind(), target.kind()) {
+        match (source.kind(), target.kind()) {
             // Trait+Kx+'a -> Trait+Ky+'b (upcasts).
             (&ty::Dynamic(ref data_a, ..), &ty::Dynamic(ref data_b, ..)) => {
-                // See `confirm_builtin_unsize_candidate` for more info.
+                // Upcast coercions permit several things:
+                //
+                // 1. Dropping auto traits, e.g., `Foo + Send` to `Foo`
+                // 2. Tightening the region bound, e.g., `Foo + 'a` to `Foo + 'b` if `'a: 'b`
+                // 3. Tightening trait to its super traits, eg. `Foo` to `Bar` if `Foo: Bar`
+                //
+                // Note that neither of the first two of these changes requires any
+                // change at runtime. The third needs to change pointer metadata at runtime.
+                //
+                // We always perform upcasting coercions when we can because of reason
+                // #2 (region bounds).
                 let auto_traits_compatible = data_b
                     .auto_traits()
                     // All of a's auto traits need to be in b's auto traits.
                     .all(|b| data_a.auto_traits().any(|a| a == b));
-                auto_traits_compatible
+                if auto_traits_compatible {
+                    let principal_def_id_a = data_a.principal_def_id();
+                    let principal_def_id_b = data_b.principal_def_id();
+                    if principal_def_id_a == principal_def_id_b {
+                        // no cyclic
+                        candidates.vec.push(BuiltinUnsizeCandidate);
+                    } else if principal_def_id_a.is_some() && principal_def_id_b.is_some() {
+                        // not casual unsizing, now check whether this is trait upcasting coercion.
+                        let principal_a = data_a.principal().unwrap();
+                        let target_trait_did = principal_def_id_b.unwrap();
+                        let source_trait_ref = principal_a.with_self_ty(self.tcx(), source);
+                        if let Some((deref_output_ty, deref_output_trait_did)) = self
+                            .need_migrate_deref_output_trait_object(
+                                source,
+                                &obligation.cause,
+                                obligation.param_env,
+                            )
+                        {
+                            if deref_output_trait_did == target_trait_did {
+                                self.tcx().struct_span_lint_hir(
+                                    DEREF_INTO_DYN_SUPERTRAIT,
+                                    obligation.cause.body_id,
+                                    obligation.cause.span,
+                                    |lint| {
+                                        lint.build(&format!(
+                                            "`{}` implements `Deref` with supertrait `{}` as output",
+                                            source,
+                                            deref_output_ty
+                                        )).emit();
+                                    },
+                                );
+                                return;
+                            }
+                        }
+
+                        for (idx, upcast_trait_ref) in
+                            util::supertraits(self.tcx(), source_trait_ref).enumerate()
+                        {
+                            if upcast_trait_ref.def_id() == target_trait_did {
+                                candidates.vec.push(TraitUpcastingUnsizeCandidate(idx));
+                            }
+                        }
+                    }
+                }
             }
 
             // `T` -> `Trait`
-            (_, &ty::Dynamic(..)) => true,
+            (_, &ty::Dynamic(..)) => {
+                candidates.vec.push(BuiltinUnsizeCandidate);
+            }
 
             // Ambiguous handling is below `T` -> `Trait`, because inference
             // variables can still implement `Unsize<Trait>` and nested
@@ -710,26 +833,29 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             (&ty::Infer(ty::TyVar(_)), _) | (_, &ty::Infer(ty::TyVar(_))) => {
                 debug!("assemble_candidates_for_unsizing: ambiguous");
                 candidates.ambiguous = true;
-                false
             }
 
             // `[T; n]` -> `[T]`
-            (&ty::Array(..), &ty::Slice(_)) => true,
+            (&ty::Array(..), &ty::Slice(_)) => {
+                candidates.vec.push(BuiltinUnsizeCandidate);
+            }
 
             // `Struct<T>` -> `Struct<U>`
             (&ty::Adt(def_id_a, _), &ty::Adt(def_id_b, _)) if def_id_a.is_struct() => {
-                def_id_a == def_id_b
+                if def_id_a == def_id_b {
+                    candidates.vec.push(BuiltinUnsizeCandidate);
+                }
             }
 
             // `(.., T)` -> `(.., U)`
-            (&ty::Tuple(tys_a), &ty::Tuple(tys_b)) => tys_a.len() == tys_b.len(),
+            (&ty::Tuple(tys_a), &ty::Tuple(tys_b)) => {
+                if tys_a.len() == tys_b.len() {
+                    candidates.vec.push(BuiltinUnsizeCandidate);
+                }
+            }
 
-            _ => false,
+            _ => {}
         };
-
-        if may_apply {
-            candidates.vec.push(BuiltinUnsizeCandidate);
-        }
     }
 
     fn assemble_candidates_for_trait_alias(
@@ -768,5 +894,119 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 candidates.ambiguous = true;
             }
         }
+    }
+
+    fn assemble_const_drop_candidates(
+        &mut self,
+        obligation: &TraitObligation<'tcx>,
+        candidates: &mut SelectionCandidateSet<'tcx>,
+    ) -> Result<(), SelectionError<'tcx>> {
+        let mut stack: Vec<(Ty<'tcx>, usize)> = vec![(obligation.self_ty().skip_binder(), 0)];
+
+        while let Some((ty, depth)) = stack.pop() {
+            let mut noreturn = false;
+
+            self.check_recursion_depth(depth, obligation)?;
+            let mut copy_candidates = SelectionCandidateSet { vec: Vec::new(), ambiguous: false };
+            let mut copy_obligation =
+                obligation.with(obligation.predicate.rebind(ty::TraitPredicate {
+                    trait_ref: ty::TraitRef {
+                        def_id: self.tcx().require_lang_item(hir::LangItem::Copy, None),
+                        substs: self.tcx().mk_substs_trait(ty, &[]),
+                    },
+                    constness: ty::BoundConstness::NotConst,
+                }));
+            copy_obligation.recursion_depth = depth + 1;
+            self.assemble_candidates_from_impls(&copy_obligation, &mut copy_candidates);
+            let copy_conditions = self.copy_clone_conditions(&copy_obligation);
+            self.assemble_builtin_bound_candidates(copy_conditions, &mut copy_candidates);
+            if !copy_candidates.vec.is_empty() {
+                noreturn = true;
+            }
+            debug!(?copy_candidates.vec, "assemble_const_drop_candidates - copy");
+
+            match ty.kind() {
+                ty::Int(_)
+                | ty::Uint(_)
+                | ty::Float(_)
+                | ty::Infer(ty::IntVar(_))
+                | ty::Infer(ty::FloatVar(_))
+                | ty::FnPtr(_)
+                | ty::Never
+                | ty::Ref(..)
+                | ty::FnDef(..)
+                | ty::RawPtr(_)
+                | ty::Bool
+                | ty::Char
+                | ty::Str
+                | ty::Foreign(_) => {} // Do nothing. These types satisfy `const Drop`.
+
+                ty::Adt(def, subst) => {
+                    let mut set = SelectionCandidateSet { vec: Vec::new(), ambiguous: false };
+                    self.assemble_candidates_from_impls(
+                        &obligation.with(obligation.predicate.map_bound(|mut pred| {
+                            pred.trait_ref.substs = self.tcx().mk_substs_trait(ty, &[]);
+                            pred
+                        })),
+                        &mut set,
+                    );
+                    stack.extend(def.all_fields().map(|f| (f.ty(self.tcx(), subst), depth + 1)));
+
+                    debug!(?set.vec, "assemble_const_drop_candidates - ty::Adt");
+                    if set.vec.into_iter().any(|candidate| {
+                        if let SelectionCandidate::ImplCandidate(did) = candidate {
+                            matches!(self.tcx().impl_constness(did), hir::Constness::NotConst)
+                        } else {
+                            false
+                        }
+                    }) {
+                        if !noreturn {
+                            // has non-const Drop
+                            return Ok(());
+                        }
+                        debug!("not returning");
+                    }
+                }
+
+                ty::Array(ty, _) => stack.push((ty, depth + 1)),
+
+                ty::Tuple(_) => stack.extend(ty.tuple_fields().map(|t| (t, depth + 1))),
+
+                ty::Closure(_, substs) => {
+                    stack.extend(substs.as_closure().upvar_tys().map(|t| (t, depth + 1)))
+                }
+
+                ty::Generator(_, substs, _) => {
+                    let substs = substs.as_generator();
+                    stack.extend(substs.upvar_tys().map(|t| (t, depth + 1)));
+                    stack.push((substs.witness(), depth + 1));
+                }
+
+                ty::GeneratorWitness(tys) => stack.extend(
+                    self.tcx().erase_late_bound_regions(*tys).iter().map(|t| (t, depth + 1)),
+                ),
+
+                ty::Slice(ty) => stack.push((ty, depth + 1)),
+
+                ty::Opaque(..)
+                | ty::Dynamic(..)
+                | ty::Error(_)
+                | ty::Bound(..)
+                | ty::Infer(_)
+                | ty::Placeholder(_)
+                | ty::Projection(..)
+                | ty::Param(..) => {
+                    if !noreturn {
+                        return Ok(());
+                    }
+                    debug!("not returning");
+                }
+            }
+            debug!(?stack, "assemble_const_drop_candidates - in loop");
+        }
+        // all types have passed.
+        candidates.vec.push(ConstDropCandidate);
+
+        Ok(())
     }
 }

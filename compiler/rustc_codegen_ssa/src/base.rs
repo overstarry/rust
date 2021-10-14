@@ -18,18 +18,18 @@ use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::lang_items::LangItem;
 use rustc_index::vec::Idx;
+use rustc_metadata::EncodedMetadata;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
-use rustc_middle::middle::cstore::EncodedMetadata;
 use rustc_middle::middle::lang_items;
 use rustc_middle::mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem};
-use rustc_middle::ty::layout::{HasTyCtxt, TyAndLayout};
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use rustc_session::cgu_reuse_tracker::CguReuse;
 use rustc_session::config::{self, EntryFnType};
 use rustc_session::Session;
 use rustc_span::symbol::sym;
-use rustc_target::abi::{Align, LayoutOf, VariantIdx};
+use rustc_target::abi::{Align, VariantIdx};
 
 use std::convert::TryFrom;
 use std::ops::{Deref, DerefMut};
@@ -150,19 +150,8 @@ pub fn unsized_info<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
             // trait upcasting coercion
 
-            // if both of the two `principal`s are `None`, this function would have returned early above.
-            // and if one of the two `principal`s is `None`, typechecking would have rejected this case.
-            let principal_a = data_a
-                .principal()
-                .expect("unsized_info: missing principal trait for trait upcasting coercion");
-            let principal_b = data_b
-                .principal()
-                .expect("unsized_info: missing principal trait for trait upcasting coercion");
-
-            let vptr_entry_idx = cx.tcx().vtable_trait_upcasting_coercion_new_vptr_slot((
-                principal_a.with_self_ty(cx.tcx(), source),
-                principal_b.with_self_ty(cx.tcx(), source),
-            ));
+            let vptr_entry_idx =
+                cx.tcx().vtable_trait_upcasting_coercion_new_vptr_slot((source, target));
 
             if let Some(entry_idx) = vptr_entry_idx {
                 let ptr_ty = cx.type_i8p();
@@ -549,12 +538,18 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
     } else if let Some(kind) = tcx.allocator_kind(()) {
         let llmod_id =
             cgu_name_builder.build_cgu_name(LOCAL_CRATE, &["crate"], Some("allocator")).to_string();
-        let mut modules = backend.new_metadata(tcx, &llmod_id);
+        let mut module_llvm = backend.new_metadata(tcx, &llmod_id);
         tcx.sess.time("write_allocator_module", || {
-            backend.codegen_allocator(tcx, &mut modules, kind, tcx.lang_items().oom().is_some())
+            backend.codegen_allocator(
+                tcx,
+                &mut module_llvm,
+                &llmod_id,
+                kind,
+                tcx.lang_items().oom().is_some(),
+            )
         });
 
-        Some(ModuleCodegen { name: llmod_id, module_llvm: modules, kind: ModuleKind::Allocator })
+        Some(ModuleCodegen { name: llmod_id, module_llvm, kind: ModuleKind::Allocator })
     } else {
         None
     };

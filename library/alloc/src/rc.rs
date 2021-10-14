@@ -305,6 +305,7 @@ struct RcBox<T: ?Sized> {
 /// [get_mut]: Rc::get_mut
 #[cfg_attr(not(test), rustc_diagnostic_item = "Rc")]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_insignificant_dtor]
 pub struct Rc<T: ?Sized> {
     ptr: NonNull<RcBox<T>>,
     phantom: PhantomData<RcBox<T>>,
@@ -451,6 +452,7 @@ impl<T> Rc<T> {
     /// ```
     #[cfg(not(no_global_oom_handling))]
     #[unstable(feature = "new_uninit", issue = "63291")]
+    #[must_use]
     pub fn new_uninit() -> Rc<mem::MaybeUninit<T>> {
         unsafe {
             Rc::from_ptr(Rc::allocate_for_layout(
@@ -483,6 +485,7 @@ impl<T> Rc<T> {
     /// [zeroed]: mem::MaybeUninit::zeroed
     #[cfg(not(no_global_oom_handling))]
     #[unstable(feature = "new_uninit", issue = "63291")]
+    #[must_use]
     pub fn new_zeroed() -> Rc<mem::MaybeUninit<T>> {
         unsafe {
             Rc::from_ptr(Rc::allocate_for_layout(
@@ -586,6 +589,7 @@ impl<T> Rc<T> {
     /// `value` will be pinned in memory and unable to be moved.
     #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "pin", since = "1.33.0")]
+    #[must_use]
     pub fn pin(value: T) -> Pin<Rc<T>> {
         unsafe { Pin::new_unchecked(Rc::new(value)) }
     }
@@ -657,6 +661,7 @@ impl<T> Rc<[T]> {
     /// ```
     #[cfg(not(no_global_oom_handling))]
     #[unstable(feature = "new_uninit", issue = "63291")]
+    #[must_use]
     pub fn new_uninit_slice(len: usize) -> Rc<[mem::MaybeUninit<T>]> {
         unsafe { Rc::from_ptr(Rc::allocate_for_slice(len)) }
     }
@@ -683,6 +688,7 @@ impl<T> Rc<[T]> {
     /// [zeroed]: mem::MaybeUninit::zeroed
     #[cfg(not(no_global_oom_handling))]
     #[unstable(feature = "new_uninit", issue = "63291")]
+    #[must_use]
     pub fn new_zeroed_slice(len: usize) -> Rc<[mem::MaybeUninit<T>]> {
         unsafe {
             Rc::from_ptr(Rc::allocate_for_layout(
@@ -781,9 +787,7 @@ impl<T: ?Sized> Rc<T> {
     /// Consumes the `Rc`, returning the wrapped pointer.
     ///
     /// To avoid a memory leak the pointer must be converted back to an `Rc` using
-    /// [`Rc::from_raw`][from_raw].
-    ///
-    /// [from_raw]: Rc::from_raw
+    /// [`Rc::from_raw`].
     ///
     /// # Examples
     ///
@@ -834,7 +838,7 @@ impl<T: ?Sized> Rc<T> {
     /// and alignment as `T`. This is trivially true if `U` is `T`.
     /// Note that if `U` is not `T` but has the same size and alignment, this is
     /// basically like transmuting references of different types. See
-    /// [`mem::transmute`][transmute] for more information on what
+    /// [`mem::transmute`] for more information on what
     /// restrictions apply in this case.
     ///
     /// The user of `from_raw` has to make sure a specific value of `T` is only
@@ -844,7 +848,6 @@ impl<T: ?Sized> Rc<T> {
     /// even if the returned `Rc<T>` is never accessed.
     ///
     /// [into_raw]: Rc::into_raw
-    /// [transmute]: core::mem::transmute
     ///
     /// # Examples
     ///
@@ -1011,7 +1014,7 @@ impl<T: ?Sized> Rc<T> {
     /// mutate a shared value.
     ///
     /// See also [`make_mut`][make_mut], which will [`clone`][clone]
-    /// the inner value when there are other pointers.
+    /// the inner value when there are other `Rc` pointers.
     ///
     /// [make_mut]: Rc::make_mut
     /// [clone]: Clone::clone
@@ -1086,8 +1089,6 @@ impl<T: ?Sized> Rc<T> {
     /// assert!(Rc::ptr_eq(&five, &same_five));
     /// assert!(!Rc::ptr_eq(&five, &other_five));
     /// ```
-    ///
-    /// [`ptr::eq`]: core::ptr::eq
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
         this.ptr.as_ptr() == other.ptr.as_ptr()
     }
@@ -1100,10 +1101,12 @@ impl<T: Clone> Rc<T> {
     /// [`clone`] the inner value to a new allocation to ensure unique ownership.  This is also
     /// referred to as clone-on-write.
     ///
-    /// If there are no other `Rc` pointers to this allocation, then [`Weak`]
-    /// pointers to this allocation will be disassociated.
+    /// However, if there are no other `Rc` pointers to this allocation, but some [`Weak`]
+    /// pointers, then the [`Weak`] pointers will be disassociated and the inner value will not
+    /// be cloned.
     ///
-    /// See also [`get_mut`], which will fail rather than cloning.
+    /// See also [`get_mut`], which will fail rather than cloning the inner value
+    /// or diassociating [`Weak`] pointers.
     ///
     /// [`clone`]: Clone::clone
     /// [`get_mut`]: Rc::get_mut
@@ -1115,11 +1118,11 @@ impl<T: Clone> Rc<T> {
     ///
     /// let mut data = Rc::new(5);
     ///
-    /// *Rc::make_mut(&mut data) += 1;        // Won't clone anything
-    /// let mut other_data = Rc::clone(&data);    // Won't clone inner data
-    /// *Rc::make_mut(&mut data) += 1;        // Clones inner data
-    /// *Rc::make_mut(&mut data) += 1;        // Won't clone anything
-    /// *Rc::make_mut(&mut other_data) *= 2;  // Won't clone anything
+    /// *Rc::make_mut(&mut data) += 1;         // Won't clone anything
+    /// let mut other_data = Rc::clone(&data); // Won't clone inner data
+    /// *Rc::make_mut(&mut data) += 1;         // Clones inner data
+    /// *Rc::make_mut(&mut data) += 1;         // Won't clone anything
+    /// *Rc::make_mut(&mut other_data) *= 2;   // Won't clone anything
     ///
     /// // Now `data` and `other_data` point to different allocations.
     /// assert_eq!(*data, 8);
@@ -1743,7 +1746,7 @@ impl<T: ?Sized> fmt::Pointer for Rc<T> {
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "from_for_ptrs", since = "1.6.0")]
 impl<T> From<T> for Rc<T> {
-    /// Converts a generic type `T` into a `Rc<T>`
+    /// Converts a generic type `T` into an `Rc<T>`
     ///
     /// The conversion allocates on the heap and moves `t`
     /// from the stack into it.
@@ -1991,7 +1994,7 @@ impl<T, I: iter::TrustedLen<Item = T>> ToRcSlice<T> for I {
 
 /// `Weak` is a version of [`Rc`] that holds a non-owning reference to the
 /// managed allocation. The allocation is accessed by calling [`upgrade`] on the `Weak`
-/// pointer, which returns an [`Option`]`<`[`Rc`]`<T>>`.
+/// pointer, which returns an <code>[Option]<[Rc]\<T>></code>.
 ///
 /// Since a `Weak` reference does not count towards ownership, it will not
 /// prevent the value stored in the allocation from being dropped, and `Weak` itself makes no
@@ -2046,6 +2049,7 @@ impl<T> Weak<T> {
     /// assert!(empty.upgrade().is_none());
     /// ```
     #[stable(feature = "downgraded_weak", since = "1.10.0")]
+    #[must_use]
     pub fn new() -> Weak<T> {
         Weak { ptr: NonNull::new(usize::MAX as *mut RcBox<T>).expect("MAX is not 0") }
     }
@@ -2088,7 +2092,8 @@ impl<T: ?Sized> Weak<T> {
     /// // assert_eq!("hello", unsafe { &*weak.as_ptr() });
     /// ```
     ///
-    /// [`null`]: core::ptr::null
+    /// [`null`]: ptr::null
+    #[must_use]
     #[stable(feature = "rc_as_ptr", since = "1.45.0")]
     pub fn as_ptr(&self) -> *const T {
         let ptr: *mut RcBox<T> = NonNull::as_ptr(self.ptr);
@@ -2132,6 +2137,7 @@ impl<T: ?Sized> Weak<T> {
     ///
     /// [`from_raw`]: Weak::from_raw
     /// [`as_ptr`]: Weak::as_ptr
+    #[must_use = "`self` will be dropped if the result is not used"]
     #[stable(feature = "weak_into_raw", since = "1.45.0")]
     pub fn into_raw(self) -> *const T {
         let result = self.as_ptr();
@@ -2224,6 +2230,8 @@ impl<T: ?Sized> Weak<T> {
     ///
     /// assert!(weak_five.upgrade().is_none());
     /// ```
+    #[must_use = "this returns a new `Rc`, \
+                  without modifying the original weak pointer"]
     #[stable(feature = "rc_weak", since = "1.4.0")]
     pub fn upgrade(&self) -> Option<Rc<T>> {
         let inner = self.inner()?;
@@ -2315,8 +2323,6 @@ impl<T: ?Sized> Weak<T> {
     /// let third = Rc::downgrade(&third_rc);
     /// assert!(!first.ptr_eq(&third));
     /// ```
-    ///
-    /// [`ptr::eq`]: core::ptr::eq
     #[inline]
     #[stable(feature = "weak_ptr_eq", since = "1.39.0")]
     pub fn ptr_eq(&self, other: &Self) -> bool {
@@ -2398,7 +2404,6 @@ impl<T> Default for Weak<T> {
     /// Constructs a new `Weak<T>`, without allocating any memory.
     /// Calling [`upgrade`] on the return value always gives [`None`].
     ///
-    /// [`None`]: Option
     /// [`upgrade`]: Weak::upgrade
     ///
     /// # Examples

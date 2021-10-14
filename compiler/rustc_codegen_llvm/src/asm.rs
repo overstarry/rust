@@ -105,7 +105,7 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
         let r = r.unwrap();
 
         // Again, based on how many outputs we have
-        let outputs = ia.outputs.iter().zip(&outputs).filter(|&(ref o, _)| !o.is_indirect);
+        let outputs = ia.outputs.iter().zip(&outputs).filter(|&(o, _)| !o.is_indirect);
         for (i, (_, &place)) in outputs.enumerate() {
             let v = if num_outputs == 1 { r } else { self.extract_value(r, i as u64) };
             OperandValue::Immediate(v).store(self, place);
@@ -302,11 +302,19 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
                         "~{flags}".to_string(),
                     ]);
                 }
-                InlineAsmArch::RiscV32 | InlineAsmArch::RiscV64 => {}
+                InlineAsmArch::RiscV32 | InlineAsmArch::RiscV64 => {
+                    constraints.extend_from_slice(&[
+                        "~{vtype}".to_string(),
+                        "~{vl}".to_string(),
+                        "~{vxsat}".to_string(),
+                        "~{vxrm}".to_string(),
+                    ]);
+                }
                 InlineAsmArch::Nvptx64 => {}
                 InlineAsmArch::PowerPC | InlineAsmArch::PowerPC64 => {}
                 InlineAsmArch::Hexagon => {}
                 InlineAsmArch::Mips | InlineAsmArch::Mips64 => {}
+                InlineAsmArch::S390x => {}
                 InlineAsmArch::SpirV => {}
                 InlineAsmArch::Wasm32 => {}
                 InlineAsmArch::Bpf => {}
@@ -323,7 +331,7 @@ impl AsmBuilderMethods<'tcx> for Builder<'a, 'll, 'tcx> {
         let output_type = match &output_types[..] {
             [] => self.type_void(),
             [ty] => ty,
-            tys => self.type_struct(&tys, false),
+            tys => self.type_struct(tys, false),
         };
         let dialect = match asm_arch {
             InlineAsmArch::X86 | InlineAsmArch::X86_64
@@ -425,7 +433,7 @@ impl AsmMethods for CodegenCx<'ll, 'tcx> {
     }
 }
 
-fn inline_asm_call(
+pub(crate) fn inline_asm_call(
     bx: &mut Builder<'a, 'll, 'tcx>,
     asm: &str,
     cons: &str,
@@ -608,6 +616,10 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg_nonzero) => "b",
             InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::freg) => "f",
+            InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::cr)
+            | InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::xer) => {
+                unreachable!("clobber-only")
+            }
             InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::freg) => "f",
             InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::vreg) => {
@@ -626,6 +638,8 @@ fn reg_to_llvm(reg: InlineAsmRegOrRegClass, layout: Option<&TyAndLayout<'tcx>>) 
             InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => "r",
             InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::reg) => "r",
             InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::wreg) => "w",
+            InlineAsmRegClass::S390x(S390xInlineAsmRegClass::reg) => "r",
+            InlineAsmRegClass::S390x(S390xInlineAsmRegClass::freg) => "f",
             InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
                 bug!("LLVM backend does not support SPIR-V")
             }
@@ -704,6 +718,7 @@ fn modifier_to_llvm(
         }
         InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => None,
         InlineAsmRegClass::Bpf(_) => None,
+        InlineAsmRegClass::S390x(_) => None,
         InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
             bug!("LLVM backend does not support SPIR-V")
         }
@@ -744,6 +759,10 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::reg_nonzero) => cx.type_i32(),
         InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::freg) => cx.type_f64(),
+        InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::cr)
+        | InlineAsmRegClass::PowerPC(PowerPCInlineAsmRegClass::xer) => {
+            unreachable!("clobber-only")
+        }
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::reg) => cx.type_i32(),
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::freg) => cx.type_f32(),
         InlineAsmRegClass::RiscV(RiscVInlineAsmRegClass::vreg) => {
@@ -762,6 +781,8 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
         InlineAsmRegClass::Wasm(WasmInlineAsmRegClass::local) => cx.type_i32(),
         InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::reg) => cx.type_i64(),
         InlineAsmRegClass::Bpf(BpfInlineAsmRegClass::wreg) => cx.type_i32(),
+        InlineAsmRegClass::S390x(S390xInlineAsmRegClass::reg) => cx.type_i32(),
+        InlineAsmRegClass::S390x(S390xInlineAsmRegClass::freg) => cx.type_f64(),
         InlineAsmRegClass::SpirV(SpirVInlineAsmRegClass::reg) => {
             bug!("LLVM backend does not support SPIR-V")
         }
@@ -771,7 +792,7 @@ fn dummy_output_type(cx: &CodegenCx<'ll, 'tcx>, reg: InlineAsmRegClass) -> &'ll 
 
 /// Helper function to get the LLVM type for a Scalar. Pointers are returned as
 /// the equivalent integer type.
-fn llvm_asm_scalar_type(cx: &CodegenCx<'ll, 'tcx>, scalar: &Scalar) -> &'ll Type {
+fn llvm_asm_scalar_type(cx: &CodegenCx<'ll, 'tcx>, scalar: Scalar) -> &'ll Type {
     match scalar.value {
         Primitive::Int(Integer::I8, _) => cx.type_i8(),
         Primitive::Int(Integer::I16, _) => cx.type_i16(),
@@ -791,7 +812,7 @@ fn llvm_fixup_input(
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Value {
-    match (reg, &layout.abi) {
+    match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
             if let Primitive::Int(Integer::I8, _) = s.value {
                 let vec_ty = bx.cx.type_vector(bx.cx.type_i8(), 8);
@@ -814,7 +835,7 @@ fn llvm_fixup_input(
             Abi::Vector { element, count },
         ) if layout.size.bytes() == 8 => {
             let elem_ty = llvm_asm_scalar_type(bx.cx, element);
-            let vec_ty = bx.cx.type_vector(elem_ty, *count);
+            let vec_ty = bx.cx.type_vector(elem_ty, count);
             let indices: Vec<_> = (0..count * 2).map(|x| bx.const_i32(x as i32)).collect();
             bx.shuffle_vector(value, bx.const_undef(vec_ty), bx.const_vector(&indices))
         }
@@ -869,7 +890,7 @@ fn llvm_fixup_output(
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Value {
-    match (reg, &layout.abi) {
+    match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
             if let Primitive::Int(Integer::I8, _) = s.value {
                 bx.extract_element(value, bx.const_i32(0))
@@ -889,8 +910,8 @@ fn llvm_fixup_output(
             Abi::Vector { element, count },
         ) if layout.size.bytes() == 8 => {
             let elem_ty = llvm_asm_scalar_type(bx.cx, element);
-            let vec_ty = bx.cx.type_vector(elem_ty, *count * 2);
-            let indices: Vec<_> = (0..*count).map(|x| bx.const_i32(x as i32)).collect();
+            let vec_ty = bx.cx.type_vector(elem_ty, count * 2);
+            let indices: Vec<_> = (0..count).map(|x| bx.const_i32(x as i32)).collect();
             bx.shuffle_vector(value, bx.const_undef(vec_ty), bx.const_vector(&indices))
         }
         (InlineAsmRegClass::X86(X86InlineAsmRegClass::reg_abcd), Abi::Scalar(s))
@@ -944,7 +965,7 @@ fn llvm_fixup_output_type(
     reg: InlineAsmRegClass,
     layout: &TyAndLayout<'tcx>,
 ) -> &'ll Type {
-    match (reg, &layout.abi) {
+    match (reg, layout.abi) {
         (InlineAsmRegClass::AArch64(AArch64InlineAsmRegClass::vreg), Abi::Scalar(s)) => {
             if let Primitive::Int(Integer::I8, _) = s.value {
                 cx.type_vector(cx.type_i8(), 8)

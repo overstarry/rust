@@ -207,8 +207,7 @@ fn check_trait_items(cx: &LateContext<'_>, visited_trait: &Item<'_>, trait_items
         }
     }
 
-    if cx.access_levels.is_exported(visited_trait.def_id)
-        && trait_items.iter().any(|i| is_named_self(cx, i, sym::len))
+    if cx.access_levels.is_exported(visited_trait.def_id) && trait_items.iter().any(|i| is_named_self(cx, i, sym::len))
     {
         let mut current_and_super_traits = DefIdSet::default();
         fill_trait_set(visited_trait.def_id.to_def_id(), &mut current_and_super_traits, cx);
@@ -246,10 +245,10 @@ enum LenOutput<'tcx> {
 fn parse_len_output(cx: &LateContext<'_>, sig: FnSig<'tcx>) -> Option<LenOutput<'tcx>> {
     match *sig.output().kind() {
         ty::Int(_) | ty::Uint(_) => Some(LenOutput::Integral),
-        ty::Adt(adt, subs) if cx.tcx.is_diagnostic_item(sym::option_type, adt.did) => {
+        ty::Adt(adt, subs) if cx.tcx.is_diagnostic_item(sym::Option, adt.did) => {
             subs.type_at(0).is_integral().then(|| LenOutput::Option(adt.did))
         },
-        ty::Adt(adt, subs) if cx.tcx.is_diagnostic_item(sym::result_type, adt.did) => subs
+        ty::Adt(adt, subs) if cx.tcx.is_diagnostic_item(sym::Result, adt.did) => subs
             .type_at(0)
             .is_integral()
             .then(|| LenOutput::Result(adt.did, subs.type_at(1))),
@@ -331,17 +330,15 @@ fn check_for_is_empty(
             None,
             None,
         ),
-        Some(is_empty) if !cx.access_levels.is_exported(is_empty.def_id.expect_local()) => {
-            (
-                format!(
-                    "{} `{}` has a public `len` method, but a private `is_empty` method",
-                    item_kind,
-                    item_name.as_str(),
-                ),
-                Some(cx.tcx.def_span(is_empty.def_id)),
-                None,
-            )
-        },
+        Some(is_empty) if !cx.access_levels.is_exported(is_empty.def_id.expect_local()) => (
+            format!(
+                "{} `{}` has a public `len` method, but a private `is_empty` method",
+                item_kind,
+                item_name.as_str(),
+            ),
+            Some(cx.tcx.def_span(is_empty.def_id)),
+            None,
+        ),
         Some(is_empty)
             if !(is_empty.fn_has_self_parameter
                 && check_is_empty_sig(cx.tcx.fn_sig(is_empty.def_id).skip_binder(), self_kind, output)) =>
@@ -458,14 +455,10 @@ fn is_empty_array(expr: &Expr<'_>) -> bool {
 fn has_is_empty(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     /// Gets an `AssocItem` and return true if it matches `is_empty(self)`.
     fn is_is_empty(cx: &LateContext<'_>, item: &ty::AssocItem) -> bool {
-        if let ty::AssocKind::Fn = item.kind {
-            if item.ident.name.as_str() == "is_empty" {
-                let sig = cx.tcx.fn_sig(item.def_id);
-                let ty = sig.skip_binder();
-                ty.inputs().len() == 1
-            } else {
-                false
-            }
+        if item.kind == ty::AssocKind::Fn && item.ident.name.as_str() == "is_empty" {
+            let sig = cx.tcx.fn_sig(item.def_id);
+            let ty = sig.skip_binder();
+            ty.inputs().len() == 1
         } else {
             false
         }

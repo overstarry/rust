@@ -178,18 +178,19 @@ impl FromInternal<(TreeAndSpacing, &'_ mut Vec<Self>, &mut Rustc<'_>)>
                 tt!(Punct::new('#', false))
             }
 
+            Interpolated(nt)
+                if let Some((name, is_raw)) = ident_name_compatibility_hack(&nt, span, rustc) =>
+            {
+                TokenTree::Ident(Ident::new(rustc.sess, name.name, is_raw, name.span))
+            }
             Interpolated(nt) => {
-                if let Some((name, is_raw)) = ident_name_compatibility_hack(&nt, span, rustc) {
-                    TokenTree::Ident(Ident::new(rustc.sess, name.name, is_raw, name.span))
-                } else {
-                    let stream = nt_to_tokenstream(&nt, rustc.sess, CanSynthesizeMissingTokens::No);
-                    TokenTree::Group(Group {
-                        delimiter: Delimiter::None,
-                        stream,
-                        span: DelimSpan::from_single(span),
-                        flatten: crate::base::pretty_printing_compatibility_hack(&nt, rustc.sess),
-                    })
-                }
+                let stream = nt_to_tokenstream(&nt, rustc.sess, CanSynthesizeMissingTokens::No);
+                TokenTree::Group(Group {
+                    delimiter: Delimiter::None,
+                    stream,
+                    span: DelimSpan::from_single(span),
+                    flatten: crate::base::pretty_printing_compatibility_hack(&nt, rustc.sess),
+                })
             }
 
             OpenDelim(..) | CloseDelim(..) => unreachable!(),
@@ -576,7 +577,7 @@ impl server::Literal for Rustc<'_> {
             }
 
             // Synthesize a new symbol that includes the minus sign.
-            let symbol = Symbol::intern(&s[..1 + lit.symbol.len()]);
+            let symbol = Symbol::intern(&s[..1 + lit.symbol.as_str().len()]);
             lit = token::Lit::new(lit.kind, symbol, lit.suffix);
         }
 
@@ -744,7 +745,7 @@ impl server::Span for Rustc<'_> {
         self.sess.source_map().lookup_char_pos(span.lo()).file
     }
     fn parent(&mut self, span: Self::Span) -> Option<Self::Span> {
-        span.parent()
+        span.parent_callsite()
     }
     fn source(&mut self, span: Self::Span) -> Self::Span {
         span.source_callsite()
@@ -756,6 +757,12 @@ impl server::Span for Rustc<'_> {
     fn end(&mut self, span: Self::Span) -> LineColumn {
         let loc = self.sess.source_map().lookup_char_pos(span.hi());
         LineColumn { line: loc.line, column: loc.col.to_usize() }
+    }
+    fn before(&mut self, span: Self::Span) -> Self::Span {
+        span.shrink_to_lo()
+    }
+    fn after(&mut self, span: Self::Span) -> Self::Span {
+        span.shrink_to_hi()
     }
     fn join(&mut self, first: Self::Span, second: Self::Span) -> Option<Self::Span> {
         let self_loc = self.sess.source_map().lookup_char_pos(first.lo());

@@ -15,6 +15,7 @@ mod object_safety;
 mod on_unimplemented;
 mod project;
 pub mod query;
+pub(crate) mod relationships;
 mod select;
 mod specialize;
 mod structural_match;
@@ -28,6 +29,7 @@ use crate::traits::query::evaluate_obligation::InferCtxtExt as _;
 use rustc_errors::ErrorReported;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
+use rustc_hir::lang_items::LangItem;
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::subst::{InternalSubsts, SubstsRef};
 use rustc_middle::ty::{
@@ -62,7 +64,9 @@ pub use self::specialize::specialization_graph::FutureCompatOverlapErrorKind;
 pub use self::specialize::{specialization_graph, translate_substs, OverlapError};
 pub use self::structural_match::search_for_structural_match_violation;
 pub use self::structural_match::NonStructuralMatchTy;
-pub use self::util::{elaborate_predicates, elaborate_trait_ref, elaborate_trait_refs};
+pub use self::util::{
+    elaborate_obligations, elaborate_predicates, elaborate_trait_ref, elaborate_trait_refs,
+};
 pub use self::util::{expand_trait_aliases, TraitAliasExpander};
 pub use self::util::{
     get_vtable_index_of_object_method, impl_item_is_final, predicate_for_trait_def, upcast_choices,
@@ -138,7 +142,8 @@ pub fn type_known_to_meet_bound_modulo_regions<'a, 'tcx>(
         infcx.tcx.def_path_str(def_id)
     );
 
-    let trait_ref = ty::TraitRef { def_id, substs: infcx.tcx.mk_substs_trait(ty, &[]) };
+    let trait_ref =
+        ty::Binder::dummy(ty::TraitRef { def_id, substs: infcx.tcx.mk_substs_trait(ty, &[]) });
     let obligation = Obligation {
         param_env,
         cause: ObligationCause::misc(span, hir::CRATE_HIR_ID),
@@ -449,7 +454,7 @@ fn subst_and_check_impossible_predicates<'tcx>(
     debug!("subst_and_check_impossible_predicates(key={:?})", key);
 
     let mut predicates = tcx.predicates_of(key.0).instantiate(tcx, key.1).predicates;
-    predicates.retain(|predicate| !predicate.needs_subst());
+    predicates.retain(|predicate| !predicate.definitely_needs_subst(tcx));
     let result = impossible_predicates(tcx, predicates);
 
     debug!("subst_and_check_impossible_predicates(key={:?}) = {:?}", key, result);
@@ -620,8 +625,33 @@ fn dump_vtable_entries<'tcx>(
     trait_ref: ty::PolyTraitRef<'tcx>,
     entries: &[VtblEntry<'tcx>],
 ) {
-    let msg = format!("Vtable entries for `{}`: {:#?}", trait_ref, entries);
+    let msg = format!("vtable entries for `{}`: {:#?}", trait_ref, entries);
     tcx.sess.struct_span_err(sp, &msg).emit();
+}
+
+fn own_existential_vtable_entries<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_ref: ty::PolyExistentialTraitRef<'tcx>,
+) -> &'tcx [DefId] {
+    let trait_methods = tcx
+        .associated_items(trait_ref.def_id())
+        .in_definition_order()
+        .filter(|item| item.kind == ty::AssocKind::Fn);
+    // Now list each method's DefId (for within its trait).
+    let own_entries = trait_methods.filter_map(move |trait_method| {
+        debug!("own_existential_vtable_entry: trait_method={:?}", trait_method);
+        let def_id = trait_method.def_id;
+
+        // Some methods cannot be called on an object; skip those.
+        if !is_vtable_safe_method(tcx, trait_ref.def_id(), &trait_method) {
+            debug!("own_existential_vtable_entry: not vtable safe");
+            return None;
+        }
+
+        Some(def_id)
+    });
+
+    tcx.arena.alloc_from_iter(own_entries.into_iter())
 }
 
 /// Given a trait `trait_ref`, iterates the vtable entries
@@ -640,21 +670,15 @@ fn vtable_entries<'tcx>(
                 entries.extend(COMMON_VTABLE_ENTRIES);
             }
             VtblSegment::TraitOwnEntries { trait_ref, emit_vptr } => {
-                let trait_methods = tcx
-                    .associated_items(trait_ref.def_id())
-                    .in_definition_order()
-                    .filter(|item| item.kind == ty::AssocKind::Fn);
-                // Now list each method's DefId and InternalSubsts (for within its trait).
-                // If the method can never be called from this object, produce `Vacant`.
-                let own_entries = trait_methods.map(move |trait_method| {
-                    debug!("vtable_entries: trait_method={:?}", trait_method);
-                    let def_id = trait_method.def_id;
+                let existential_trait_ref = trait_ref
+                    .map_bound(|trait_ref| ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref));
 
-                    // Some methods cannot be called on an object; skip those.
-                    if !is_vtable_safe_method(tcx, trait_ref.def_id(), &trait_method) {
-                        debug!("vtable_entries: not vtable safe");
-                        return VtblEntry::Vacant;
-                    }
+                // Lookup the shape of vtable for the trait.
+                let own_existential_entries =
+                    tcx.own_existential_vtable_entries(existential_trait_ref);
+
+                let own_entries = own_existential_entries.iter().copied().map(|def_id| {
+                    debug!("vtable_entries: trait_method={:?}", def_id);
 
                     // The method may have some early-bound lifetimes; add regions for those.
                     let substs = trait_ref.map_bound(|trait_ref| {
@@ -759,48 +783,41 @@ fn vtable_trait_first_method_offset<'tcx>(
 pub fn vtable_trait_upcasting_coercion_new_vptr_slot(
     tcx: TyCtxt<'tcx>,
     key: (
-        ty::PolyTraitRef<'tcx>, // trait owning vtable
-        ty::PolyTraitRef<'tcx>, // super trait ref
+        Ty<'tcx>, // trait object type whose trait owning vtable
+        Ty<'tcx>, // trait object for supertrait
     ),
 ) -> Option<usize> {
-    let (trait_owning_vtable, super_trait_ref) = key;
-    let super_trait_did = super_trait_ref.def_id();
-    // FIXME: take substsref part into account here after upcasting coercion allows the same def_id occur
-    // multiple times.
+    let (source, target) = key;
+    assert!(matches!(&source.kind(), &ty::Dynamic(..)) && !source.needs_infer());
+    assert!(matches!(&target.kind(), &ty::Dynamic(..)) && !target.needs_infer());
 
-    let vtable_segment_callback = {
-        let mut vptr_offset = 0;
-        move |segment| {
-            match segment {
-                VtblSegment::MetadataDSA => {
-                    vptr_offset += COMMON_VTABLE_ENTRIES.len();
-                }
-                VtblSegment::TraitOwnEntries { trait_ref, emit_vptr } => {
-                    vptr_offset += util::count_own_vtable_entries(tcx, trait_ref);
-                    if trait_ref.def_id() == super_trait_did {
-                        if emit_vptr {
-                            return ControlFlow::Break(Some(vptr_offset));
-                        } else {
-                            return ControlFlow::Break(None);
-                        }
-                    }
+    // this has been typecked-before, so diagnostics is not really needed.
+    let unsize_trait_did = tcx.require_lang_item(LangItem::Unsize, None);
 
-                    if emit_vptr {
-                        vptr_offset += 1;
-                    }
-                }
-            }
-            ControlFlow::Continue(())
-        }
+    let trait_ref = ty::TraitRef {
+        def_id: unsize_trait_did,
+        substs: tcx.mk_substs_trait(source, &[target.into()]),
+    };
+    let obligation = Obligation::new(
+        ObligationCause::dummy(),
+        ty::ParamEnv::reveal_all(),
+        ty::Binder::dummy(ty::TraitPredicate {
+            trait_ref,
+            constness: ty::BoundConstness::NotConst,
+        }),
+    );
+
+    let implsrc = tcx.infer_ctxt().enter(|infcx| {
+        let mut selcx = SelectionContext::new(&infcx);
+        selcx.select(&obligation).unwrap()
+    });
+
+    let implsrc_traitcasting = match implsrc {
+        Some(ImplSource::TraitUpcasting(data)) => data,
+        _ => bug!(),
     };
 
-    if let Some(vptr_offset) =
-        prepare_vtable_segments(tcx, trait_owning_vtable, vtable_segment_callback)
-    {
-        vptr_offset
-    } else {
-        bug!("Failed to find info for expected trait in vtable");
-    }
+    implsrc_traitcasting.vtable_vptr_slot
 }
 
 pub fn provide(providers: &mut ty::query::Providers) {
@@ -810,19 +827,20 @@ pub fn provide(providers: &mut ty::query::Providers) {
         specialization_graph_of: specialize::specialization_graph_provider,
         specializes: specialize::specializes,
         codegen_fulfill_obligation: codegen::codegen_fulfill_obligation,
+        own_existential_vtable_entries,
         vtable_entries,
         vtable_trait_upcasting_coercion_new_vptr_slot,
         subst_and_check_impossible_predicates,
-        mir_abstract_const: |tcx, def_id| {
+        thir_abstract_const: |tcx, def_id| {
             let def_id = def_id.expect_local();
             if let Some(def) = ty::WithOptConstParam::try_lookup(def_id, tcx) {
-                tcx.mir_abstract_const_of_const_arg(def)
+                tcx.thir_abstract_const_of_const_arg(def)
             } else {
-                const_evaluatable::mir_abstract_const(tcx, ty::WithOptConstParam::unknown(def_id))
+                const_evaluatable::thir_abstract_const(tcx, ty::WithOptConstParam::unknown(def_id))
             }
         },
-        mir_abstract_const_of_const_arg: |tcx, (did, param_did)| {
-            const_evaluatable::mir_abstract_const(
+        thir_abstract_const_of_const_arg: |tcx, (did, param_did)| {
+            const_evaluatable::thir_abstract_const(
                 tcx,
                 ty::WithOptConstParam { did, const_param_did: Some(param_did) },
             )

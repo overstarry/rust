@@ -367,7 +367,7 @@ impl MetaItem {
             let is_first = i == 0;
             if !is_first {
                 let mod_sep_span =
-                    Span::new(last_pos, segment.ident.span.lo(), segment.ident.span.ctxt());
+                    Span::new(last_pos, segment.ident.span.lo(), segment.ident.span.ctxt(), None);
                 idents.push(TokenTree::token(token::ModSep, mod_sep_span).into());
             }
             idents.push(TokenTree::Token(Token::from_ast_ident(segment.ident)).into());
@@ -564,11 +564,11 @@ impl NestedMetaItem {
         I: Iterator<Item = TokenTree>,
     {
         match tokens.peek() {
-            Some(TokenTree::Token(token)) => {
-                if let Ok(lit) = Lit::from_token(token) {
-                    tokens.next();
-                    return Some(NestedMetaItem::Literal(lit));
-                }
+            Some(TokenTree::Token(token))
+                if let Ok(lit) = Lit::from_token(token) =>
+            {
+                tokens.next();
+                return Some(NestedMetaItem::Literal(lit));
             }
             Some(TokenTree::Delimited(_, token::NoDelim, inner_tokens)) => {
                 let inner_tokens = inner_tokens.clone();

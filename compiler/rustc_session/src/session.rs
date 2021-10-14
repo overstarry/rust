@@ -2,10 +2,9 @@ use crate::cgu_reuse_tracker::CguReuseTracker;
 use crate::code_stats::CodeStats;
 pub use crate::code_stats::{DataTypeKind, FieldInfo, SizeKind, VariantInfo};
 use crate::config::{self, CrateType, OutputType, SwitchWithOptPath};
-use crate::filesearch;
-use crate::lint::{self, LintId};
 use crate::parse::ParseSess;
 use crate::search_paths::{PathKind, SearchPath};
+use crate::{filesearch, lint};
 
 pub use rustc_ast::attr::MarkedAttrs;
 pub use rustc_ast::Attribute;
@@ -23,8 +22,8 @@ use rustc_errors::registry::Registry;
 use rustc_errors::{DiagnosticBuilder, DiagnosticId, ErrorReported};
 use rustc_macros::HashStable_Generic;
 pub use rustc_span::def_id::StableCrateId;
+use rustc_span::edition::Edition;
 use rustc_span::source_map::{FileLoader, MultiSpan, RealFileLoader, SourceMap, Span};
-use rustc_span::{edition::Edition, RealFileName};
 use rustc_span::{sym, SourceFileHashAlgorithm, Symbol};
 use rustc_target::asm::InlineAsmArch;
 use rustc_target::spec::{CodeModel, PanicStrategy, RelocModel, RelroLevel};
@@ -36,14 +35,10 @@ use std::fmt;
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::ops::{Div, Mul};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-
-pub trait SessionLintStore: sync::Send + sync::Sync {
-    fn name_to_lint(&self, lint_name: &str) -> LintId;
-}
 
 pub struct OptimizationFuel {
     /// If `-zfuel=crate=n` is specified, initially set to `n`, otherwise `0`.
@@ -131,16 +126,13 @@ pub struct Session {
     pub target: Target,
     pub host: Target,
     pub opts: config::Options,
-    pub host_tlib_path: SearchPath,
-    /// `None` if the host and target are the same.
-    pub target_tlib_path: Option<SearchPath>,
+    pub host_tlib_path: Lrc<SearchPath>,
+    pub target_tlib_path: Lrc<SearchPath>,
     pub parse_sess: ParseSess,
     pub sysroot: PathBuf,
     /// The name of the root source file of the crate, in the local file system.
     /// `None` means that there is no source file.
     pub local_crate_source_file: Option<PathBuf>,
-    /// The directory the compiler has been executed in
-    pub working_dir: RealFileName,
 
     /// Set of `(DiagnosticId, Option<Span>, message)` tuples tracking
     /// (sub)diagnostics that have been set once, but should not be set again,
@@ -156,8 +148,6 @@ pub struct Session {
 
     features: OnceCell<rustc_feature::Features>,
 
-    lint_store: OnceCell<Lrc<dyn SessionLintStore>>,
-
     incr_comp_session: OneThread<RefCell<IncrCompSession>>,
     /// Used for incremental compilation tests. Will only be populated if
     /// `-Zquery-dep-graph` is specified.
@@ -172,15 +162,9 @@ pub struct Session {
     /// Data about code being compiled, gathered during compilation.
     pub code_stats: CodeStats,
 
-    /// If `-zfuel=crate=n` is specified, `Some(crate)`.
-    optimization_fuel_crate: Option<String>,
-
     /// Tracks fuel info if `-zfuel=crate=n` is specified.
     optimization_fuel: Lock<OptimizationFuel>,
 
-    // The next two are public because the driver needs to read them.
-    /// If `-zprint-fuel=crate`, `Some(crate)`.
-    pub print_fuel_crate: Option<String>,
     /// Always set to zero and incremented so that we can print fuel expended by a crate.
     pub print_fuel: AtomicU64,
 
@@ -191,16 +175,12 @@ pub struct Session {
     /// Cap lint level specified by a driver specifically.
     pub driver_lint_caps: FxHashMap<lint::LintId, lint::Level>,
 
-    /// `Span`s of trait methods that weren't found to avoid emitting object safety errors
-    pub trait_methods_not_found: Lock<FxHashSet<Span>>,
-
-    /// Mapping from ident span to path span for paths that don't exist as written, but that
-    /// exist under `std`. For example, wrote `str::from_utf8` instead of `std::str::from_utf8`.
-    pub confused_type_with_std_module: Lock<FxHashMap<Span, Span>>,
-
     /// Tracks the current behavior of the CTFE engine when an error occurs.
     /// Options range from returning the error without a backtrace to returning an error
     /// and immediately printing the backtrace to stderr.
+    /// The `Lock` is only used by miri to allow setting `ctfe_backtrace` after analysis when
+    /// `MIRI_BACKTRACE` is set. This makes it only apply to miri's errors and not to all CTFE
+    /// errors.
     pub ctfe_backtrace: Lock<CtfeBacktrace>,
 
     /// This tracks where `-Zunleash-the-miri-inside-of-you` was used to get around a
@@ -214,11 +194,6 @@ pub struct Session {
 
     /// Set of enabled features for the current target.
     pub target_features: FxHashSet<Symbol>,
-
-    used_attrs: Lock<MarkedAttrs>,
-
-    /// `Span`s for `if` conditions that we have suggested turning into `if let`.
-    pub if_let_suggestions: Lock<FxHashSet<Span>>,
 }
 
 pub struct PerfStats {
@@ -606,13 +581,6 @@ impl Session {
         }
     }
 
-    pub fn init_lint_store(&self, lint_store: Lrc<dyn SessionLintStore>) {
-        self.lint_store
-            .set(lint_store)
-            .map_err(|_| ())
-            .expect("`lint_store` was initialized twice");
-    }
-
     /// Calculates the flavor of LTO to use for this compilation.
     pub fn lto(&self) -> config::Lto {
         // If our target has codegen requirements ignore the command line
@@ -792,12 +760,6 @@ impl Session {
             )
     }
 
-    /// Returns the symbol name for the registrar function,
-    /// given the crate `Svh` and the function `DefIndex`.
-    pub fn generate_plugin_registrar_symbol(&self, stable_crate_id: StableCrateId) -> String {
-        format!("__rustc_plugin_registrar_{:08x}__", stable_crate_id.to_u64())
-    }
-
     pub fn generate_proc_macro_decls_symbol(&self, stable_crate_id: StableCrateId) -> String {
         format!("__rustc_proc_macro_decls_{:08x}__", stable_crate_id.to_u64())
     }
@@ -807,8 +769,7 @@ impl Session {
             &self.sysroot,
             self.opts.target_triple.triple(),
             &self.opts.search_paths,
-            // `target_tlib_path == None` means it's the same as `host_tlib_path`.
-            self.target_tlib_path.as_ref().unwrap_or(&self.host_tlib_path),
+            &self.target_tlib_path,
             kind,
         )
     }
@@ -820,6 +781,18 @@ impl Session {
             &self.host_tlib_path,
             kind,
         )
+    }
+
+    /// Returns a list of directories where target-specific tool binaries are located.
+    pub fn get_tools_search_paths(&self, self_contained: bool) -> Vec<PathBuf> {
+        let rustlib_path = rustc_target::target_rustlib_path(&self.sysroot, &config::host_triple());
+        let p = std::array::IntoIter::new([
+            Path::new(&self.sysroot),
+            Path::new(&rustlib_path),
+            Path::new("bin"),
+        ])
+        .collect::<PathBuf>();
+        if self_contained { vec![p.clone(), p.join("self-contained")] } else { vec![p] }
     }
 
     pub fn init_incr_comp_session(
@@ -906,20 +879,25 @@ impl Session {
     /// This expends fuel if applicable, and records fuel if applicable.
     pub fn consider_optimizing<T: Fn() -> String>(&self, crate_name: &str, msg: T) -> bool {
         let mut ret = true;
-        if let Some(ref c) = self.optimization_fuel_crate {
+        if let Some((ref c, _)) = self.opts.debugging_opts.fuel {
             if c == crate_name {
                 assert_eq!(self.threads(), 1);
                 let mut fuel = self.optimization_fuel.lock();
                 ret = fuel.remaining != 0;
                 if fuel.remaining == 0 && !fuel.out_of_fuel {
-                    self.warn(&format!("optimization-fuel-exhausted: {}", msg()));
+                    if self.diagnostic().can_emit_warnings() {
+                        // We only call `msg` in case we can actually emit warnings.
+                        // Otherwise, this could cause a `delay_good_path_bug` to
+                        // trigger (issue #79546).
+                        self.warn(&format!("optimization-fuel-exhausted: {}", msg()));
+                    }
                     fuel.out_of_fuel = true;
                 } else if fuel.remaining > 0 {
                     fuel.remaining -= 1;
                 }
             }
         }
-        if let Some(ref c) = self.print_fuel_crate {
+        if let Some(ref c) = self.opts.debugging_opts.print_fuel {
             if c == crate_name {
                 assert_eq!(self.threads(), 1);
                 self.print_fuel.fetch_add(1, SeqCst);
@@ -1074,39 +1052,14 @@ impl Session {
             == config::InstrumentCoverage::ExceptUnusedFunctions
     }
 
-    pub fn mark_attr_used(&self, attr: &Attribute) {
-        self.used_attrs.lock().mark(attr)
-    }
-
-    pub fn is_attr_used(&self, attr: &Attribute) -> bool {
-        self.used_attrs.lock().is_marked(attr)
-    }
-
-    /// Returns `true` if the attribute's path matches the argument. If it
-    /// matches, then the attribute is marked as used.
-    ///
-    /// This method should only be used by rustc, other tools can use
-    /// `Attribute::has_name` instead, because only rustc is supposed to report
-    /// the `unused_attributes` lint. (`MetaItem` and `NestedMetaItem` are
-    /// produced by lowering an `Attribute` and don't have identity, so they
-    /// only have the `has_name` method, and you need to mark the original
-    /// `Attribute` as used when necessary.)
-    pub fn check_name(&self, attr: &Attribute, name: Symbol) -> bool {
-        let matches = attr.has_name(name);
-        if matches {
-            self.mark_attr_used(attr);
-        }
-        matches
-    }
-
     pub fn is_proc_macro_attr(&self, attr: &Attribute) -> bool {
         [sym::proc_macro, sym::proc_macro_attribute, sym::proc_macro_derive]
             .iter()
-            .any(|kind| self.check_name(attr, *kind))
+            .any(|kind| attr.has_name(*kind))
     }
 
     pub fn contains_name(&self, attrs: &[Attribute], name: Symbol) -> bool {
-        attrs.iter().any(|item| self.check_name(item, name))
+        attrs.iter().any(|item| item.has_name(name))
     }
 
     pub fn find_by_name<'a>(
@@ -1114,7 +1067,7 @@ impl Session {
         attrs: &'a [Attribute],
         name: Symbol,
     ) -> Option<&'a Attribute> {
-        attrs.iter().find(|attr| self.check_name(attr, name))
+        attrs.iter().find(|attr| attr.has_name(name))
     }
 
     pub fn filter_by_name<'a>(
@@ -1122,7 +1075,7 @@ impl Session {
         attrs: &'a [Attribute],
         name: Symbol,
     ) -> impl Iterator<Item = &'a Attribute> {
-        attrs.iter().filter(move |attr| self.check_name(attr, name))
+        attrs.iter().filter(move |attr| attr.has_name(name))
     }
 
     pub fn first_attr_value_str_by_name(
@@ -1130,7 +1083,7 @@ impl Session {
         attrs: &[Attribute],
         name: Symbol,
     ) -> Option<Symbol> {
-        attrs.iter().find(|at| self.check_name(at, name)).and_then(|at| at.value_str())
+        attrs.iter().find(|at| at.has_name(name)).and_then(|at| at.value_str())
     }
 }
 
@@ -1290,11 +1243,13 @@ pub fn build_session(
 
     let host_triple = config::host_triple();
     let target_triple = sopts.target_triple.triple();
-    let host_tlib_path = SearchPath::from_sysroot_and_triple(&sysroot, host_triple);
+    let host_tlib_path = Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, host_triple));
     let target_tlib_path = if host_triple == target_triple {
-        None
+        // Use the same `SearchPath` if host and target triple are identical to avoid unnecessary
+        // rescanning of the target lib path and an unnecessary allocation.
+        host_tlib_path.clone()
     } else {
-        Some(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
+        Lrc::new(SearchPath::from_sysroot_and_triple(&sysroot, target_triple))
     };
 
     let file_path_mapping = sopts.file_path_mapping();
@@ -1302,23 +1257,11 @@ pub fn build_session(
     let local_crate_source_file =
         local_crate_source_file.map(|path| file_path_mapping.map_prefix(path).0);
 
-    let optimization_fuel_crate = sopts.debugging_opts.fuel.as_ref().map(|i| i.0.clone());
     let optimization_fuel = Lock::new(OptimizationFuel {
         remaining: sopts.debugging_opts.fuel.as_ref().map_or(0, |i| i.1),
         out_of_fuel: false,
     });
-    let print_fuel_crate = sopts.debugging_opts.print_fuel.clone();
     let print_fuel = AtomicU64::new(0);
-
-    let working_dir = env::current_dir().unwrap_or_else(|e| {
-        parse_sess.span_diagnostic.fatal(&format!("Current directory is invalid: {}", e)).raise()
-    });
-    let (path, remapped) = file_path_mapping.map_prefix(working_dir.clone());
-    let working_dir = if remapped {
-        RealFileName::Remapped { local_path: Some(working_dir), virtual_name: path }
-    } else {
-        RealFileName::LocalPath(path)
-    };
 
     let cgu_reuse_tracker = if sopts.debugging_opts.query_dep_graph {
         CguReuseTracker::new()
@@ -1350,12 +1293,10 @@ pub fn build_session(
         parse_sess,
         sysroot,
         local_crate_source_file,
-        working_dir,
         one_time_diagnostics: Default::default(),
         crate_types: OnceCell::new(),
         stable_crate_id: OnceCell::new(),
         features: OnceCell::new(),
-        lint_store: OnceCell::new(),
         incr_comp_session: OneThread::new(RefCell::new(IncrCompSession::NotInitialized)),
         cgu_reuse_tracker,
         prof,
@@ -1366,20 +1307,14 @@ pub fn build_session(
             normalize_projection_ty: AtomicUsize::new(0),
         },
         code_stats: Default::default(),
-        optimization_fuel_crate,
         optimization_fuel,
-        print_fuel_crate,
         print_fuel,
         jobserver: jobserver::client(),
         driver_lint_caps,
-        trait_methods_not_found: Lock::new(Default::default()),
-        confused_type_with_std_module: Lock::new(Default::default()),
         ctfe_backtrace,
         miri_unleashed_features: Lock::new(Default::default()),
         asm_arch,
         target_features: FxHashSet::default(),
-        used_attrs: Lock::new(MarkedAttrs::new()),
-        if_let_suggestions: Default::default(),
     };
 
     validate_commandline_args_with_session_available(&sess);
@@ -1418,6 +1353,16 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
         }
     }
 
+    // Do the same for sample profile data.
+    if let Some(ref path) = sess.opts.debugging_opts.profile_sample_use {
+        if !path.exists() {
+            sess.err(&format!(
+                "File `{}` passed to `-C profile-sample-use` does not exist.",
+                path.display()
+            ));
+        }
+    }
+
     // Unwind tables cannot be disabled if the target requires them.
     if let Some(include_uwtables) = sess.opts.cg.force_unwind_tables {
         if sess.target.requires_uwtable && !include_uwtables {
@@ -1449,7 +1394,7 @@ fn validate_commandline_args_with_session_available(sess: &Session) {
     // Cannot enable crt-static with sanitizers on Linux
     if sess.crt_static(None) && !sess.opts.debugging_opts.sanitizer.is_empty() {
         sess.err(
-            "Sanitizer is incompatible with statically linked libc, \
+            "sanitizer is incompatible with statically linked libc, \
                                 disable it using `-C target-feature=-crt-static`",
         );
     }

@@ -1,7 +1,9 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::eager_or_lazy::is_lazyness_candidate;
+use clippy_utils::is_trait_item;
 use clippy_utils::source::{snippet, snippet_with_applicability, snippet_with_macro_callsite};
-use clippy_utils::ty::{implements_trait, is_type_diagnostic_item, match_type};
+use clippy_utils::ty::implements_trait;
+use clippy_utils::ty::{is_type_diagnostic_item, match_type};
 use clippy_utils::{contains_return, last_path_segment, paths};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
@@ -34,15 +36,23 @@ pub(super) fn check<'tcx>(
         or_has_args: bool,
         span: Span,
     ) -> bool {
+        let is_default_default = || is_trait_item(cx, fun, sym::Default);
+
+        let implements_default = |arg, default_trait_id| {
+            let arg_ty = cx.typeck_results().expr_ty(arg);
+            implements_trait(cx, arg_ty, default_trait_id, &[])
+        };
+
         if_chain! {
             if !or_has_args;
             if name == "unwrap_or";
             if let hir::ExprKind::Path(ref qpath) = fun.kind;
-            let path = last_path_segment(qpath).ident.name;
-            if matches!(path, kw::Default | sym::new);
-            let arg_ty = cx.typeck_results().expr_ty(arg);
             if let Some(default_trait_id) = cx.tcx.get_diagnostic_item(sym::Default);
-            if implements_trait(cx, arg_ty, default_trait_id, &[]);
+            let path = last_path_segment(qpath).ident.name;
+            // needs to target Default::default in particular or be *::new and have a Default impl
+            // available
+            if (matches!(path, kw::Default) && is_default_default())
+                || (matches!(path, sym::new) && implements_default(arg, default_trait_id));
 
             then {
                 let mut applicability = Applicability::MachineApplicable;
@@ -86,16 +96,16 @@ pub(super) fn check<'tcx>(
             (&paths::RESULT, true, &["or", "unwrap_or"], "else"),
         ];
 
-        if let hir::ExprKind::MethodCall(path, _, args, _) = &arg.kind {
+        if let hir::ExprKind::MethodCall(path, _, [self_arg, ..], _) = &arg.kind {
             if path.ident.name == sym::len {
-                let ty = cx.typeck_results().expr_ty(&args[0]).peel_refs();
+                let ty = cx.typeck_results().expr_ty(self_arg).peel_refs();
 
                 match ty.kind() {
                     ty::Slice(_) | ty::Array(_, _) | ty::Str => return,
                     _ => (),
                 }
 
-                if is_type_diagnostic_item(cx, ty, sym::vec_type) {
+                if is_type_diagnostic_item(cx, ty, sym::Vec) {
                     return;
                 }
             }
@@ -168,15 +178,15 @@ pub(super) fn check<'tcx>(
             hir::ExprKind::Index(..) | hir::ExprKind::MethodCall(..) => {
                 check_general_case(cx, name, method_span, &args[0], &args[1], expr.span, None);
             },
-            hir::ExprKind::Block(block, _) => {
-                if let BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided) = block.rules {
-                    if let Some(block_expr) = block.expr {
-                        if let hir::ExprKind::MethodCall(..) = block_expr.kind {
-                            check_general_case(cx, name, method_span, &args[0], &args[1], expr.span, None);
-                        }
+            hir::ExprKind::Block(block, _)
+                if block.rules == BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided) =>
+            {
+                if let Some(block_expr) = block.expr {
+                    if let hir::ExprKind::MethodCall(..) = block_expr.kind {
+                        check_general_case(cx, name, method_span, &args[0], &args[1], expr.span, None);
                     }
                 }
-            },
+            }
             _ => (),
         }
     }

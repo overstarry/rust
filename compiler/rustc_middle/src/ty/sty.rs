@@ -239,7 +239,7 @@ static_assert_size!(TyKind<'_>, 32);
 ///   implements `CK<(u32, u32), Output = u32>`, where `CK` is the trait
 ///   specified above.
 /// - U is a type parameter representing the types of its upvars, tupled up
-///   (borrowed, if appropriate; that is, if an U field represents a by-ref upvar,
+///   (borrowed, if appropriate; that is, if a U field represents a by-ref upvar,
 ///    and the up-var has the type `Foo`, then that field of U will be `&Foo`).
 ///
 /// So, for example, given this function:
@@ -643,7 +643,7 @@ impl<'tcx> GeneratorSubsts<'tcx> {
     }
 
     /// This returns the types of the MIR locals which had to be stored across suspension points.
-    /// It is calculated in rustc_mir::transform::generator::StateTransform.
+    /// It is calculated in rustc_const_eval::transform::generator::StateTransform.
     /// All the types here must be in the tuple in GeneratorInterior.
     ///
     /// The locals are grouped by their variant number. Note that some locals may
@@ -844,8 +844,11 @@ impl<'tcx> TraitRef<'tcx> {
 
     /// Returns a `TraitRef` of the form `P0: Foo<P1..Pn>` where `Pi`
     /// are the parameters defined on trait.
-    pub fn identity(tcx: TyCtxt<'tcx>, def_id: DefId) -> TraitRef<'tcx> {
-        TraitRef { def_id, substs: InternalSubsts::identity_for_item(tcx, def_id) }
+    pub fn identity(tcx: TyCtxt<'tcx>, def_id: DefId) -> Binder<'tcx, TraitRef<'tcx>> {
+        ty::Binder::dummy(TraitRef {
+            def_id,
+            substs: InternalSubsts::identity_for_item(tcx, def_id),
+        })
     }
 
     #[inline]
@@ -876,7 +879,10 @@ impl<'tcx> PolyTraitRef<'tcx> {
     }
 
     pub fn to_poly_trait_predicate(&self) -> ty::PolyTraitPredicate<'tcx> {
-        self.map_bound(|trait_ref| ty::TraitPredicate { trait_ref })
+        self.map_bound(|trait_ref| ty::TraitPredicate {
+            trait_ref,
+            constness: ty::BoundConstness::NotConst,
+        })
     }
 }
 
@@ -1265,7 +1271,7 @@ pub type Region<'tcx> = &'tcx RegionKind;
 /// Representation of regions. Note that the NLL checker uses a distinct
 /// representation of regions. For this reason, it internally replaces all the
 /// regions with inference variables -- the index of the variable is then used
-/// to index into internal NLL data structures. See `rustc_mir::borrow_check`
+/// to index into internal NLL data structures. See `rustc_const_eval::borrow_check`
 /// module for more information.
 ///
 /// ## The Region lattice within a given function
@@ -1320,7 +1326,7 @@ pub type Region<'tcx> = &'tcx RegionKind;
 /// These are regions that are stored behind a binder and must be substituted
 /// with some concrete region before being used. There are two kind of
 /// bound regions: early-bound, which are bound in an item's `Generics`,
-/// and are substituted by a `InternalSubsts`, and late-bound, which are part of
+/// and are substituted by an `InternalSubsts`, and late-bound, which are part of
 /// higher-ranked types (e.g., `for<'a> fn(&'a ())`), and are substituted by
 /// the likes of `liberate_late_bound_regions`. The distinction exists
 /// because higher-ranked lifetimes aren't supported in all places. See [1][2].
@@ -1468,7 +1474,7 @@ pub type PolyExistentialProjection<'tcx> = Binder<'tcx, ExistentialProjection<'t
 impl<'tcx> ExistentialProjection<'tcx> {
     /// Extracts the underlying existential trait reference from this projection.
     /// For example, if this is a projection of `exists T. <T as Iterator>::Item == X`,
-    /// then this function would return a `exists T. T: Iterator` existential trait
+    /// then this function would return an `exists T. T: Iterator` existential trait
     /// reference.
     pub fn trait_ref(&self, tcx: TyCtxt<'tcx>) -> ty::ExistentialTraitRef<'tcx> {
         let def_id = tcx.associated_item(self.item_def_id).container.id();
@@ -1562,26 +1568,26 @@ impl RegionKind {
 
         match *self {
             ty::ReVar(..) => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
-                flags = flags | TypeFlags::HAS_FREE_LOCAL_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_LOCAL_REGIONS;
                 flags = flags | TypeFlags::HAS_RE_INFER;
             }
             ty::RePlaceholder(..) => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
-                flags = flags | TypeFlags::HAS_FREE_LOCAL_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_LOCAL_REGIONS;
                 flags = flags | TypeFlags::HAS_RE_PLACEHOLDER;
             }
             ty::ReEarlyBound(..) => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
-                flags = flags | TypeFlags::HAS_FREE_LOCAL_REGIONS;
-                flags = flags | TypeFlags::HAS_RE_PARAM;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_LOCAL_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_RE_PARAM;
             }
             ty::ReFree { .. } => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
-                flags = flags | TypeFlags::HAS_FREE_LOCAL_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_LOCAL_REGIONS;
             }
             ty::ReEmpty(_) | ty::ReStatic => {
-                flags = flags | TypeFlags::HAS_FREE_REGIONS;
+                flags = flags | TypeFlags::HAS_KNOWN_FREE_REGIONS;
             }
             ty::ReLateBound(..) => {
                 flags = flags | TypeFlags::HAS_RE_LATE_BOUND;
@@ -1667,6 +1673,14 @@ impl<'tcx> TyS<'tcx> {
     #[inline]
     pub fn is_ty_var(&self) -> bool {
         matches!(self.kind(), Infer(TyVar(_)))
+    }
+
+    #[inline]
+    pub fn ty_vid(&self) -> Option<ty::TyVid> {
+        match self.kind() {
+            &Infer(TyVar(vid)) => Some(vid),
+            _ => None,
+        }
     }
 
     #[inline]

@@ -5,6 +5,7 @@ use crate::io::ErrorKind;
 pub use self::rand::hashmap_random_keys;
 pub use libc::strlen;
 
+#[cfg(not(target_os = "espidf"))]
 #[macro_use]
 pub mod weak;
 
@@ -43,6 +44,10 @@ pub mod thread_local_dtor;
 pub mod thread_local_key;
 pub mod time;
 
+#[cfg(target_os = "espidf")]
+pub fn init(argc: isize, argv: *const *const u8) {}
+
+#[cfg(not(target_os = "espidf"))]
 // SAFETY: must be called only once during runtime initialization.
 // NOTE: this is not guaranteed to run, for example when Rust code is called externally.
 pub unsafe fn init(argc: isize, argv: *const *const u8) {
@@ -115,7 +120,7 @@ pub unsafe fn init(argc: isize, argv: *const *const u8) {
 
     unsafe fn reset_sigpipe() {
         #[cfg(not(any(target_os = "emscripten", target_os = "fuchsia")))]
-        assert!(signal(libc::SIGPIPE, libc::SIG_IGN) != libc::SIG_ERR);
+        rtassert!(signal(libc::SIGPIPE, libc::SIG_IGN) != libc::SIG_ERR);
     }
 }
 
@@ -302,5 +307,24 @@ cfg_if::cfg_if! {
         #[link(name = "zircon")]
         #[link(name = "fdio")]
         extern "C" {}
+    } else if #[cfg(all(target_os = "linux", target_env = "uclibc"))] {
+        #[link(name = "dl")]
+        extern "C" {}
+    }
+}
+
+#[cfg(target_os = "espidf")]
+mod unsupported {
+    use crate::io;
+
+    pub fn unsupported<T>() -> io::Result<T> {
+        Err(unsupported_err())
+    }
+
+    pub fn unsupported_err() -> io::Error {
+        io::Error::new_const(
+            io::ErrorKind::Unsupported,
+            &"operation not supported on this platform",
+        )
     }
 }

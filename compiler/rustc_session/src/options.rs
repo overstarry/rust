@@ -10,6 +10,7 @@ use rustc_target::spec::{RelocModel, RelroLevel, SplitDebuginfo, TargetTriple, T
 
 use rustc_feature::UnstableFeatures;
 use rustc_span::edition::Edition;
+use rustc_span::RealFileName;
 use rustc_span::SourceFileHashAlgorithm;
 
 use std::collections::BTreeMap;
@@ -203,6 +204,9 @@ top_level_options!(
         json_unused_externs: bool [UNTRACKED],
 
         pretty: Option<PpMode> [UNTRACKED],
+
+        /// The (potentially remapped) working directory
+        working_dir: RealFileName [TRACKED],
     }
 );
 
@@ -345,6 +349,7 @@ mod desc {
     pub const parse_threads: &str = parse_number;
     pub const parse_passes: &str = "a space-separated list of passes, or `all`";
     pub const parse_panic_strategy: &str = "either `unwind` or `abort`";
+    pub const parse_opt_panic_strategy: &str = parse_panic_strategy;
     pub const parse_relro_level: &str = "one of: `full`, `partial`, or `off`";
     pub const parse_sanitizers: &str =
         "comma separated list of sanitizers: `address`, `hwaddress`, `leak`, `memory` or `thread`";
@@ -545,10 +550,19 @@ mod parse {
         }
     }
 
-    crate fn parse_panic_strategy(slot: &mut Option<PanicStrategy>, v: Option<&str>) -> bool {
+    crate fn parse_opt_panic_strategy(slot: &mut Option<PanicStrategy>, v: Option<&str>) -> bool {
         match v {
             Some("unwind") => *slot = Some(PanicStrategy::Unwind),
             Some("abort") => *slot = Some(PanicStrategy::Abort),
+            _ => return false,
+        }
+        true
+    }
+
+    crate fn parse_panic_strategy(slot: &mut PanicStrategy, v: Option<&str>) -> bool {
+        match v {
+            Some("unwind") => *slot = PanicStrategy::Unwind,
+            Some("abort") => *slot = PanicStrategy::Abort,
             _ => return false,
         }
         true
@@ -954,7 +968,7 @@ options! {
         "optimization level (0-3, s, or z; default: 0)"),
     overflow_checks: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "use overflow checks for integer arithmetic"),
-    panic: Option<PanicStrategy> = (None, parse_panic_strategy, [TRACKED],
+    panic: Option<PanicStrategy> = (None, parse_opt_panic_strategy, [TRACKED],
         "panic strategy to compile crate with"),
     passes: Vec<String> = (Vec::new(), parse_list, [TRACKED],
         "a list of extra LLVM passes to run (space separated)"),
@@ -1026,6 +1040,8 @@ options! {
         "combine CGUs into a single one"),
     crate_attr: Vec<String> = (Vec::new(), parse_string_push, [TRACKED],
         "inject the given attribute in the crate"),
+    debug_info_for_profiling: bool = (false, parse_bool, [TRACKED],
+        "emit discriminators and other data necessary for AutoFDO"),
     debug_macros: bool = (false, parse_bool, [TRACKED],
         "emit line numbers debug info inside macros (default: no)"),
     deduplicate_diagnostics: bool = (true, parse_bool, [UNTRACKED],
@@ -1102,6 +1118,8 @@ options! {
     incremental_info: bool = (false, parse_bool, [UNTRACKED],
         "print high-level information about incremental reuse (or the lack thereof) \
         (default: no)"),
+    incremental_relative_spans: bool = (false, parse_bool, [TRACKED],
+        "hash spans relative to their parent item for incr. comp. (default: no)"),
     incremental_verify_ich: bool = (false, parse_bool, [UNTRACKED],
         "verify incr. comp. hashes of green query instances (default: no)"),
     inline_mir: Option<bool> = (None, parse_opt_bool, [TRACKED],
@@ -1180,8 +1198,13 @@ options! {
         "pass `-install_name @rpath/...` to the macOS linker (default: no)"),
     panic_abort_tests: bool = (false, parse_bool, [TRACKED],
         "support compiling tests with panic=abort (default: no)"),
+    panic_in_drop: PanicStrategy = (PanicStrategy::Unwind, parse_panic_strategy, [TRACKED],
+        "panic strategy for panics in drops"),
     parse_only: bool = (false, parse_bool, [UNTRACKED],
         "parse only; do not compile, assemble, or link (default: no)"),
+    partially_uninit_const_threshold: Option<usize> = (None, parse_opt_number, [TRACKED],
+        "allow generating const initializers with mixed init/uninit bytes, \
+        and set the maximum total size of a const allocation for which this is allowed (default: never)"),
     perf_stats: bool = (false, parse_bool, [UNTRACKED],
         "print some performance-related statistics (default: no)"),
     plt: Option<bool> = (None, parse_opt_bool, [TRACKED],
@@ -1221,14 +1244,20 @@ options! {
         (default based on relative source path)"),
     profiler_runtime: String = (String::from("profiler_builtins"), parse_string, [TRACKED],
         "name of the profiler runtime crate to automatically inject (default: `profiler_builtins`)"),
+    profile_sample_use: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
+        "use the given `.prof` file for sampled profile-guided optimization (also known as AutoFDO)"),
     query_dep_graph: bool = (false, parse_bool, [UNTRACKED],
         "enable queries of the dependency graph for regression testing (default: no)"),
     query_stats: bool = (false, parse_bool, [UNTRACKED],
         "print some statistics about the query system (default: no)"),
+    randomize_layout: bool = (false, parse_bool, [TRACKED],
+        "randomize the layout of types (default: no)"),
     relax_elf_relocations: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "whether ELF relocations can be relaxed"),
     relro_level: Option<RelroLevel> = (None, parse_relro_level, [TRACKED],
         "choose which RELRO level to use"),
+    remap_cwd_prefix: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
+        "remap paths under the current working directory to this path prefix"),
     simulate_remapped_rust_src_base: Option<PathBuf> = (None, parse_opt_pathbuf, [TRACKED],
         "simulate the effect of remap-debuginfo = true at bootstrapping by remapping path \
         to rust's source base directory. only meant for testing purposes"),
@@ -1283,7 +1312,7 @@ options! {
     thinlto: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable ThinLTO when possible"),
     thir_unsafeck: bool = (false, parse_bool, [TRACKED],
-        "use the work-in-progress THIR unsafety checker. NOTE: this is unsound (default: no)"),
+        "use the THIR unsafety checker (default: no)"),
     /// We default to 1 here since we want to behave like
     /// a sequential compiler for now. This'll likely be adjusted
     /// in the future. Note that -Zthreads=0 is the way to get

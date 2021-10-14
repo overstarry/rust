@@ -77,7 +77,7 @@ mod as_keyword {}
 ///     '_inner: for j in 1..=200 {
 ///         println!("    inner iteration (j): {}", j);
 ///         if j >= 3 {
-///             // breaks from inner loop, let's outer loop continue.
+///             // breaks from inner loop, lets outer loop continue.
 ///             break;
 ///         }
 ///         if i >= 2 {
@@ -119,7 +119,7 @@ mod break_keyword {}
 
 #[doc(keyword = "const")]
 //
-/// Compile-time constants and compile-time evaluable functions.
+/// Compile-time constants, compile-time evaluable functions, and raw pointers.
 ///
 /// ## Compile-time constants
 ///
@@ -2289,7 +2289,7 @@ mod dyn_keyword {}
 /// }
 ///
 /// let mut u = IntOrFloat { f: 1.0 };
-/// // Reading the fields of an union is always unsafe
+/// // Reading the fields of a union is always unsafe
 /// assert_eq!(unsafe { u.i }, 1065353216);
 /// // Updating through any of the field will modify all of them
 /// u.i = 1073741824;

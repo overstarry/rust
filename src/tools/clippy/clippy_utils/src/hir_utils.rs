@@ -232,6 +232,7 @@ impl HirEqInterExpr<'_, '_, '_> {
             (&ExprKind::If(lc, lt, ref le), &ExprKind::If(rc, rt, ref re)) => {
                 self.eq_expr(lc, rc) && self.eq_expr(&**lt, &**rt) && both(le, re, |l, r| self.eq_expr(l, r))
             },
+            (&ExprKind::Let(lp, le, _), &ExprKind::Let(rp, re, _)) => self.eq_pat(lp, rp) && self.eq_expr(le, re),
             (&ExprKind::Lit(ref l), &ExprKind::Lit(ref r)) => l.node == r.node,
             (&ExprKind::Loop(lb, ref ll, ref lls, _), &ExprKind::Loop(rb, ref rl, ref rls, _)) => {
                 lls == rls && self.eq_block(lb, rb) && both(ll, rl, |l, r| l.ident.name == r.ident.name)
@@ -539,7 +540,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
         std::mem::discriminant(&b.rules).hash(&mut self.s);
     }
 
-    #[allow(clippy::many_single_char_names, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     pub fn hash_expr(&mut self, e: &Expr<'_>) {
         let simple_const = self
             .maybe_typeck_results
@@ -664,6 +665,10 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                         InlineAsmOperand::Sym { expr } => self.hash_expr(expr),
                     }
                 }
+            },
+            ExprKind::Let(pat, expr, _) => {
+                self.hash_expr(expr);
+                self.hash_pat(pat);
             },
             ExprKind::LlvmInlineAsm(..) | ExprKind::Err => {},
             ExprKind::Lit(ref l) => {

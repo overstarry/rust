@@ -76,6 +76,7 @@ use crate::check::dropck;
 use crate::check::FnCtxt;
 use crate::mem_categorization as mc;
 use crate::middle::region;
+use rustc_data_structures::stable_set::FxHashSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
 use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
@@ -126,7 +127,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     /// Region checking during the WF phase for items. `wf_tys` are the
     /// types from which we should derive implied bounds, if any.
-    pub fn regionck_item(&self, item_id: hir::HirId, span: Span, wf_tys: &[Ty<'tcx>]) {
+    pub fn regionck_item(&self, item_id: hir::HirId, span: Span, wf_tys: FxHashSet<Ty<'tcx>>) {
         debug!("regionck_item(item.id={:?}, wf_tys={:?})", item_id, wf_tys);
         let subject = self.tcx.hir().local_def_id(item_id);
         let mut rcx = RegionCtxt::new(self, item_id, Subject(subject), self.param_env);
@@ -144,11 +145,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// rest of type check and because sometimes we need type
     /// inference to have completed before we can determine which
     /// constraints to add.
-    pub fn regionck_fn(&self, fn_id: hir::HirId, body: &'tcx hir::Body<'tcx>) {
+    pub(crate) fn regionck_fn(
+        &self,
+        fn_id: hir::HirId,
+        body: &'tcx hir::Body<'tcx>,
+        span: Span,
+        wf_tys: FxHashSet<Ty<'tcx>>,
+    ) {
         debug!("regionck_fn(id={})", fn_id);
         let subject = self.tcx.hir().body_owner_def_id(body.id());
         let hir_id = body.value.hir_id;
         let mut rcx = RegionCtxt::new(self, hir_id, Subject(subject), self.param_env);
+        // We need to add the implied bounds from the function signature
+        rcx.outlives_environment.add_implied_bounds(self, wf_tys, fn_id, span);
+        rcx.outlives_environment.save_implied_bounds(fn_id);
 
         if !self.errors_reported_since_creation() {
             // regionck assumes typeck succeeded
@@ -180,7 +190,7 @@ pub struct RegionCtxt<'a, 'tcx> {
 impl<'a, 'tcx> Deref for RegionCtxt<'a, 'tcx> {
     type Target = FnCtxt<'a, 'tcx>;
     fn deref(&self) -> &Self::Target {
-        &self.fcx
+        self.fcx
     }
 }
 
@@ -277,24 +287,16 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
         // because it will have no effect.
         //
         // FIXME(#27579) return types should not be implied bounds
-        let fn_sig_tys: Vec<_> =
+        let fn_sig_tys: FxHashSet<_> =
             fn_sig.inputs().iter().cloned().chain(Some(fn_sig.output())).collect();
 
-        self.outlives_environment.add_implied_bounds(
-            self.fcx,
-            &fn_sig_tys[..],
-            body_id.hir_id,
-            span,
-        );
+        self.outlives_environment.add_implied_bounds(self.fcx, fn_sig_tys, body_id.hir_id, span);
         self.outlives_environment.save_implied_bounds(body_id.hir_id);
-        self.link_fn_params(&body.params);
+        self.link_fn_params(body.params);
         self.visit_body(body);
         self.visit_region_obligations(body_id.hir_id);
 
-        self.constrain_opaque_types(
-            &self.fcx.opaque_types.borrow(),
-            self.outlives_environment.free_region_map(),
-        );
+        self.constrain_opaque_types(self.outlives_environment.free_region_map());
     }
 
     fn visit_region_obligations(&mut self, hir_id: hir::HirId) {
@@ -377,13 +379,13 @@ impl<'a, 'tcx> Visitor<'tcx> for RegionCtxt<'a, 'tcx> {
 
     fn visit_arm(&mut self, arm: &'tcx hir::Arm<'tcx>) {
         // see above
-        self.constrain_bindings_in_pat(&arm.pat);
+        self.constrain_bindings_in_pat(arm.pat);
         intravisit::walk_arm(self, arm);
     }
 
     fn visit_local(&mut self, l: &'tcx hir::Local<'tcx>) {
         // see above
-        self.constrain_bindings_in_pat(&l.pat);
+        self.constrain_bindings_in_pat(l.pat);
         self.link_local(l);
         intravisit::walk_local(self, l);
     }
@@ -405,13 +407,13 @@ impl<'a, 'tcx> Visitor<'tcx> for RegionCtxt<'a, 'tcx> {
 
         match expr.kind {
             hir::ExprKind::AddrOf(hir::BorrowKind::Ref, m, ref base) => {
-                self.link_addr_of(expr, m, &base);
+                self.link_addr_of(expr, m, base);
 
                 intravisit::walk_expr(self, expr);
             }
 
-            hir::ExprKind::Match(ref discr, ref arms, _) => {
-                self.link_match(&discr, &arms[..]);
+            hir::ExprKind::Match(ref discr, arms, _) => {
+                self.link_match(discr, arms);
 
                 intravisit::walk_expr(self, expr);
             }
@@ -446,7 +448,7 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
         let mut place = self.with_mc(|mc| mc.cat_expr_unadjusted(expr))?;
 
         let typeck_results = self.typeck_results.borrow();
-        let adjustments = typeck_results.expr_adjustments(&expr);
+        let adjustments = typeck_results.expr_adjustments(expr);
         if adjustments.is_empty() {
             return Ok(place);
         }
@@ -473,7 +475,7 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
                 self.link_autoref(expr, &place, autoref);
             }
 
-            place = self.with_mc(|mc| mc.cat_expr_adjusted(expr, place, &adjustment))?;
+            place = self.with_mc(|mc| mc.cat_expr_adjusted(expr, place, adjustment))?;
         }
 
         Ok(place)
@@ -538,10 +540,10 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
             None => {
                 return;
             }
-            Some(ref expr) => &**expr,
+            Some(expr) => &*expr,
         };
         let discr_cmt = ignore_err!(self.with_mc(|mc| mc.cat_expr(init_expr)));
-        self.link_pattern(discr_cmt, &local.pat);
+        self.link_pattern(discr_cmt, local.pat);
     }
 
     /// Computes the guarantors for any ref bindings in a match and
@@ -552,7 +554,7 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
         let discr_cmt = ignore_err!(self.with_mc(|mc| mc.cat_expr(discr)));
         debug!("discr_cmt={:?}", discr_cmt);
         for arm in arms {
-            self.link_pattern(discr_cmt.clone(), &arm.pat);
+            self.link_pattern(discr_cmt.clone(), arm.pat);
         }
     }
 
@@ -565,7 +567,7 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
             let param_cmt =
                 self.with_mc(|mc| mc.cat_rvalue(param.hir_id, param.pat.span, param_ty));
             debug!("param_ty={:?} param_cmt={:?} param={:?}", param_ty, param_cmt, param);
-            self.link_pattern(param_cmt, &param.pat);
+            self.link_pattern(param_cmt, param.pat);
         }
     }
 
@@ -580,7 +582,7 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
                     if let Some(ty::BindByReference(mutbl)) =
                         mc.typeck_results.extract_binding_mode(self.tcx.sess, *hir_id, *span)
                     {
-                        self.link_region_from_node_type(*span, *hir_id, mutbl, &sub_cmt);
+                        self.link_region_from_node_type(*span, *hir_id, mutbl, sub_cmt);
                     }
                 }
             })

@@ -128,6 +128,12 @@ pub fn error_string(errno: i32) -> String {
     }
 }
 
+#[cfg(target_os = "espidf")]
+pub fn getcwd() -> io::Result<PathBuf> {
+    Ok(PathBuf::from("/"))
+}
+
+#[cfg(not(target_os = "espidf"))]
 pub fn getcwd() -> io::Result<PathBuf> {
     let mut buf = Vec::with_capacity(512);
     loop {
@@ -154,6 +160,12 @@ pub fn getcwd() -> io::Result<PathBuf> {
     }
 }
 
+#[cfg(target_os = "espidf")]
+pub fn chdir(p: &path::Path) -> io::Result<()> {
+    super::unsupported::unsupported()
+}
+
+#[cfg(not(target_os = "espidf"))]
 pub fn chdir(p: &path::Path) -> io::Result<()> {
     let p: &OsStr = p.as_ref();
     let p = CString::new(p.as_bytes())?;
@@ -368,20 +380,24 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
 #[cfg(any(target_os = "solaris", target_os = "illumos"))]
 pub fn current_exe() -> io::Result<PathBuf> {
-    extern "C" {
-        fn getexecname() -> *const c_char;
-    }
-    unsafe {
-        let path = getexecname();
-        if path.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            let filename = CStr::from_ptr(path).to_bytes();
-            let path = PathBuf::from(<OsStr as OsStrExt>::from_bytes(filename));
+    if let Ok(path) = crate::fs::read_link("/proc/self/path/a.out") {
+        Ok(path)
+    } else {
+        extern "C" {
+            fn getexecname() -> *const c_char;
+        }
+        unsafe {
+            let path = getexecname();
+            if path.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                let filename = CStr::from_ptr(path).to_bytes();
+                let path = PathBuf::from(<OsStr as OsStrExt>::from_bytes(filename));
 
-            // Prepend a current working directory to the path if
-            // it doesn't contain an absolute pathname.
-            if filename[0] == b'/' { Ok(path) } else { getcwd().map(|cwd| cwd.join(path)) }
+                // Prepend a current working directory to the path if
+                // it doesn't contain an absolute pathname.
+                if filename[0] == b'/' { Ok(path) } else { getcwd().map(|cwd| cwd.join(path)) }
+            }
         }
     }
 }
@@ -430,6 +446,11 @@ pub fn current_exe() -> io::Result<PathBuf> {
     let exe_path = env::args().next().unwrap();
     let path = path::Path::new(&exe_path);
     path.canonicalize()
+}
+
+#[cfg(target_os = "espidf")]
+pub fn current_exe() -> io::Result<PathBuf> {
+    super::unsupported::unsupported()
 }
 
 pub struct Env {
@@ -541,6 +562,7 @@ pub fn unsetenv(n: &OsStr) -> io::Result<()> {
     }
 }
 
+#[cfg(not(target_os = "espidf"))]
 pub fn page_size() -> usize {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
@@ -563,7 +585,8 @@ pub fn home_dir() -> Option<PathBuf> {
         target_os = "ios",
         target_os = "emscripten",
         target_os = "redox",
-        target_os = "vxworks"
+        target_os = "vxworks",
+        target_os = "espidf"
     ))]
     unsafe fn fallback() -> Option<OsString> {
         None
@@ -573,7 +596,8 @@ pub fn home_dir() -> Option<PathBuf> {
         target_os = "ios",
         target_os = "emscripten",
         target_os = "redox",
-        target_os = "vxworks"
+        target_os = "vxworks",
+        target_os = "espidf"
     )))]
     unsafe fn fallback() -> Option<OsString> {
         let amt = match libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) {

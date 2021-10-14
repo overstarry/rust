@@ -143,6 +143,8 @@ pub struct Config {
     pub rust_new_symbol_mangling: bool,
     pub rust_profile_use: Option<String>,
     pub rust_profile_generate: Option<String>,
+    pub llvm_profile_use: Option<String>,
+    pub llvm_profile_generate: bool,
 
     pub build: TargetSelection,
     pub hosts: Vec<TargetSelection>,
@@ -395,6 +397,7 @@ struct Build {
     install_stage: Option<u32>,
     dist_stage: Option<u32>,
     bench_stage: Option<u32>,
+    patch_binaries_for_nix: Option<bool>,
 }
 
 /// TOML representation of various global install decisions.
@@ -605,6 +608,8 @@ impl Config {
         if let Some(value) = flags.deny_warnings {
             config.deny_warnings = value;
         }
+        config.llvm_profile_use = flags.llvm_profile_use;
+        config.llvm_profile_generate = flags.llvm_profile_generate;
 
         if config.dry_run {
             let dir = config.out.join("tmp-dry-run");
@@ -977,7 +982,8 @@ impl Config {
         config.rust_debug_assertions_std =
             debug_assertions_std.unwrap_or(config.rust_debug_assertions);
         config.rust_overflow_checks = overflow_checks.unwrap_or(default);
-        config.rust_overflow_checks_std = overflow_checks_std.unwrap_or(default);
+        config.rust_overflow_checks_std =
+            overflow_checks_std.unwrap_or(config.rust_overflow_checks);
 
         config.rust_debug_logging = debug_logging.unwrap_or(config.rust_debug_assertions);
 

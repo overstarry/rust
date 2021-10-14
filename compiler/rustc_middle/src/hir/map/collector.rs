@@ -1,7 +1,6 @@
 use crate::arena::Arena;
 use crate::hir::map::Map;
 use crate::hir::{IndexedHir, OwnerNodes, ParentedNode};
-use crate::ich::StableHashingContext;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
@@ -12,6 +11,7 @@ use rustc_hir::definitions;
 use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
 use rustc_hir::*;
 use rustc_index::vec::{Idx, IndexVec};
+use rustc_query_system::ich::StableHashingContext;
 use rustc_session::Session;
 use rustc_span::source_map::SourceMap;
 use rustc_span::{Span, DUMMY_SP};
@@ -60,13 +60,6 @@ fn hash_body(
         item_like.hash_stable(hcx, &mut stable_hasher);
     });
     stable_hasher.finish()
-}
-
-/// Represents an entry and its parent `HirId`.
-#[derive(Copy, Clone, Debug)]
-pub struct Entry<'hir> {
-    parent: HirId,
-    node: Node<'hir>,
 }
 
 impl<'a, 'hir> NodeCollector<'a, 'hir> {
@@ -394,20 +387,6 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         }
     }
 
-    fn visit_macro_def(&mut self, macro_def: &'hir MacroDef<'hir>) {
-        // Exported macros are visited directly from the crate root,
-        // so they do not have `parent_node` set.
-        // Find the correct enclosing module from their DefKey.
-        let def_key = self.definitions.def_key(macro_def.def_id);
-        let parent = def_key.parent.map_or(hir::CRATE_HIR_ID, |local_def_index| {
-            self.definitions.local_def_id_to_hir_id(LocalDefId { local_def_index })
-        });
-        self.insert_owner(macro_def.def_id, OwnerNode::MacroDef(macro_def));
-        self.with_parent(parent, |this| {
-            this.insert_nested(macro_def.def_id);
-        });
-    }
-
     fn visit_variant(&mut self, v: &'hir Variant<'hir>, g: &'hir Generics<'hir>, item_id: HirId) {
         self.insert(v.span, v.id, Node::Variant(v));
         self.with_parent(v.id, |this| {
@@ -434,18 +413,18 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         self.visit_nested_trait_item(id);
     }
 
-    fn visit_impl_item_ref(&mut self, ii: &'hir ImplItemRef<'hir>) {
+    fn visit_impl_item_ref(&mut self, ii: &'hir ImplItemRef) {
         // Do not visit the duplicate information in ImplItemRef. We want to
         // map the actual nodes, not the duplicate ones in the *Ref.
-        let ImplItemRef { id, ident: _, kind: _, span: _, vis: _, defaultness: _ } = *ii;
+        let ImplItemRef { id, ident: _, kind: _, span: _, defaultness: _ } = *ii;
 
         self.visit_nested_impl_item(id);
     }
 
-    fn visit_foreign_item_ref(&mut self, fi: &'hir ForeignItemRef<'hir>) {
+    fn visit_foreign_item_ref(&mut self, fi: &'hir ForeignItemRef) {
         // Do not visit the duplicate information in ForeignItemRef. We want to
         // map the actual nodes, not the duplicate ones in the *Ref.
-        let ForeignItemRef { id, ident: _, span: _, vis: _ } = *fi;
+        let ForeignItemRef { id, ident: _, span: _ } = *fi;
 
         self.visit_nested_foreign_item(id);
     }

@@ -660,7 +660,7 @@ pub unsafe fn zeroed<T>() -> T {
 #[rustc_diagnostic_item = "mem_uninitialized"]
 #[track_caller]
 pub unsafe fn uninitialized<T>() -> T {
-    // SAFETY: the caller must guarantee that an unitialized value is valid for `T`.
+    // SAFETY: the caller must guarantee that an uninitialized value is valid for `T`.
     unsafe {
         intrinsics::assert_uninit_valid::<T>();
         MaybeUninit::uninit().assume_init()
@@ -1053,6 +1053,7 @@ pub const fn discriminant<T>(v: &T) -> Discriminant<T> {
 #[inline(always)]
 #[unstable(feature = "variant_count", issue = "73662")]
 #[rustc_const_unstable(feature = "variant_count", issue = "73662")]
+#[rustc_diagnostic_item = "mem_variant_count"]
 pub const fn variant_count<T>() -> usize {
     intrinsics::variant_count::<T>()
 }

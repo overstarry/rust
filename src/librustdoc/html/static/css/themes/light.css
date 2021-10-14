@@ -93,7 +93,7 @@ pre, .rustdoc.source .example-wrap {
 	background-color: #f6fdb0 !important;
 }
 
-.docblock h1, .docblock h2, .docblock h3, .docblock h4, .docblock h5 {
+.docblock h1, .docblock h2, .docblock h3, .docblock h4, .docblock h5, .docblock h6 {
 	border-bottom-color: #ddd;
 }
 
@@ -172,6 +172,9 @@ nav.main .separator {
 a {
 	color: #000;
 }
+body.source .example-wrap pre.rust a {
+	background: #eee;
+}
 
 .docblock:not(.type-decl) a:not(.srclink):not(.test-arrow),
 .docblock-short a:not(.srclink):not(.test-arrow), .item-info a,
@@ -229,8 +232,8 @@ details.undocumented > summary::before {
 	border-color: #bfbfbf;
 }
 
-#help > div > span {
-	border-bottom-color: #bfbfbf;
+#help span.bottom, #help span.top {
+	border-color: #bfbfbf;
 }
 
 .since {

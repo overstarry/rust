@@ -116,7 +116,7 @@ impl<'a, 'tcx, 'v> Hir2Qmm<'a, 'tcx, 'v> {
         // prevent folding of `cfg!` macros and the like
         if !e.span.from_expansion() {
             match &e.kind {
-                ExprKind::Unary(UnOp::Not, inner) => return Ok(Bool::Not(box self.run(inner)?)),
+                ExprKind::Unary(UnOp::Not, inner) => return Ok(Bool::Not(Box::new(self.run(inner)?))),
                 ExprKind::Binary(binop, lhs, rhs) => match &binop.node {
                     BinOpKind::Or => {
                         return Ok(Bool::Or(self.extract(BinOpKind::Or, &[lhs, rhs], Vec::new())?));
@@ -260,8 +260,8 @@ fn simplify_not(cx: &LateContext<'_>, expr: &Expr<'_>) -> Option<String> {
         },
         ExprKind::MethodCall(path, _, args, _) if args.len() == 1 => {
             let type_of_receiver = cx.typeck_results().expr_ty(&args[0]);
-            if !is_type_diagnostic_item(cx, type_of_receiver, sym::option_type)
-                && !is_type_diagnostic_item(cx, type_of_receiver, sym::result_type)
+            if !is_type_diagnostic_item(cx, type_of_receiver, sym::Option)
+                && !is_type_diagnostic_item(cx, type_of_receiver, sym::Result)
             {
                 return None;
             }

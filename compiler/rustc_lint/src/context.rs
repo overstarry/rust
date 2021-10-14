@@ -31,17 +31,16 @@ use rustc_hir::definitions::{DefPathData, DisambiguatedDefPathData};
 use rustc_middle::lint::LintDiagnosticBuilder;
 use rustc_middle::middle::privacy::AccessLevels;
 use rustc_middle::middle::stability;
-use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
+use rustc_middle::ty::layout::{LayoutError, LayoutOfHelpers, TyAndLayout};
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, print::Printer, subst::GenericArg, Ty, TyCtxt};
 use rustc_serialize::json::Json;
 use rustc_session::lint::{BuiltinLintDiagnostics, ExternDepSpec};
 use rustc_session::lint::{FutureIncompatibleInfo, Level, Lint, LintBuffer, LintId};
 use rustc_session::Session;
-use rustc_session::SessionLintStore;
 use rustc_span::lev_distance::find_best_match_for_name;
 use rustc_span::{symbol::Symbol, MultiSpan, Span, DUMMY_SP};
-use rustc_target::abi::LayoutOf;
+use rustc_target::abi;
 use tracing::debug;
 
 use std::cell::Cell;
@@ -73,20 +72,6 @@ pub struct LintStore {
 
     /// Map of registered lint groups to what lints they expand to.
     lint_groups: FxHashMap<&'static str, LintGroup>,
-}
-
-impl SessionLintStore for LintStore {
-    fn name_to_lint(&self, lint_name: &str) -> LintId {
-        let lints = self
-            .find_lints(lint_name)
-            .unwrap_or_else(|_| panic!("Failed to find lint with name `{}`", lint_name));
-
-        if let &[lint] = lints.as_slice() {
-            return lint;
-        } else {
-            panic!("Found mutliple lints with name `{}`: {:?}", lint_name, lints);
-        }
-    }
 }
 
 /// The target of the `by_name` map, which accounts for renaming/deprecation.
@@ -332,7 +317,16 @@ impl LintStore {
         crate_attrs: &[ast::Attribute],
     ) {
         let (tool_name, lint_name_only) = parse_lint_and_tool_name(lint_name);
-
+        if lint_name_only == crate::WARNINGS.name_lower() && level == Level::ForceWarn {
+            return struct_span_err!(
+                sess,
+                DUMMY_SP,
+                E0602,
+                "`{}` lint group is not supported with ´--force-warn´",
+                crate::WARNINGS.name_lower()
+            )
+            .emit();
+        }
         let db = match self.check_lint_name(sess, lint_name_only, tool_name, crate_attrs) {
             CheckLintNameResult::Ok(_) => None,
             CheckLintNameResult::Warning(ref msg, _) => Some(sess.struct_warn(msg)),
@@ -758,6 +752,10 @@ pub trait LintContext: Sized {
                         Applicability::MachineApplicable
                     );
                 }
+                BuiltinLintDiagnostics::NamedAsmLabel(help) => {
+                    db.help(&help);
+                    db.note("see the asm section of the unstable book <https://doc.rust-lang.org/nightly/unstable-book/library-features/asm.html#labels> for more information");
+                }
             }
             // Rewrap `db`, and pass control to the user.
             decorate(LintDiagnosticBuilder::new(db));
@@ -792,6 +790,7 @@ impl<'a> EarlyContext<'a> {
         sess: &'a Session,
         lint_store: &'a LintStore,
         krate: &'a ast::Crate,
+        crate_attrs: &'a [ast::Attribute],
         buffered: LintBuffer,
         warn_about_weird_lints: bool,
     ) -> EarlyContext<'a> {
@@ -799,7 +798,7 @@ impl<'a> EarlyContext<'a> {
             sess,
             krate,
             lint_store,
-            builder: LintLevelsBuilder::new(sess, warn_about_weird_lints, lint_store, &krate.attrs),
+            builder: LintLevelsBuilder::new(sess, warn_about_weird_lints, lint_store, crate_attrs),
             buffered,
         }
     }
@@ -1046,12 +1045,33 @@ impl<'tcx> LateContext<'tcx> {
     }
 }
 
-impl<'tcx> LayoutOf for LateContext<'tcx> {
-    type Ty = Ty<'tcx>;
-    type TyAndLayout = Result<TyAndLayout<'tcx>, LayoutError<'tcx>>;
+impl<'tcx> abi::HasDataLayout for LateContext<'tcx> {
+    #[inline]
+    fn data_layout(&self) -> &abi::TargetDataLayout {
+        &self.tcx.data_layout
+    }
+}
 
-    fn layout_of(&self, ty: Ty<'tcx>) -> Self::TyAndLayout {
-        self.tcx.layout_of(self.param_env.and(ty))
+impl<'tcx> ty::layout::HasTyCtxt<'tcx> for LateContext<'tcx> {
+    #[inline]
+    fn tcx(&self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+}
+
+impl<'tcx> ty::layout::HasParamEnv<'tcx> for LateContext<'tcx> {
+    #[inline]
+    fn param_env(&self) -> ty::ParamEnv<'tcx> {
+        self.param_env
+    }
+}
+
+impl<'tcx> LayoutOfHelpers<'tcx> for LateContext<'tcx> {
+    type LayoutOfResult = Result<TyAndLayout<'tcx>, LayoutError<'tcx>>;
+
+    #[inline]
+    fn handle_layout_err(&self, err: LayoutError<'tcx>, _: Span, _: Ty<'tcx>) -> LayoutError<'tcx> {
+        err
     }
 }
 

@@ -57,7 +57,7 @@ use core::fmt::Display;
 
 /// The error type for `try_reserve` methods.
 #[derive(Clone, PartialEq, Eq, Debug)]
-#[unstable(feature = "try_reserve", reason = "new API", issue = "48043")]
+#[stable(feature = "try_reserve", since = "1.57.0")]
 pub struct TryReserveError {
     kind: TryReserveErrorKind,
 }
@@ -111,21 +111,22 @@ pub enum TryReserveErrorKind {
     issue = "48043"
 )]
 impl From<TryReserveErrorKind> for TryReserveError {
+    #[inline]
     fn from(kind: TryReserveErrorKind) -> Self {
         Self { kind }
     }
 }
 
-#[unstable(feature = "try_reserve", reason = "new API", issue = "48043")]
-impl From<LayoutError> for TryReserveError {
+#[unstable(feature = "try_reserve_kind", reason = "new API", issue = "48043")]
+impl From<LayoutError> for TryReserveErrorKind {
     /// Always evaluates to [`TryReserveErrorKind::CapacityOverflow`].
     #[inline]
     fn from(_: LayoutError) -> Self {
-        TryReserveErrorKind::CapacityOverflow.into()
+        TryReserveErrorKind::CapacityOverflow
     }
 }
 
-#[unstable(feature = "try_reserve", reason = "new API", issue = "48043")]
+#[stable(feature = "try_reserve", since = "1.57.0")]
 impl Display for TryReserveError {
     fn fmt(
         &self,
