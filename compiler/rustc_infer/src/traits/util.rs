@@ -1,10 +1,11 @@
 use smallvec::smallvec;
 
+use crate::infer::outlives::components::{push_outlives_components, Component};
 use crate::traits::{Obligation, ObligationCause, PredicateObligation};
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
-use rustc_middle::ty::outlives::Component;
 use rustc_middle::ty::{self, ToPredicate, TyCtxt, WithConstness};
 use rustc_span::symbol::Ident;
+use rustc_span::Span;
 
 pub fn anonymize_predicate<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -92,6 +93,22 @@ pub fn elaborate_predicates<'tcx>(
     let obligations = predicates
         .map(|predicate| {
             predicate_obligation(predicate, ty::ParamEnv::empty(), ObligationCause::dummy())
+        })
+        .collect();
+    elaborate_obligations(tcx, obligations)
+}
+
+pub fn elaborate_predicates_with_span<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    predicates: impl Iterator<Item = (ty::Predicate<'tcx>, Span)>,
+) -> Elaborator<'tcx> {
+    let obligations = predicates
+        .map(|(predicate, span)| {
+            predicate_obligation(
+                predicate,
+                ty::ParamEnv::empty(),
+                ObligationCause::dummy_with_span(span),
+            )
         })
         .collect();
     elaborate_obligations(tcx, obligations)
@@ -200,7 +217,7 @@ impl Elaborator<'tcx> {
 
                 let visited = &mut self.visited;
                 let mut components = smallvec![];
-                tcx.push_outlives_components(ty_max, &mut components);
+                push_outlives_components(tcx, ty_max, &mut components);
                 self.stack.extend(
                     components
                         .into_iter()

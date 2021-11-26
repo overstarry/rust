@@ -124,10 +124,7 @@ fn push_debuginfo_type_name<'tcx>(
             // info for MSVC debugger. However, wrapping these types' names in a synthetic type
             // causes the .natvis engine for WinDbg to fail to display their data, so we opt these
             // types out to aid debugging in MSVC.
-            let is_slice_or_str = match *inner_type.kind() {
-                ty::Slice(_) | ty::Str => true,
-                _ => false,
-            };
+            let is_slice_or_str = matches!(*inner_type.kind(), ty::Slice(_) | ty::Str);
 
             if !cpp_like_names {
                 output.push('&');
@@ -480,14 +477,11 @@ pub fn compute_debuginfo_vtable_name<'tcx>(
     }
 
     if let Some(trait_ref) = trait_ref {
-        push_item_name(tcx, trait_ref.skip_binder().def_id, true, &mut vtable_name);
+        let trait_ref =
+            tcx.normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), trait_ref);
+        push_item_name(tcx, trait_ref.def_id, true, &mut vtable_name);
         visited.clear();
-        push_generic_params_internal(
-            tcx,
-            trait_ref.skip_binder().substs,
-            &mut vtable_name,
-            &mut visited,
-        );
+        push_generic_params_internal(tcx, trait_ref.substs, &mut vtable_name, &mut visited);
     } else {
         vtable_name.push_str("_");
     }

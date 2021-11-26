@@ -1,11 +1,11 @@
-error[E0310]: the parameter type `T` may not live long enough
+error: `impl` associated type signature for `A` doesn't match `trait` associated type signature
   --> $DIR/impl_bounds.rs:15:5
    |
+LL |     type A<'a> where Self: 'a;
+   |     -------------------------- expected
+...
 LL |     type A<'a> where Self: 'static = (&'a ());
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-   |
-   = help: consider adding an explicit lifetime bound `T: 'static`...
-   = note: ...so that the definition in impl matches the definition from the trait
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ found
 
 error: `impl` associated type signature for `B` doesn't match `trait` associated type signature
   --> $DIR/impl_bounds.rs:17:5
@@ -59,10 +59,10 @@ LL | impl<T: std::marker::Copy> Foo for Fooy<T> {
    |       +++++++++++++++++++
 
 error[E0277]: the trait bound `T: Copy` is not satisfied
-  --> $DIR/impl_bounds.rs:22:5
+  --> $DIR/impl_bounds.rs:22:24
    |
 LL |     fn d() where Self: Copy {}
-   |     ^^^^^^^^^^^^^^^^^^^^^^^ the trait `Copy` is not implemented for `T`
+   |                        ^^^^ the trait `Copy` is not implemented for `T`
    |
 note: required because of the requirements on the impl of `Copy` for `Fooy<T>`
   --> $DIR/impl_bounds.rs:11:10
@@ -85,5 +85,5 @@ LL | impl<T: std::marker::Copy> Foo for Fooy<T> {
 
 error: aborting due to 5 previous errors
 
-Some errors have detailed explanations: E0277, E0310, E0478.
+Some errors have detailed explanations: E0277, E0478.
 For more information about an error, try `rustc --explain E0277`.

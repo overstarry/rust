@@ -29,6 +29,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expected_ty_expr: Option<&'tcx hir::Expr<'tcx>>,
     ) {
         self.annotate_expected_due_to_let_ty(err, expr);
+        self.suggest_box_deref(err, expr, expected, expr_ty);
         self.suggest_compatible_variants(err, expr, expected, expr_ty);
         self.suggest_deref_ref_or_into(err, expr, expected, expr_ty, expected_ty_expr);
         if self.suggest_calling_boxed_future_when_appropriate(err, expr, expected, expr_ty) {
@@ -167,6 +168,23 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
     }
 
+    fn suggest_box_deref(
+        &self,
+        err: &mut DiagnosticBuilder<'_>,
+        expr: &hir::Expr<'_>,
+        expected: Ty<'tcx>,
+        expr_ty: Ty<'tcx>,
+    ) {
+        if expr_ty.is_box() && expr_ty.boxed_ty() == expected {
+            err.span_suggestion_verbose(
+                expr.span.shrink_to_lo(),
+                "try dereferencing the `Box`",
+                "*".to_string(),
+                Applicability::MachineApplicable,
+            );
+        }
+    }
+
     /// If the expected type is an enum (Issue #55250) with any variants whose
     /// sole field is of the found type, suggest such variants. (Issue #42764)
     fn suggest_compatible_variants(
@@ -181,7 +199,50 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 return;
             }
 
-            let mut compatible_variants = expected_adt
+            // If the expression is of type () and it's the return expression of a block,
+            // we suggest adding a separate return expression instead.
+            // (To avoid things like suggesting `Ok(while .. { .. })`.)
+            if expr_ty.is_unit() {
+                if let Some(hir::Node::Block(&hir::Block {
+                    span: block_span, expr: Some(e), ..
+                })) = self.tcx.hir().find(self.tcx.hir().get_parent_node(expr.hir_id))
+                {
+                    if e.hir_id == expr.hir_id {
+                        if let Some(span) = expr.span.find_ancestor_inside(block_span) {
+                            let return_suggestions =
+                                if self.tcx.is_diagnostic_item(sym::Result, expected_adt.did) {
+                                    vec!["Ok(())".to_string()]
+                                } else if self.tcx.is_diagnostic_item(sym::Option, expected_adt.did)
+                                {
+                                    vec!["None".to_string(), "Some(())".to_string()]
+                                } else {
+                                    return;
+                                };
+                            if let Some(indent) =
+                                self.tcx.sess.source_map().indentation_before(span.shrink_to_lo())
+                            {
+                                // Add a semicolon, except after `}`.
+                                let semicolon =
+                                    match self.tcx.sess.source_map().span_to_snippet(span) {
+                                        Ok(s) if s.ends_with('}') => "",
+                                        _ => ";",
+                                    };
+                                err.span_suggestions(
+                                    span.shrink_to_hi(),
+                                    "try adding an expression at the end of the block",
+                                    return_suggestions
+                                        .into_iter()
+                                        .map(|r| format!("{}\n{}{}", semicolon, indent, r)),
+                                    Applicability::MaybeIncorrect,
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let compatible_variants: Vec<String> = expected_adt
                 .variants
                 .iter()
                 .filter(|variant| variant.fields.len() == 1)
@@ -202,19 +263,33 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         None
                     }
                 })
-                .peekable();
+                .collect();
 
-            if compatible_variants.peek().is_some() {
-                if let Ok(expr_text) = self.tcx.sess.source_map().span_to_snippet(expr.span) {
-                    let suggestions = compatible_variants.map(|v| format!("{}({})", v, expr_text));
-                    let msg = "try using a variant of the expected enum";
-                    err.span_suggestions(
-                        expr.span,
-                        msg,
-                        suggestions,
-                        Applicability::MaybeIncorrect,
-                    );
-                }
+            if let [variant] = &compatible_variants[..] {
+                // Just a single matching variant.
+                err.multipart_suggestion(
+                    &format!("try wrapping the expression in `{}`", variant),
+                    vec![
+                        (expr.span.shrink_to_lo(), format!("{}(", variant)),
+                        (expr.span.shrink_to_hi(), ")".to_string()),
+                    ],
+                    Applicability::MaybeIncorrect,
+                );
+            } else if compatible_variants.len() > 1 {
+                // More than one matching variant.
+                err.multipart_suggestions(
+                    &format!(
+                        "try wrapping the expression in a variant of `{}`",
+                        self.tcx.def_path_str(expected_adt.did)
+                    ),
+                    compatible_variants.into_iter().map(|variant| {
+                        vec![
+                            (expr.span.shrink_to_lo(), format!("{}(", variant)),
+                            (expr.span.shrink_to_hi(), ")".to_string()),
+                        ]
+                    }),
+                    Applicability::MaybeIncorrect,
+                );
             }
         }
     }
@@ -428,7 +503,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 (&ty::Str, &ty::Array(arr, _) | &ty::Slice(arr)) if arr == self.tcx.types.u8 => {
                     if let hir::ExprKind::Lit(_) = expr.kind {
                         if let Ok(src) = sm.span_to_snippet(sp) {
-                            if let Some(_) = replace_prefix(&src, "b\"", "\"") {
+                            if replace_prefix(&src, "b\"", "\"").is_some() {
                                 let pos = sp.lo() + BytePos(1);
                                 return Some((
                                     sp.with_hi(pos),
@@ -444,7 +519,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 (&ty::Array(arr, _) | &ty::Slice(arr), &ty::Str) if arr == self.tcx.types.u8 => {
                     if let hir::ExprKind::Lit(_) = expr.kind {
                         if let Ok(src) = sm.span_to_snippet(sp) {
-                            if let Some(_) = replace_prefix(&src, "\"", "b\"") {
+                            if replace_prefix(&src, "\"", "b\"").is_some() {
                                 return Some((
                                     sp.shrink_to_lo(),
                                     "consider adding a leading `b`",
@@ -743,9 +818,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             return false;
         }
 
-        let src = if let Ok(src) = self.tcx.sess.source_map().span_to_snippet(expr.span) {
-            src
-        } else {
+        let Ok(src) = self.tcx.sess.source_map().span_to_snippet(expr.span) else {
             return false;
         };
 

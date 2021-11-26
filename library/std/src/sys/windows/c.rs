@@ -262,6 +262,8 @@ pub const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x00010000;
 
 pub const STATUS_SUCCESS: NTSTATUS = 0x00000000;
 
+pub const BCRYPT_USE_SYSTEM_PREFERRED_RNG: DWORD = 0x00000002;
+
 #[repr(C)]
 #[cfg(not(target_pointer_width = "64"))]
 pub struct WSADATA {
@@ -678,10 +680,6 @@ if #[cfg(not(target_vendor = "uwp"))] {
 
     #[link(name = "advapi32")]
     extern "system" {
-        // Forbidden when targeting UWP
-        #[link_name = "SystemFunction036"]
-        pub fn RtlGenRandom(RandomBuffer: *mut u8, RandomBufferLength: ULONG) -> BOOLEAN;
-
         // Allowed but unused by UWP
         pub fn OpenProcessToken(
             ProcessHandle: HANDLE,
@@ -736,6 +734,7 @@ if #[cfg(not(target_vendor = "uwp"))] {
             lpSecurityAttributes: LPSECURITY_ATTRIBUTES,
         ) -> BOOL;
         pub fn SetThreadStackGuarantee(_size: *mut c_ulong) -> BOOL;
+        pub fn GetWindowsDirectoryW(lpBuffer: LPWSTR, uSize: UINT) -> UINT;
     }
 }
 }
@@ -743,8 +742,6 @@ if #[cfg(not(target_vendor = "uwp"))] {
 // UWP specific functions & types
 cfg_if::cfg_if! {
 if #[cfg(target_vendor = "uwp")] {
-    pub const BCRYPT_USE_SYSTEM_PREFERRED_RNG: DWORD = 0x00000002;
-
     #[repr(C)]
     pub struct FILE_STANDARD_INFO {
         pub AllocationSize: LARGE_INTEGER,
@@ -754,15 +751,6 @@ if #[cfg(target_vendor = "uwp")] {
         pub Directory: BOOLEAN,
     }
 
-    #[link(name = "bcrypt")]
-    extern "system" {
-        pub fn BCryptGenRandom(
-            hAlgorithm: LPVOID,
-            pBuffer: *mut u8,
-            cbBuffer: ULONG,
-            dwFlags: ULONG,
-        ) -> LONG;
-    }
     #[link(name = "kernel32")]
     extern "system" {
         pub fn GetFileInformationByHandleEx(
@@ -786,6 +774,7 @@ extern "system" {
     pub fn LeaveCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
     pub fn DeleteCriticalSection(CriticalSection: *mut CRITICAL_SECTION);
 
+    pub fn GetSystemDirectoryW(lpBuffer: LPWSTR, uSize: UINT) -> UINT;
     pub fn RemoveDirectoryW(lpPathName: LPCWSTR) -> BOOL;
     pub fn SetFileAttributesW(lpFileName: LPCWSTR, dwFileAttributes: DWORD) -> BOOL;
     pub fn SetLastError(dwErrCode: DWORD);
@@ -990,6 +979,12 @@ extern "system" {
         cchCount2: c_int,
         bIgnoreCase: BOOL,
     ) -> c_int;
+    pub fn GetFullPathNameW(
+        lpFileName: LPCWSTR,
+        nBufferLength: DWORD,
+        lpBuffer: LPWSTR,
+        lpFilePart: *mut LPWSTR,
+    ) -> DWORD;
 }
 
 #[link(name = "ws2_32")]
@@ -1083,6 +1078,18 @@ extern "system" {
         exceptfds: *mut fd_set,
         timeout: *const timeval,
     ) -> c_int;
+}
+
+#[link(name = "bcrypt")]
+extern "system" {
+    // >= Vista / Server 2008
+    // https://docs.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcryptgenrandom
+    pub fn BCryptGenRandom(
+        hAlgorithm: LPVOID,
+        pBuffer: *mut u8,
+        cbBuffer: ULONG,
+        dwFlags: ULONG,
+    ) -> NTSTATUS;
 }
 
 // Functions that aren't available on every version of Windows that we support,

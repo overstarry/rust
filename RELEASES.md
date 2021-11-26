@@ -1,3 +1,11 @@
+Version 1.56.1 (2021-11-01)
+===========================
+
+- New lints to detect the presence of bidirectional-override Unicode
+  codepoints in the compiled source code ([CVE-2021-42574])
+
+[CVE-2021-42574]: https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2021-42574
+
 Version 1.56.0 (2021-10-21)
 ========================
 
@@ -6,7 +14,6 @@ Language
 
 - [The 2021 Edition is now stable.][rust#88100]
   See [the edition guide][rust-2021-edition-guide] for more details.
-- [You can now specify explicit discriminant values on any Rust enum.][rust#86860]
 - [The pattern in `binding @ pattern` can now also introduce new bindings.][rust#85305]
 - [Union field access is permitted in `const fn`.][rust#85769]
 
@@ -51,8 +58,6 @@ Stabilised APIs
 ---------------
 
 - [`std::os::unix::fs::chroot`]
-- [`Iterator::intersperse`]
-- [`Iterator::intersperse_with`]
 - [`UnsafeCell::raw_get`]
 - [`BufWriter::into_parts`]
 - [`core::panic::{UnwindSafe, RefUnwindSafe, AssertUnwindSafe}`]
@@ -80,7 +85,7 @@ Cargo
 - [Cargo supports specifying a minimum supported Rust version in Cargo.toml.][`rust-version`]
   This has no effect at present on dependency version selection.
   We encourage crates to specify their minimum supported Rust version, and we encourage CI systems
-  that support Rust code to include a crate's specified minimum version in the text matrix for that
+  that support Rust code to include a crate's specified minimum version in the test matrix for that
   crate by default.
 
 Compatibility notes

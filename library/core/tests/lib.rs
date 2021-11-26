@@ -9,6 +9,7 @@
 #![feature(cfg_target_has_atomic)]
 #![feature(const_assume)]
 #![feature(const_cell_into_inner)]
+#![feature(const_convert)]
 #![feature(const_maybe_uninit_assume_init)]
 #![feature(const_ptr_read)]
 #![feature(const_ptr_write)]
@@ -20,12 +21,13 @@
 #![feature(core_private_diy_float)]
 #![feature(dec2flt)]
 #![feature(div_duration)]
-#![feature(duration_consts_2)]
+#![feature(duration_consts_float)]
 #![feature(duration_constants)]
 #![feature(exact_size_is_empty)]
 #![feature(extern_types)]
 #![feature(flt2dec)]
 #![feature(fmt_internals)]
+#![feature(float_minimum_maximum)]
 #![feature(array_from_fn)]
 #![feature(hashmap_internals)]
 #![feature(try_find)]
@@ -55,21 +57,25 @@
 #![feature(const_mut_refs)]
 #![feature(const_pin)]
 #![feature(const_slice_from_raw_parts)]
-#![feature(const_raw_ptr_deref)]
+#![cfg_attr(bootstrap, feature(const_raw_ptr_deref))]
 #![feature(never_type)]
 #![feature(unwrap_infallible)]
-#![feature(option_result_unwrap_unchecked)]
 #![feature(result_into_ok_or_err)]
+#![cfg_attr(not(bootstrap), feature(portable_simd))]
 #![feature(ptr_metadata)]
 #![feature(once_cell)]
 #![feature(unsized_tuple_coercion)]
 #![feature(const_option)]
+#![feature(const_result)]
 #![feature(integer_atomics)]
 #![feature(int_roundings)]
 #![feature(slice_group_by)]
+#![feature(split_array)]
 #![feature(trusted_random_access)]
 #![feature(unsize)]
 #![feature(unzip_option)]
+#![feature(const_array_from_ref)]
+#![feature(const_slice_from_ref)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 extern crate test;
@@ -101,6 +107,8 @@ mod pattern;
 mod pin;
 mod ptr;
 mod result;
+#[cfg(not(bootstrap))]
+mod simd;
 mod slice;
 mod str;
 mod str_lossy;

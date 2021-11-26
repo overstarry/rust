@@ -10,7 +10,7 @@ use rustc_hir::definitions::{DefKey, DefPath, DefPathHash};
 use rustc_middle::hir::exports::Export;
 use rustc_middle::middle::exported_symbols::ExportedSymbol;
 use rustc_middle::middle::stability::DeprecationEntry;
-use rustc_middle::ty::query::Providers;
+use rustc_middle::ty::query::{ExternProviders, Providers};
 use rustc_middle::ty::{self, TyCtxt, Visibility};
 use rustc_session::cstore::{CrateSource, CrateStore, ForeignModule};
 use rustc_session::utils::NativeLibKind;
@@ -26,7 +26,7 @@ use std::any::Any;
 macro_rules! provide {
     (<$lt:tt> $tcx:ident, $def_id:ident, $other:ident, $cdata:ident,
       $($name:ident => $compute:block)*) => {
-        pub fn provide_extern(providers: &mut Providers) {
+        pub fn provide_extern(providers: &mut ExternProviders) {
             $(fn $name<$lt>(
                 $tcx: TyCtxt<$lt>,
                 def_id_arg: ty::query::query_keys::$name<$lt>,
@@ -51,7 +51,7 @@ macro_rules! provide {
                 $compute
             })*
 
-            *providers = Providers {
+            *providers = ExternProviders {
                 $($name,)*
                 ..*providers
             };
@@ -80,6 +80,12 @@ impl IntoArgs for CrateNum {
 impl IntoArgs for (CrateNum, DefId) {
     fn into_args(self) -> (DefId, DefId) {
         (self.0.as_def_id(), self.1)
+    }
+}
+
+impl IntoArgs for ty::InstanceDef<'tcx> {
+    fn into_args(self) -> (DefId, DefId) {
+        (self.def_id(), self.def_id())
     }
 }
 
@@ -312,7 +318,7 @@ pub fn provide(providers: &mut Providers) {
             }
 
             let mut add_child = |bfs_queue: &mut VecDeque<_>, child: &Export, parent: DefId| {
-                if child.vis != ty::Visibility::Public {
+                if !child.vis.is_public() {
                     return;
                 }
 

@@ -42,7 +42,7 @@ use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_infer::infer::{Coercion, InferOk, InferResult};
-use rustc_infer::traits::Obligation;
+use rustc_infer::traits::{Obligation, TraitEngine, TraitEngineExt};
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, PointerCast,
@@ -146,6 +146,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
             .and_then(|InferOk { value: ty, obligations }| success(f(ty), ty, obligations))
     }
 
+    #[instrument(skip(self))]
     fn coerce(&self, a: Ty<'tcx>, b: Ty<'tcx>) -> CoerceResult<'tcx> {
         // First, remove any resolved type variables (at the top level, at least):
         let a = self.shallow_resolve(a);
@@ -184,9 +185,10 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                 debug!("coerce: unsize not object safe");
                 return Err(TypeError::ObjectUnsafeCoercion(did));
             }
-            Err(_) => {}
+            Err(error) => {
+                debug!(?error, "coerce: unsize failed");
+            }
         }
-        debug!("coerce: unsize failed");
 
         // Examine the supertype and consider auto-borrowing.
         match *b.kind() {
@@ -520,9 +522,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
 
         let traits =
             (self.tcx.lang_items().unsize_trait(), self.tcx.lang_items().coerce_unsized_trait());
-        let (unsize_did, coerce_unsized_did) = if let (Some(u), Some(cu)) = traits {
-            (u, cu)
-        } else {
+        let (Some(unsize_did), Some(coerce_unsized_did)) = traits else {
             debug!("missing Unsize or CoerceUnsized traits");
             return Err(TypeError::Mismatch);
         };
@@ -933,14 +933,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Same as `try_coerce()`, but without side-effects.
+    ///
+    /// Returns false if the coercion creates any obligations that result in
+    /// errors.
     pub fn can_coerce(&self, expr_ty: Ty<'tcx>, target: Ty<'tcx>) -> bool {
         let source = self.resolve_vars_with_obligations(expr_ty);
-        debug!("coercion::can({:?} -> {:?})", source, target);
+        debug!("coercion::can_with_predicates({:?} -> {:?})", source, target);
 
         let cause = self.cause(rustc_span::DUMMY_SP, ObligationCauseCode::ExprAssignable);
         // We don't ever need two-phase here since we throw out the result of the coercion
         let coerce = Coerce::new(self, cause, AllowTwoPhase::No);
-        self.probe(|_| coerce.coerce(source, target)).is_ok()
+        self.probe(|_| {
+            let ok = match coerce.coerce(source, target) {
+                Ok(ok) => ok,
+                _ => return false,
+            };
+            let mut fcx = traits::FulfillmentContext::new_in_snapshot();
+            fcx.register_predicate_obligations(self, ok.obligations);
+            fcx.select_where_possible(&self).is_empty()
+        })
     }
 
     /// Given a type and a target type, this function will calculate and return

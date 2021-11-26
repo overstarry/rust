@@ -43,7 +43,7 @@ jobs:
           - name: mingw-check
             os: ubuntu-latest-xl
             env: {}
-          - name: x86_64-gnu-llvm-10
+          - name: x86_64-gnu-llvm-12
             os: ubuntu-latest-xl
             env: {}
           - name: x86_64-gnu-tools
@@ -91,9 +91,6 @@ jobs:
         if: success() && !env.SKIP_JOB
       - name: install sccache
         run: src/ci/scripts/install-sccache.sh
-        if: success() && !env.SKIP_JOB
-      - name: select Xcode
-        run: src/ci/scripts/select-xcode.sh
         if: success() && !env.SKIP_JOB
       - name: install clang
         run: src/ci/scripts/install-clang.sh
@@ -277,7 +274,7 @@ jobs:
           - name: x86_64-gnu-distcheck
             os: ubuntu-latest-xl
             env: {}
-          - name: x86_64-gnu-llvm-10
+          - name: x86_64-gnu-llvm-12
             env:
               RUST_BACKTRACE: 1
             os: ubuntu-latest-xl
@@ -290,12 +287,13 @@ jobs:
             os: ubuntu-latest-xl
           - name: dist-x86_64-apple
             env:
-              SCRIPT: "./x.py dist"
+              SCRIPT: "./x.py dist --exclude rust-docs --exclude extended && ./x.py dist --target=x86_64-apple-darwin rust-docs && ./x.py dist extended"
               RUST_CONFIGURE_ARGS: "--host=x86_64-apple-darwin --target=x86_64-apple-darwin,aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim --enable-full-tools --enable-sanitizers --enable-profiler --set rust.jemalloc --set llvm.ninja=false"
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
               MACOSX_DEPLOYMENT_TARGET: 10.7
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
+              NO_OVERFLOW_CHECKS: 1
               DIST_REQUIRE_ALL_TOOLS: 1
             os: macos-latest
           - name: dist-x86_64-apple-alt
@@ -306,6 +304,7 @@ jobs:
               MACOSX_DEPLOYMENT_TARGET: 10.7
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
+              NO_OVERFLOW_CHECKS: 1
             os: macos-latest
           - name: x86_64-apple
             env:
@@ -316,18 +315,19 @@ jobs:
               MACOSX_STD_DEPLOYMENT_TARGET: 10.7
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
+              NO_OVERFLOW_CHECKS: 1
             os: macos-latest
           - name: dist-aarch64-apple
             env:
               SCRIPT: "./x.py dist --stage 2"
               RUST_CONFIGURE_ARGS: "--build=x86_64-apple-darwin --host=aarch64-apple-darwin --target=aarch64-apple-darwin --enable-full-tools --enable-sanitizers --enable-profiler --set rust.jemalloc --set llvm.ninja=false"
               RUSTC_RETRY_LINKER_ON_SEGFAULT: 1
-              SELECT_XCODE: /Applications/Xcode_12.2.app
               USE_XCODE_CLANG: 1
               MACOSX_DEPLOYMENT_TARGET: 11.0
               MACOSX_STD_DEPLOYMENT_TARGET: 11.0
               NO_LLVM_ASSERTIONS: 1
               NO_DEBUG_ASSERTIONS: 1
+              NO_OVERFLOW_CHECKS: 1
               DIST_REQUIRE_ALL_TOOLS: 1
               JEMALLOC_SYS_WITH_LG_PAGE: 14
             os: macos-latest
@@ -467,9 +467,6 @@ jobs:
       - name: install sccache
         run: src/ci/scripts/install-sccache.sh
         if: success() && !env.SKIP_JOB
-      - name: select Xcode
-        run: src/ci/scripts/select-xcode.sh
-        if: success() && !env.SKIP_JOB
       - name: install clang
         run: src/ci/scripts/install-clang.sh
         if: success() && !env.SKIP_JOB
@@ -579,9 +576,6 @@ jobs:
         if: success() && !env.SKIP_JOB
       - name: install sccache
         run: src/ci/scripts/install-sccache.sh
-        if: success() && !env.SKIP_JOB
-      - name: select Xcode
-        run: src/ci/scripts/select-xcode.sh
         if: success() && !env.SKIP_JOB
       - name: install clang
         run: src/ci/scripts/install-clang.sh
