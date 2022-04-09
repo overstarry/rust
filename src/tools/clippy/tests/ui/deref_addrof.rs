@@ -1,4 +1,5 @@
 // run-rustfix
+#![allow(clippy::return_self_not_must_use)]
 #![warn(clippy::deref_addrof)]
 
 fn get_number() -> usize {
@@ -36,6 +37,8 @@ fn main() {
     let b = *&&a;
 
     let b = **&aref;
+
+    let _ = unsafe { *core::ptr::addr_of!(a) };
 }
 
 #[rustfmt::skip]

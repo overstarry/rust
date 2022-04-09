@@ -192,7 +192,7 @@ fn find_capture_matching_projections<'a, 'tcx>(
         is_ancestor_or_same_capture(&possible_ancestor_proj_kinds, &hir_projections)
     })?;
 
-    // Convert index to be from the presepective of the entire closure_min_captures map
+    // Convert index to be from the perspective of the entire closure_min_captures map
     // instead of just the root variable capture list
     Some((compute_capture_idx(closure_min_captures, var_hir_id, idx), capture))
 }
@@ -217,10 +217,6 @@ fn to_upvars_resolved_place_builder<'a, 'tcx>(
                 ty::ClosureKind::FnOnce => {}
             }
 
-            // We won't be building MIR if the closure wasn't local
-            let closure_hir_id = tcx.hir().local_def_id_to_hir_id(closure_def_id.expect_local());
-            let closure_span = tcx.hir().span(closure_hir_id);
-
             let Some((capture_index, capture)) =
                 find_capture_matching_projections(
                     typeck_results,
@@ -228,6 +224,7 @@ fn to_upvars_resolved_place_builder<'a, 'tcx>(
                     closure_def_id,
                     &from_builder.projection,
                 ) else {
+                let closure_span = tcx.def_span(closure_def_id);
                 if !enable_precise_capture(tcx, closure_span) {
                     bug!(
                         "No associated capture found for {:?}[{:#?}] even though \
@@ -244,6 +241,8 @@ fn to_upvars_resolved_place_builder<'a, 'tcx>(
                 return Err(from_builder);
             };
 
+            // We won't be building MIR if the closure wasn't local
+            let closure_hir_id = tcx.hir().local_def_id_to_hir_id(closure_def_id.expect_local());
             let closure_ty = typeck_results.node_type(closure_hir_id);
 
             let substs = match closure_ty.kind() {
@@ -257,7 +256,7 @@ fn to_upvars_resolved_place_builder<'a, 'tcx>(
             // We must have inferred the capture types since we are building MIR, therefore
             // it's safe to call `tuple_element_ty` and we can unwrap here because
             // we know that the capture exists and is the `capture_index`-th capture.
-            let var_ty = substs.tupled_upvars_ty().tuple_element_ty(capture_index).unwrap();
+            let var_ty = substs.tupled_upvars_ty().tuple_fields()[capture_index];
 
             upvar_resolved_place_builder =
                 upvar_resolved_place_builder.field(Field::new(capture_index), var_ty);
@@ -266,7 +265,7 @@ fn to_upvars_resolved_place_builder<'a, 'tcx>(
             // we need to deref it
             upvar_resolved_place_builder = match capture.info.capture_kind {
                 ty::UpvarCapture::ByRef(_) => upvar_resolved_place_builder.deref(),
-                ty::UpvarCapture::ByValue(_) => upvar_resolved_place_builder,
+                ty::UpvarCapture::ByValue => upvar_resolved_place_builder,
             };
 
             let next_projection = capture.place.projections.len();
@@ -335,11 +334,8 @@ impl<'tcx> PlaceBuilder<'tcx> {
         self.project(PlaceElem::Deref)
     }
 
-    crate fn downcast(self, adt_def: &'tcx AdtDef, variant_index: VariantIdx) -> Self {
-        self.project(PlaceElem::Downcast(
-            Some(adt_def.variants[variant_index].ident.name),
-            variant_index,
-        ))
+    crate fn downcast(self, adt_def: AdtDef<'tcx>, variant_index: VariantIdx) -> Self {
+        self.project(PlaceElem::Downcast(Some(adt_def.variant(variant_index).name), variant_index))
     }
 
     fn index(self, index: Local) -> Self {
@@ -570,10 +566,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::Continue { .. }
             | ExprKind::Return { .. }
             | ExprKind::Literal { .. }
+            | ExprKind::NamedConst { .. }
+            | ExprKind::NonHirLiteral { .. }
+            | ExprKind::ConstParam { .. }
             | ExprKind::ConstBlock { .. }
             | ExprKind::StaticRef { .. }
             | ExprKind::InlineAsm { .. }
-            | ExprKind::LlvmInlineAsm { .. }
             | ExprKind::Yield { .. }
             | ExprKind::ThreadLocalRef(_)
             | ExprKind::Call { .. } => {

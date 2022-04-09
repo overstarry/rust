@@ -4,7 +4,7 @@ use crate::ty::{PolyTraitRef, TyCtxt};
 
 /// Given a PolyTraitRef, get the PolyTraitRefs of the trait's (transitive) supertraits.
 ///
-/// A simplfied version of the same function at `rustc_infer::traits::util::supertraits`.
+/// A simplified version of the same function at `rustc_infer::traits::util::supertraits`.
 pub fn supertraits<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_ref: PolyTraitRef<'tcx>,
@@ -26,9 +26,9 @@ impl<'tcx> Elaborator<'tcx> {
             .predicates
             .into_iter()
             .flat_map(|(pred, _)| {
-                pred.subst_supertrait(self.tcx, &trait_ref).to_opt_poly_trait_ref()
+                pred.subst_supertrait(self.tcx, &trait_ref).to_opt_poly_trait_pred()
             })
-            .map(|t| t.value)
+            .map(|t| t.map_bound(|pred| pred.trait_ref))
             .filter(|supertrait_ref| self.visited.insert(*supertrait_ref));
 
         self.stack.extend(supertrait_refs);

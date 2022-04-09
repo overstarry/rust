@@ -11,8 +11,8 @@ doctest = false
 bitflags = "1.0"
 cstr = "0.2"
 libc = "0.2"
+libloading = "0.7.1"
 measureme = "10.0.0"
-snap = "1"
 tracing = "0.1"
 rustc_middle = { path = "../rustc_middle" }
 rustc-demangle = "0.1.21"
@@ -25,6 +25,7 @@ rustc_fs_util = { path = "../rustc_fs_util" }
 rustc_hir = { path = "../rustc_hir" }
 rustc_index = { path = "../rustc_index" }
 rustc_llvm = { path = "../rustc_llvm" }
+rustc_macros = { path = "../rustc_macros" }
 rustc_metadata = { path = "../rustc_metadata" }
 rustc_query_system = { path = "../rustc_query_system" }
 rustc_session = { path = "../rustc_session" }

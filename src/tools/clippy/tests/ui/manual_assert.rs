@@ -2,7 +2,15 @@
 // [edition2018] edition:2018
 // [edition2021] edition:2021
 // run-rustfix
+
 #![warn(clippy::manual_assert)]
+#![allow(clippy::nonminimal_bool)]
+
+macro_rules! one {
+    () => {
+        1
+    };
+}
 
 fn main() {
     let a = vec![1, 2, 3];
@@ -53,5 +61,8 @@ fn main() {
     }
     if a.is_empty() || !b.is_empty() {
         panic!("panic5");
+    }
+    if a.is_empty() {
+        panic!("with expansion {}", one!())
     }
 }

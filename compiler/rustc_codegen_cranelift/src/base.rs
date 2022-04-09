@@ -1,12 +1,16 @@
 //! Codegen of a single function
 
-use cranelift_codegen::binemit::{NullStackMapSink, NullTrapSink};
+use rustc_ast::InlineAsmOptions;
 use rustc_index::vec::IndexVec;
 use rustc_middle::ty::adjustment::PointerCast;
 use rustc_middle::ty::layout::FnAbiOf;
+use rustc_middle::ty::print::with_no_trimmed_paths;
+
+use indexmap::IndexSet;
 
 use crate::constant::ConstantCx;
 use crate::prelude::*;
+use crate::pretty_clif::CommentWriter;
 
 pub(crate) fn codegen_fn<'tcx>(
     cx: &mut crate::CodegenCx<'tcx>,
@@ -22,7 +26,10 @@ pub(crate) fn codegen_fn<'tcx>(
     let mir = tcx.instance_mir(instance.def);
     let _mir_guard = crate::PrintOnPanic(|| {
         let mut buf = Vec::new();
-        rustc_middle::mir::write_mir_pretty(tcx, Some(instance.def_id()), &mut buf).unwrap();
+        with_no_trimmed_paths!({
+            rustc_middle::mir::pretty::write_mir_fn(tcx, mir, &mut |_, _| Ok(()), &mut buf)
+                .unwrap();
+        });
         String::from_utf8_lossy(&buf).into_owned()
     });
 
@@ -48,13 +55,15 @@ pub(crate) fn codegen_fn<'tcx>(
         (0..mir.basic_blocks().len()).map(|_| bcx.create_block()).collect();
 
     // Make FunctionCx
-    let pointer_type = module.target_config().pointer_type();
+    let target_config = module.target_config();
+    let pointer_type = target_config.pointer_type();
     let clif_comments = crate::pretty_clif::CommentWriter::new(tcx, instance);
 
     let mut fx = FunctionCx {
         cx,
         module,
         tcx,
+        target_config,
         pointer_type,
         constants_cx: ConstantCx::new(),
 
@@ -71,14 +80,12 @@ pub(crate) fn codegen_fn<'tcx>(
         clif_comments,
         source_info_set: indexmap::IndexSet::new(),
         next_ssa_var: 0,
-
-        inline_asm_index: 0,
     };
 
     let arg_uninhabited = fx
         .mir
         .args_iter()
-        .any(|arg| fx.layout_of(fx.monomorphize(&fx.mir.local_decls[arg].ty)).abi.is_uninhabited());
+        .any(|arg| fx.layout_of(fx.monomorphize(fx.mir.local_decls[arg].ty)).abi.is_uninhabited());
 
     if !crate::constant::check_constants(&mut fx) {
         fx.bcx.append_block_params_for_function_params(fx.block_map[START_BLOCK]);
@@ -87,7 +94,7 @@ pub(crate) fn codegen_fn<'tcx>(
     } else if arg_uninhabited {
         fx.bcx.append_block_params_for_function_params(fx.block_map[START_BLOCK]);
         fx.bcx.switch_to_block(fx.block_map[START_BLOCK]);
-        crate::trap::trap_unreachable(&mut fx, "function has uninhabited argument");
+        fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
     } else {
         tcx.sess.time("codegen clif ir", || {
             tcx.sess
@@ -98,27 +105,54 @@ pub(crate) fn codegen_fn<'tcx>(
 
     // Recover all necessary data from fx, before accessing func will prevent future access to it.
     let instance = fx.instance;
-    let mut clif_comments = fx.clif_comments;
+    let clif_comments = fx.clif_comments;
     let source_info_set = fx.source_info_set;
     let local_map = fx.local_map;
 
     fx.constants_cx.finalize(fx.tcx, &mut *fx.module);
-
-    // Store function in context
-    let context = &mut cx.cached_context;
-    context.func = func;
 
     crate::pretty_clif::write_clif_file(
         tcx,
         "unopt",
         module.isa(),
         instance,
-        &context,
+        &func,
         &clif_comments,
     );
 
     // Verify function
-    verify_func(tcx, &clif_comments, &context.func);
+    verify_func(tcx, &clif_comments, &func);
+
+    compile_fn(
+        cx,
+        module,
+        instance,
+        symbol_name.name,
+        func_id,
+        func,
+        clif_comments,
+        source_info_set,
+        local_map,
+    );
+}
+
+fn compile_fn<'tcx>(
+    cx: &mut crate::CodegenCx<'tcx>,
+    module: &mut dyn Module,
+    instance: Instance<'tcx>,
+    symbol_name: &str,
+    func_id: FuncId,
+    func: Function,
+    mut clif_comments: CommentWriter,
+    source_info_set: IndexSet<SourceInfo>,
+    local_map: IndexVec<mir::Local, CPlace<'tcx>>,
+) {
+    let tcx = cx.tcx;
+
+    // Store function in context
+    let context = &mut cx.cached_context;
+    context.clear();
+    context.func = func;
 
     // If the return block is not reachable, then the SSA builder may have inserted an `iconst.i128`
     // instruction, which doesn't have an encoding.
@@ -144,9 +178,7 @@ pub(crate) fn codegen_fn<'tcx>(
     // Define function
     tcx.sess.time("define function", || {
         context.want_disasm = crate::pretty_clif::should_write_ir(tcx);
-        module
-            .define_function(func_id, context, &mut NullTrapSink {}, &mut NullStackMapSink {})
-            .unwrap()
+        module.define_function(func_id, context).unwrap()
     });
 
     // Write optimized function to file for debugging
@@ -155,7 +187,7 @@ pub(crate) fn codegen_fn<'tcx>(
         "opt",
         module.isa(),
         instance,
-        &context,
+        &context.func,
         &clif_comments,
     );
 
@@ -176,7 +208,7 @@ pub(crate) fn codegen_fn<'tcx>(
             debug_context.define_function(
                 instance,
                 func_id,
-                symbol_name.name,
+                symbol_name,
                 isa,
                 context,
                 &source_info_set,
@@ -185,9 +217,6 @@ pub(crate) fn codegen_fn<'tcx>(
         }
         unwind_context.add_function(func_id, &context, isa);
     });
-
-    // Clear context to make it usable for the next function
-    context.clear();
 }
 
 pub(crate) fn verify_func(
@@ -203,7 +232,6 @@ pub(crate) fn verify_func(
                 tcx.sess.err(&format!("{:?}", err));
                 let pretty_error = cranelift_codegen::print_errors::pretty_verifier_error(
                     &func,
-                    None,
                     Some(Box::new(writer)),
                     err,
                 );
@@ -234,12 +262,15 @@ fn codegen_fn_content(fx: &mut FunctionCx<'_, '_, '_>) {
 
         if fx.clif_comments.enabled() {
             let mut terminator_head = "\n".to_string();
-            bb_data.terminator().kind.fmt_head(&mut terminator_head).unwrap();
+            with_no_trimmed_paths!({
+                bb_data.terminator().kind.fmt_head(&mut terminator_head).unwrap();
+            });
             let inst = fx.bcx.func.layout.last_inst(block).unwrap();
             fx.add_comment(inst, terminator_head);
         }
 
-        fx.set_debug_loc(bb_data.terminator().source_info);
+        let source_info = bb_data.terminator().source_info;
+        fx.set_debug_loc(source_info);
 
         match &bb_data.terminator().kind {
             TerminatorKind::Goto { target } => {
@@ -278,7 +309,7 @@ fn codegen_fn_content(fx: &mut FunctionCx<'_, '_, '_>) {
 
                 let target = fx.get_block(*target);
                 let failure = fx.bcx.create_block();
-                // FIXME Mark failure block as cold once Cranelift supports it
+                fx.bcx.set_cold_block(failure);
 
                 if *expected {
                     fx.bcx.ins().brz(cond, failure, &[]);
@@ -294,20 +325,18 @@ fn codegen_fn_content(fx: &mut FunctionCx<'_, '_, '_>) {
                     AssertKind::BoundsCheck { ref len, ref index } => {
                         let len = codegen_operand(fx, len).load_scalar(fx);
                         let index = codegen_operand(fx, index).load_scalar(fx);
-                        let location = fx
-                            .get_caller_location(bb_data.terminator().source_info.span)
-                            .load_scalar(fx);
+                        let location = fx.get_caller_location(source_info.span).load_scalar(fx);
 
                         codegen_panic_inner(
                             fx,
                             rustc_hir::LangItem::PanicBoundsCheck,
                             &[index, len, location],
-                            bb_data.terminator().source_info.span,
+                            source_info.span,
                         );
                     }
                     _ => {
                         let msg_str = msg.description();
-                        codegen_panic(fx, msg_str, bb_data.terminator().source_info.span);
+                        codegen_panic(fx, msg_str, source_info.span);
                     }
                 }
             }
@@ -378,10 +407,18 @@ fn codegen_fn_content(fx: &mut FunctionCx<'_, '_, '_>) {
                 options,
                 destination,
                 line_spans: _,
+                cleanup: _,
             } => {
+                if options.contains(InlineAsmOptions::MAY_UNWIND) {
+                    fx.tcx.sess.span_fatal(
+                        source_info.span,
+                        "cranelift doesn't support unwinding from inline assembly.",
+                    );
+                }
+
                 crate::inline_asm::codegen_inline_asm(
                     fx,
-                    bb_data.terminator().source_info.span,
+                    source_info.span,
                     template,
                     operands,
                     *options,
@@ -393,18 +430,16 @@ fn codegen_fn_content(fx: &mut FunctionCx<'_, '_, '_>) {
                         fx.bcx.ins().jump(destination_block, &[]);
                     }
                     None => {
-                        crate::trap::trap_unreachable(
-                            fx,
-                            "[corruption] Returned from noreturn inline asm",
-                        );
+                        fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
                     }
                 }
             }
             TerminatorKind::Resume | TerminatorKind::Abort => {
-                trap_unreachable(fx, "[corruption] Unwinding bb reached.");
+                // FIXME implement unwinding
+                fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
             }
             TerminatorKind::Unreachable => {
-                trap_unreachable(fx, "[corruption] Hit unreachable code.");
+                fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
             }
             TerminatorKind::Yield { .. }
             | TerminatorKind::FalseEdge { .. }
@@ -415,7 +450,7 @@ fn codegen_fn_content(fx: &mut FunctionCx<'_, '_, '_>) {
             }
             TerminatorKind::Drop { place, target, unwind: _ } => {
                 let drop_place = codegen_place(fx, *place);
-                crate::abi::codegen_drop(fx, bb_data.terminator().source_info.span, drop_place);
+                crate::abi::codegen_drop(fx, source_info.span, drop_place);
 
                 let target_block = fx.get_block(*target);
                 fx.bcx.ins().jump(target_block, &[]);
@@ -661,7 +696,7 @@ fn codegen_stmt<'tcx>(
                     let times = fx
                         .monomorphize(times)
                         .eval(fx.tcx, ParamEnv::reveal_all())
-                        .val
+                        .val()
                         .try_to_bits(fx.tcx.data_layout.pointer_size)
                         .unwrap();
                     if operand.layout().size.bytes() == 0 {
@@ -671,7 +706,7 @@ fn codegen_stmt<'tcx>(
                         // FIXME use emit_small_memset where possible
                         let addr = lval.to_ptr().get_addr(fx);
                         let val = operand.load_scalar(fx);
-                        fx.bcx.call_memset(fx.module.target_config(), addr, val, times);
+                        fx.bcx.call_memset(fx.target_config, addr, val, times);
                     } else {
                         let loop_block = fx.bcx.create_block();
                         let loop_block2 = fx.bcx.create_block();
@@ -708,30 +743,6 @@ fn codegen_stmt<'tcx>(
                     let operand = operand.load_scalar(fx);
                     lval.write_cvalue(fx, CValue::by_val(operand, box_layout));
                 }
-                Rvalue::NullaryOp(NullOp::Box, content_ty) => {
-                    let usize_type = fx.clif_type(fx.tcx.types.usize).unwrap();
-                    let content_ty = fx.monomorphize(content_ty);
-                    let layout = fx.layout_of(content_ty);
-                    let llsize = fx.bcx.ins().iconst(usize_type, layout.size.bytes() as i64);
-                    let llalign = fx.bcx.ins().iconst(usize_type, layout.align.abi.bytes() as i64);
-                    let box_layout = fx.layout_of(fx.tcx.mk_box(content_ty));
-
-                    // Allocate space:
-                    let def_id =
-                        match fx.tcx.lang_items().require(rustc_hir::LangItem::ExchangeMalloc) {
-                            Ok(id) => id,
-                            Err(s) => {
-                                fx.tcx
-                                    .sess
-                                    .fatal(&format!("allocation of `{}` {}", box_layout.ty, s));
-                            }
-                        };
-                    let instance = ty::Instance::mono(fx.tcx, def_id).polymorphize(fx.tcx);
-                    let func_ref = fx.get_function_ref(instance);
-                    let call = fx.bcx.ins().call(func_ref, &[llsize, llalign]);
-                    let ptr = fx.bcx.inst_results(call)[0];
-                    lval.write_cvalue(fx, CValue::by_val(ptr, box_layout));
-                }
                 Rvalue::NullaryOp(null_op, ty) => {
                     assert!(
                         lval.layout()
@@ -742,10 +753,8 @@ fn codegen_stmt<'tcx>(
                     let val = match null_op {
                         NullOp::SizeOf => layout.size.bytes(),
                         NullOp::AlignOf => layout.align.abi.bytes(),
-                        NullOp::Box => unreachable!(),
                     };
-                    let val =
-                        CValue::const_val(fx, fx.layout_of(fx.tcx.types.usize), val.into());
+                    let val = CValue::const_val(fx, fx.layout_of(fx.tcx.types.usize), val.into());
                     lval.write_cvalue(fx, val);
                 }
                 Rvalue::Aggregate(ref kind, ref operands) => match kind.as_ref() {
@@ -768,18 +777,6 @@ fn codegen_stmt<'tcx>(
         | StatementKind::Retag { .. }
         | StatementKind::AscribeUserType(..) => {}
 
-        StatementKind::LlvmInlineAsm(asm) => {
-            match asm.asm.asm.as_str().trim() {
-                "" => {
-                    // Black box
-                }
-                _ => fx.tcx.sess.span_fatal(
-                    stmt.source_info.span,
-                    "Legacy `llvm_asm!` inline assembly is not supported. \
-                    Try using the new `asm!` instead.",
-                ),
-            }
-        }
         StatementKind::Coverage { .. } => fx.tcx.sess.fatal("-Zcoverage is unimplemented"),
         StatementKind::CopyNonOverlapping(inner) => {
             let dst = codegen_operand(fx, &inner.dst);
@@ -793,7 +790,7 @@ fn codegen_stmt<'tcx>(
             let elem_size: u64 = pointee.size.bytes();
             let bytes =
                 if elem_size != 1 { fx.bcx.ins().imul_imm(count, elem_size as i64) } else { count };
-            fx.bcx.call_memcpy(fx.module.target_config(), dst, src, bytes);
+            fx.bcx.call_memcpy(fx.target_config, dst, src, bytes);
         }
     }
 }
@@ -820,7 +817,14 @@ pub(crate) fn codegen_place<'tcx>(
     for elem in place.projection {
         match elem {
             PlaceElem::Deref => {
-                cplace = cplace.place_deref(fx);
+                if cplace.layout().ty.is_box() {
+                    cplace = cplace
+                        .place_field(fx, Field::new(0)) // Box<T> -> Unique<T>
+                        .place_field(fx, Field::new(0)) // Unique<T> -> *const T
+                        .place_deref(fx);
+                } else {
+                    cplace = cplace.place_deref(fx);
+                }
             }
             PlaceElem::Field(field, _ty) => {
                 cplace = cplace.place_field(fx, field);
@@ -849,16 +853,16 @@ pub(crate) fn codegen_place<'tcx>(
                 match cplace.layout().ty.kind() {
                     ty::Array(elem_ty, _len) => {
                         assert!(!from_end, "array subslices are never `from_end`");
-                        let elem_layout = fx.layout_of(elem_ty);
+                        let elem_layout = fx.layout_of(*elem_ty);
                         let ptr = cplace.to_ptr();
                         cplace = CPlace::for_ptr(
                             ptr.offset_i64(fx, elem_layout.size.bytes() as i64 * (from as i64)),
-                            fx.layout_of(fx.tcx.mk_array(elem_ty, to - from)),
+                            fx.layout_of(fx.tcx.mk_array(*elem_ty, to - from)),
                         );
                     }
                     ty::Slice(elem_ty) => {
                         assert!(from_end, "slice subslices should be `from_end`");
-                        let elem_layout = fx.layout_of(elem_ty);
+                        let elem_layout = fx.layout_of(*elem_ty);
                         let (ptr, len) = cplace.to_ptr_maybe_unsized();
                         let len = len.unwrap();
                         cplace = CPlace::for_ptr_with_extra(
@@ -925,5 +929,5 @@ pub(crate) fn codegen_panic_inner<'tcx>(
         args,
     );
 
-    crate::trap::trap_unreachable(fx, "panic lang item returned");
+    fx.bcx.ins().trap(TrapCode::UnreachableCodeReached);
 }

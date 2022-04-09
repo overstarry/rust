@@ -1,13 +1,14 @@
 use clippy_utils::consts::{constant_simple, Constant};
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_and_sugg, span_lint_and_then};
-use clippy_utils::higher;
+use clippy_utils::macros::root_macro_call_first_node;
 use clippy_utils::source::snippet;
 use clippy_utils::ty::match_type;
 use clippy_utils::{
-    is_else_clause, is_expn_of, is_expr_path_def_path, is_lint_allowed, match_def_path, method_calls, path_to_res,
-    paths, SpanlessEq,
+    def_path_res, higher, is_else_clause, is_expn_of, is_expr_path_def_path, is_lint_allowed, match_def_path,
+    method_calls, paths, peel_blocks_with_stmt, SpanlessEq,
 };
 use if_chain::if_chain;
+use rustc_ast as ast;
 use rustc_ast::ast::{Crate, ItemKind, LitKind, ModKind, NodeId};
 use rustc_ast::visit::FnKind;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -16,24 +17,25 @@ use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::hir_id::CRATE_HIR_ID;
-use rustc_hir::intravisit::{NestedVisitorMap, Visitor};
+use rustc_hir::intravisit::Visitor;
 use rustc_hir::{
     BinOpKind, Block, Expr, ExprKind, HirId, Item, Local, MutTy, Mutability, Node, Path, Stmt, StmtKind, Ty, TyKind,
     UnOp,
 };
 use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext};
-use rustc_middle::hir::map::Map;
+use rustc_middle::hir::nested_filter;
 use rustc_middle::mir::interpret::ConstValue;
-use rustc_middle::ty;
+use rustc_middle::ty::{self, fast_reject::SimplifiedTypeGen, subst::GenericArgKind, FloatTy};
+use rustc_semver::RustcVersion;
 use rustc_session::{declare_lint_pass, declare_tool_lint, impl_lint_pass};
 use rustc_span::source_map::Spanned;
-use rustc_span::symbol::{Symbol, SymbolStr};
-use rustc_span::{BytePos, Span};
+use rustc_span::symbol::Symbol;
+use rustc_span::{sym, BytePos, Span};
 use rustc_typeck::hir_ty_to_ty;
 
 use std::borrow::{Borrow, Cow};
 
-#[cfg(feature = "metadata-collector-lint")]
+#[cfg(feature = "internal")]
 pub mod metadata_collector;
 
 declare_clippy_lint! {
@@ -314,6 +316,36 @@ declare_clippy_lint! {
     "non-idiomatic `if_chain!` usage"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for invalid `clippy::version` attributes.
+    ///
+    /// Valid values are:
+    /// * "pre 1.29.0"
+    /// * any valid semantic version
+    pub INVALID_CLIPPY_VERSION_ATTRIBUTE,
+    internal,
+    "found an invalid `clippy::version` attribute"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for declared clippy lints without the `clippy::version` attribute.
+    ///
+    pub MISSING_CLIPPY_VERSION_ATTRIBUTE,
+    internal,
+    "found clippy lint without `clippy::version` attribute"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Check that the `extract_msrv_attr!` macro is used, when a lint has a MSRV.
+    ///
+    pub MISSING_MSRV_ATTR_IMPL,
+    internal,
+    "checking if all necessary steps were taken when adding a MSRV to a lint"
+}
+
 declare_lint_pass!(ClippyLintsInternal => [CLIPPY_LINTS_INTERNAL]);
 
 impl EarlyLintPass for ClippyLintsInternal {
@@ -322,11 +354,11 @@ impl EarlyLintPass for ClippyLintsInternal {
             if let ItemKind::Mod(_, ModKind::Loaded(ref items, ..)) = utils.kind {
                 if let Some(paths) = items.iter().find(|item| item.ident.name.as_str() == "paths") {
                     if let ItemKind::Mod(_, ModKind::Loaded(ref items, ..)) = paths.kind {
-                        let mut last_name: Option<SymbolStr> = None;
+                        let mut last_name: Option<&str> = None;
                         for item in items {
                             let name = item.ident.as_str();
-                            if let Some(ref last_name) = last_name {
-                                if **last_name > *name {
+                            if let Some(last_name) = last_name {
+                                if *last_name > *name {
                                     span_lint(
                                         cx,
                                         CLIPPY_LINTS_INTERNAL,
@@ -351,7 +383,7 @@ pub struct LintWithoutLintPass {
     registered_lints: FxHashSet<Symbol>,
 }
 
-impl_lint_pass!(LintWithoutLintPass => [DEFAULT_LINT, LINT_WITHOUT_LINT_PASS]);
+impl_lint_pass!(LintWithoutLintPass => [DEFAULT_LINT, LINT_WITHOUT_LINT_PASS, INVALID_CLIPPY_VERSION_ATTRIBUTE, MISSING_CLIPPY_VERSION_ATTRIBUTE]);
 
 impl<'tcx> LateLintPass<'tcx> for LintWithoutLintPass {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
@@ -361,6 +393,8 @@ impl<'tcx> LateLintPass<'tcx> for LintWithoutLintPass {
 
         if let hir::ItemKind::Static(ty, Mutability::Not, body_id) = item.kind {
             if is_lint_ref_type(cx, ty) {
+                check_invalid_clippy_version_attribute(cx, item);
+
                 let expr = &cx.tcx.hir().body(body_id).value;
                 if_chain! {
                     if let ExprKind::AddrOf(_, _, inner_exp) = expr.kind;
@@ -386,9 +420,13 @@ impl<'tcx> LateLintPass<'tcx> for LintWithoutLintPass {
                 }
                 self.declared_lints.insert(item.ident.name, item.span);
             }
-        } else if is_expn_of(item.span, "impl_lint_pass").is_some()
-            || is_expn_of(item.span, "declare_lint_pass").is_some()
-        {
+        } else if let Some(macro_call) = root_macro_call_first_node(cx, item) {
+            if !matches!(
+                &*cx.tcx.item_name(macro_call.def_id).as_str(),
+                "impl_lint_pass" | "declare_lint_pass"
+            ) {
+                return;
+            }
             if let hir::ItemKind::Impl(hir::Impl {
                 of_trait: None,
                 items: impl_item_refs,
@@ -458,13 +496,64 @@ fn is_lint_ref_type<'tcx>(cx: &LateContext<'tcx>, ty: &Ty<'_>) -> bool {
     false
 }
 
+fn check_invalid_clippy_version_attribute(cx: &LateContext<'_>, item: &'_ Item<'_>) {
+    if let Some(value) = extract_clippy_version_value(cx, item) {
+        // The `sym!` macro doesn't work as it only expects a single token.
+        // It's better to keep it this way and have a direct `Symbol::intern` call here.
+        if value == Symbol::intern("pre 1.29.0") {
+            return;
+        }
+
+        if RustcVersion::parse(&*value.as_str()).is_err() {
+            span_lint_and_help(
+                cx,
+                INVALID_CLIPPY_VERSION_ATTRIBUTE,
+                item.span,
+                "this item has an invalid `clippy::version` attribute",
+                None,
+                "please use a valid sematic version, see `doc/adding_lints.md`",
+            );
+        }
+    } else {
+        span_lint_and_help(
+            cx,
+            MISSING_CLIPPY_VERSION_ATTRIBUTE,
+            item.span,
+            "this lint is missing the `clippy::version` attribute or version value",
+            None,
+            "please use a `clippy::version` attribute, see `doc/adding_lints.md`",
+        );
+    }
+}
+
+/// This function extracts the version value of a `clippy::version` attribute if the given value has
+/// one
+fn extract_clippy_version_value(cx: &LateContext<'_>, item: &'_ Item<'_>) -> Option<Symbol> {
+    let attrs = cx.tcx.hir().attrs(item.hir_id());
+    attrs.iter().find_map(|attr| {
+        if_chain! {
+            // Identify attribute
+            if let ast::AttrKind::Normal(ref attr_kind, _) = &attr.kind;
+            if let [tool_name, attr_name] = &attr_kind.path.segments[..];
+            if tool_name.ident.name == sym::clippy;
+            if attr_name.ident.name == sym::version;
+            if let Some(version) = attr.value_str();
+            then {
+                Some(version)
+            } else {
+                None
+            }
+        }
+    })
+}
+
 struct LintCollector<'a, 'tcx> {
     output: &'a mut FxHashSet<Symbol>,
     cx: &'a LateContext<'tcx>,
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for LintCollector<'a, 'tcx> {
-    type Map = Map<'tcx>;
+    type NestedFilter = nested_filter::All;
 
     fn visit_path(&mut self, path: &'tcx Path<'_>, _: HirId) {
         if path.segments.len() == 1 {
@@ -472,8 +561,8 @@ impl<'a, 'tcx> Visitor<'tcx> for LintCollector<'a, 'tcx> {
         }
     }
 
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::All(self.cx.tcx.hir())
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.cx.tcx.hir()
     }
 }
 
@@ -504,7 +593,7 @@ impl<'tcx> LateLintPass<'tcx> for CompilerLintFunctions {
         }
 
         if_chain! {
-            if let ExprKind::MethodCall(path, _, [self_arg, ..], _) = &expr.kind;
+            if let ExprKind::MethodCall(path, [self_arg, ..], _) = &expr.kind;
             let fn_name = path.ident;
             if let Some(sugg) = self.map.get(&*fn_name.as_str());
             let ty = cx.typeck_results().expr_ty(self_arg).peel_refs();
@@ -533,8 +622,7 @@ impl<'tcx> LateLintPass<'tcx> for OuterExpnDataPass {
         }
 
         let (method_names, arg_lists, spans) = method_calls(expr, 2);
-        let method_names: Vec<SymbolStr> = method_names.iter().map(|s| s.as_str()).collect();
-        let method_names: Vec<&str> = method_names.iter().map(|s| &**s).collect();
+        let method_names: Vec<&str> = method_names.iter().map(Symbol::as_str).collect();
         if_chain! {
             if let ["expn_data", "outer_expn"] = method_names.as_slice();
             let args = arg_lists[1];
@@ -586,11 +674,8 @@ impl<'tcx> LateLintPass<'tcx> for CollapsibleCalls {
             if and_then_args.len() == 5;
             if let ExprKind::Closure(_, _, body_id, _, _) = &and_then_args[4].kind;
             let body = cx.tcx.hir().body(*body_id);
-            if let ExprKind::Block(block, _) = &body.value.kind;
-            let stmts = &block.stmts;
-            if stmts.len() == 1 && block.expr.is_none();
-            if let StmtKind::Semi(only_expr) = &stmts[0].kind;
-            if let ExprKind::MethodCall(ps, _, span_call_args, _) = &only_expr.kind;
+            let only_expr = peel_blocks_with_stmt(&body.value);
+            if let ExprKind::MethodCall(ps, span_call_args, _) = &only_expr.kind;
             then {
                 let and_then_snippets = get_and_then_snippets(cx, and_then_args);
                 let mut sle = SpanlessEq::new(cx).deny_side_effects();
@@ -767,8 +852,8 @@ impl<'tcx> LateLintPass<'tcx> for MatchTypeOnDiagItem {
             if is_expr_path_def_path(cx, fn_path, &["clippy_utils", "ty", "match_type"]);
             // Extract the path to the matched type
             if let Some(segments) = path_to_matched_type(cx, ty_path);
-            let segments: Vec<&str> = segments.iter().map(|sym| &**sym).collect();
-            if let Some(ty_did) = path_to_res(cx, &segments[..]).opt_def_id();
+            let segments: Vec<&str> = segments.iter().map(Symbol::as_str).collect();
+            if let Some(ty_did) = def_path_res(cx, &segments[..]).opt_def_id();
             // Check if the matched type is a diagnostic item
             if let Some(item_name) = cx.tcx.get_diagnostic_name(ty_did);
             then {
@@ -790,7 +875,7 @@ impl<'tcx> LateLintPass<'tcx> for MatchTypeOnDiagItem {
     }
 }
 
-fn path_to_matched_type(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Vec<SymbolStr>> {
+fn path_to_matched_type(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Vec<Symbol>> {
     use rustc_hir::ItemKind;
 
     match &expr.kind {
@@ -804,7 +889,7 @@ fn path_to_matched_type(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Ve
                     }
                 }
             },
-            Res::Def(DefKind::Const | DefKind::Static, def_id) => {
+            Res::Def(DefKind::Const | DefKind::Static(..), def_id) => {
                 if let Some(Node::Item(item)) = cx.tcx.hir().get_if_local(def_id) {
                     if let ItemKind::Const(.., body_id) | ItemKind::Static(.., body_id) = item.kind {
                         let body = cx.tcx.hir().body(body_id);
@@ -815,12 +900,12 @@ fn path_to_matched_type(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Ve
             _ => {},
         },
         ExprKind::Array(exprs) => {
-            let segments: Vec<SymbolStr> = exprs
+            let segments: Vec<Symbol> = exprs
                 .iter()
                 .filter_map(|expr| {
                     if let ExprKind::Lit(lit) = &expr.kind {
                         if let LitKind::Str(sym, _) = lit.node {
-                            return Some(sym.as_str());
+                            return Some(sym);
                         }
                     }
 
@@ -841,7 +926,7 @@ fn path_to_matched_type(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Ve
 // This is not a complete resolver for paths. It works on all the paths currently used in the paths
 // module.  That's all it does and all it needs to do.
 pub fn check_path(cx: &LateContext<'_>, path: &[&str]) -> bool {
-    if path_to_res(cx, path) != Res::Err {
+    if def_path_res(cx, path) != Res::Err {
         return true;
     }
 
@@ -849,13 +934,33 @@ pub fn check_path(cx: &LateContext<'_>, path: &[&str]) -> bool {
     // implementations of native types. Check lang items.
     let path_syms: Vec<_> = path.iter().map(|p| Symbol::intern(p)).collect();
     let lang_items = cx.tcx.lang_items();
-    for item_def_id in lang_items.items().iter().flatten() {
+    // This list isn't complete, but good enough for our current list of paths.
+    let incoherent_impls = [
+        SimplifiedTypeGen::FloatSimplifiedType(FloatTy::F32),
+        SimplifiedTypeGen::FloatSimplifiedType(FloatTy::F64),
+        SimplifiedTypeGen::SliceSimplifiedType,
+        SimplifiedTypeGen::StrSimplifiedType,
+    ]
+    .iter()
+    .flat_map(|&ty| cx.tcx.incoherent_impls(ty));
+    for item_def_id in lang_items.items().iter().flatten().chain(incoherent_impls) {
         let lang_item_path = cx.get_def_path(*item_def_id);
         if path_syms.starts_with(&lang_item_path) {
             if let [item] = &path_syms[lang_item_path.len()..] {
-                for child in cx.tcx.item_children(*item_def_id) {
-                    if child.ident.name == *item {
-                        return true;
+                if matches!(
+                    cx.tcx.def_kind(*item_def_id),
+                    DefKind::Mod | DefKind::Enum | DefKind::Trait
+                ) {
+                    for child in cx.tcx.module_children(*item_def_id) {
+                        if child.ident.name == *item {
+                            return true;
+                        }
+                    }
+                } else {
+                    for child in cx.tcx.associated_item_def_ids(*item_def_id) {
+                        if cx.tcx.item_name(*child) == *item {
+                            return true;
+                        }
                     }
                 }
             }
@@ -912,8 +1017,8 @@ impl<'tcx> LateLintPass<'tcx> for InterningDefinedSymbol {
         }
 
         for &module in &[&paths::KW_MODULE, &paths::SYM_MODULE] {
-            if let Some(def_id) = path_to_res(cx, module).opt_def_id() {
-                for item in cx.tcx.item_children(def_id).iter() {
+            if let Some(def_id) = def_path_res(cx, module).opt_def_id() {
+                for item in cx.tcx.module_children(def_id).iter() {
                     if_chain! {
                         if let Res::Def(DefKind::Const, item_def_id) = item.res;
                         let ty = cx.tcx.type_of(item_def_id);
@@ -1004,7 +1109,6 @@ impl InterningDefinedSymbol {
             &paths::SYMBOL_TO_IDENT_STRING,
             &paths::TO_STRING_METHOD,
         ];
-        // SymbolStr might be de-referenced: `&*symbol.as_str()`
         let call = if_chain! {
             if let ExprKind::AddrOf(_, _, e) = expr.kind;
             if let ExprKind::Unary(UnOp::Deref, e) = e.kind;
@@ -1012,7 +1116,7 @@ impl InterningDefinedSymbol {
         };
         if_chain! {
             // is a method call
-            if let ExprKind::MethodCall(_, _, [item], _) = call.kind;
+            if let ExprKind::MethodCall(_, [item], _) = call.kind;
             if let Some(did) = cx.typeck_results().type_dependent_def_id(call.hir_id);
             let ty = cx.typeck_results().expr_ty(item);
             // ...on either an Ident or a Symbol
@@ -1219,7 +1323,7 @@ fn if_chain_local_span(cx: &LateContext<'_>, local: &Local<'_>, if_chain_span: S
     }
     span.adjust(if_chain_span.ctxt().outer_expn());
     let sm = cx.sess().source_map();
-    let span = sm.span_extend_to_prev_str(span, "let", false);
+    let span = sm.span_extend_to_prev_str(span, "let", false, true).unwrap_or(span);
     let span = sm.span_extend_to_next_char(span, ';', false);
     Span::new(
         span.lo() - BytePos(3),
@@ -1227,4 +1331,47 @@ fn if_chain_local_span(cx: &LateContext<'_>, local: &Local<'_>, if_chain_span: S
         span.ctxt(),
         span.parent(),
     )
+}
+
+declare_lint_pass!(MsrvAttrImpl => [MISSING_MSRV_ATTR_IMPL]);
+
+impl LateLintPass<'_> for MsrvAttrImpl {
+    fn check_item(&mut self, cx: &LateContext<'_>, item: &hir::Item<'_>) {
+        if_chain! {
+            if let hir::ItemKind::Impl(hir::Impl {
+                of_trait: Some(lint_pass_trait_ref),
+                self_ty,
+                items,
+                ..
+            }) = &item.kind;
+            if let Some(lint_pass_trait_def_id) = lint_pass_trait_ref.trait_def_id();
+            let is_late_pass = match_def_path(cx, lint_pass_trait_def_id, &paths::LATE_LINT_PASS);
+            if is_late_pass || match_def_path(cx, lint_pass_trait_def_id, &paths::EARLY_LINT_PASS);
+            let self_ty = hir_ty_to_ty(cx.tcx, self_ty);
+            if let ty::Adt(self_ty_def, _) = self_ty.kind();
+            if self_ty_def.is_struct();
+            if self_ty_def.all_fields().any(|f| {
+                cx.tcx
+                    .type_of(f.did)
+                    .walk()
+                    .filter(|t| matches!(t.unpack(), GenericArgKind::Type(_)))
+                    .any(|t| match_type(cx, t.expect_ty(), &paths::RUSTC_VERSION))
+            });
+            if !items.iter().any(|item| item.ident.name == sym!(enter_lint_attrs));
+            then {
+                let context = if is_late_pass { "LateContext" } else { "EarlyContext" };
+                let lint_pass = if is_late_pass { "LateLintPass" } else { "EarlyLintPass" };
+                let span = cx.sess().source_map().span_through_char(item.span, '{');
+                span_lint_and_sugg(
+                    cx,
+                    MISSING_MSRV_ATTR_IMPL,
+                    span,
+                    &format!("`extract_msrv_attr!` macro missing from `{lint_pass}` implementation"),
+                    &format!("add `extract_msrv_attr!({context})` to the `{lint_pass}` implementation"),
+                    format!("{}\n    extract_msrv_attr!({context});", snippet(cx, span, "..")),
+                    Applicability::MachineApplicable,
+                );
+            }
+        }
+    }
 }

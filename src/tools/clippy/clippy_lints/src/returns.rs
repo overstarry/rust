@@ -1,13 +1,12 @@
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::source::snippet_opt;
-use clippy_utils::{fn_def_id, in_macro, path_to_local_id};
+use clippy_utils::{fn_def_id, path_to_local_id};
 use if_chain::if_chain;
 use rustc_ast::ast::Attribute;
 use rustc_errors::Applicability;
-use rustc_hir::intravisit::{walk_expr, FnKind, NestedVisitorMap, Visitor};
+use rustc_hir::intravisit::{walk_expr, FnKind, Visitor};
 use rustc_hir::{Block, Body, Expr, ExprKind, FnDecl, HirId, MatchSource, PatKind, StmtKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
-use rustc_middle::hir::map::Map;
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty::subst::GenericArgKind;
 use rustc_session::{declare_lint_pass, declare_tool_lint};
@@ -37,6 +36,7 @@ declare_clippy_lint! {
     ///     String::new()
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub LET_AND_RETURN,
     style,
     "creating a let-binding and then immediately returning it like `let x = expr; x` at the end of a block"
@@ -62,6 +62,7 @@ declare_clippy_lint! {
     ///     x
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub NEEDLESS_RETURN,
     style,
     "using a return statement like `return expr;` where an expression would suffice"
@@ -71,6 +72,7 @@ declare_clippy_lint! {
 enum RetReplacement {
     Empty,
     Block,
+    Unit,
 }
 
 declare_lint_pass!(Return => [LET_AND_RETURN, NEEDLESS_RETURN]);
@@ -90,8 +92,7 @@ impl<'tcx> LateLintPass<'tcx> for Return {
             if !last_statement_borrows(cx, initexpr);
             if !in_external_macro(cx.sess(), initexpr.span);
             if !in_external_macro(cx.sess(), retexpr.span);
-            if !in_external_macro(cx.sess(), local.span);
-            if !in_macro(local.span);
+            if !local.span.from_expansion();
             then {
                 span_lint_and_then(
                     cx,
@@ -211,7 +212,7 @@ fn check_final_expr<'tcx>(
         // (except for unit type functions) so we don't match it
         ExprKind::Match(_, arms, MatchSource::Normal) => {
             for arm in arms.iter() {
-                check_final_expr(cx, arm.body, Some(arm.body.span), RetReplacement::Block);
+                check_final_expr(cx, arm.body, Some(arm.body.span), RetReplacement::Unit);
             }
         },
         ExprKind::DropTemps(expr) => check_final_expr(cx, expr, None, RetReplacement::Empty),
@@ -258,6 +259,17 @@ fn emit_return_lint(cx: &LateContext<'_>, ret_span: Span, inner_span: Option<Spa
                     Applicability::MachineApplicable,
                 );
             },
+            RetReplacement::Unit => {
+                span_lint_and_sugg(
+                    cx,
+                    NEEDLESS_RETURN,
+                    ret_span,
+                    "unneeded `return` statement",
+                    "replace `return` with a unit value",
+                    "()".to_string(),
+                    Applicability::MachineApplicable,
+                );
+            },
         },
     }
 }
@@ -274,8 +286,6 @@ struct BorrowVisitor<'a, 'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for BorrowVisitor<'_, 'tcx> {
-    type Map = Map<'tcx>;
-
     fn visit_expr(&mut self, expr: &'tcx Expr<'_>) {
         if self.borrows {
             return;
@@ -288,14 +298,10 @@ impl<'tcx> Visitor<'tcx> for BorrowVisitor<'_, 'tcx> {
                 .fn_sig(def_id)
                 .output()
                 .skip_binder()
-                .walk(self.cx.tcx)
+                .walk()
                 .any(|arg| matches!(arg.unpack(), GenericArgKind::Lifetime(_)));
         }
 
         walk_expr(self, expr);
-    }
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
     }
 }

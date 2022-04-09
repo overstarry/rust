@@ -12,7 +12,7 @@ use crate::slice::{self, Split as SliceSplit};
 use super::from_utf8_unchecked;
 use super::pattern::Pattern;
 use super::pattern::{DoubleEndedSearcher, ReverseSearcher, Searcher};
-use super::validations::{next_code_point, next_code_point_reverse, utf8_is_cont_byte};
+use super::validations::{next_code_point, next_code_point_reverse};
 use super::LinesAnyMap;
 use super::{BytesIsNotEmpty, UnsafeBytesToStr};
 use super::{CharEscapeDebugContinue, CharEscapeDefault, CharEscapeUnicode};
@@ -46,8 +46,7 @@ impl<'a> Iterator for Chars<'a> {
 
     #[inline]
     fn count(self) -> usize {
-        // length in `char` is equal to the number of non-continuation bytes
-        self.iter.filter(|&&byte| !utf8_is_cont_byte(byte)).count()
+        super::count::count_chars(self.as_str())
     }
 
     #[inline]
@@ -748,7 +747,7 @@ generate_pattern_iterators! {
 }
 
 impl<'a, P: Pattern<'a>> Split<'a, P> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///
@@ -769,7 +768,7 @@ impl<'a, P: Pattern<'a>> Split<'a, P> {
 }
 
 impl<'a, P: Pattern<'a>> RSplit<'a, P> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///
@@ -808,7 +807,7 @@ generate_pattern_iterators! {
 }
 
 impl<'a, P: Pattern<'a>> SplitTerminator<'a, P> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///
@@ -829,7 +828,7 @@ impl<'a, P: Pattern<'a>> SplitTerminator<'a, P> {
 }
 
 impl<'a, P: Pattern<'a>> RSplitTerminator<'a, P> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///
@@ -931,7 +930,7 @@ generate_pattern_iterators! {
 }
 
 impl<'a, P: Pattern<'a>> SplitN<'a, P> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///
@@ -952,7 +951,7 @@ impl<'a, P: Pattern<'a>> SplitN<'a, P> {
 }
 
 impl<'a, P: Pattern<'a>> RSplitN<'a, P> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///
@@ -1236,7 +1235,7 @@ impl<'a> DoubleEndedIterator for SplitWhitespace<'a> {
 impl FusedIterator for SplitWhitespace<'_> {}
 
 impl<'a> SplitWhitespace<'a> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///
@@ -1292,7 +1291,7 @@ impl<'a> DoubleEndedIterator for SplitAsciiWhitespace<'a> {
 impl FusedIterator for SplitAsciiWhitespace<'_> {}
 
 impl<'a> SplitAsciiWhitespace<'a> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///
@@ -1360,7 +1359,7 @@ impl<'a, P: Pattern<'a, Searcher: ReverseSearcher<'a>>> DoubleEndedIterator
 impl<'a, P: Pattern<'a>> FusedIterator for SplitInclusive<'a, P> {}
 
 impl<'a, P: Pattern<'a>> SplitInclusive<'a, P> {
-    /// Returns remainder of the splitted string
+    /// Returns remainder of the split string
     ///
     /// # Examples
     ///

@@ -1,6 +1,7 @@
 use crate::abi::{self, Abi, Align, FieldsShape, Size};
 use crate::abi::{HasDataLayout, TyAbiInterface, TyAndLayout};
 use crate::spec::{self, HasTargetSpec};
+use rustc_span::Symbol;
 use std::fmt;
 
 mod aarch64;
@@ -73,6 +74,7 @@ mod attr_impl {
             // or not to actually emit the attribute. It can also be controlled
             // with the `-Zmutable-noalias` debugging option.
             const NoAliasMutRef = 1 << 6;
+            const NoUndef = 1 << 7;
         }
     }
 }
@@ -214,9 +216,9 @@ impl Uniform {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub struct CastTarget {
-    pub prefix: [Option<RegKind>; 8],
-    pub prefix_chunk_size: Size,
+    pub prefix: [Option<Reg>; 8],
     pub rest: Uniform,
+    pub attrs: ArgAttributes,
 }
 
 impl From<Reg> for CastTarget {
@@ -227,29 +229,48 @@ impl From<Reg> for CastTarget {
 
 impl From<Uniform> for CastTarget {
     fn from(uniform: Uniform) -> CastTarget {
-        CastTarget { prefix: [None; 8], prefix_chunk_size: Size::ZERO, rest: uniform }
+        CastTarget {
+            prefix: [None; 8],
+            rest: uniform,
+            attrs: ArgAttributes {
+                regular: ArgAttribute::default(),
+                arg_ext: ArgExtension::None,
+                pointee_size: Size::ZERO,
+                pointee_align: None,
+            },
+        }
     }
 }
 
 impl CastTarget {
     pub fn pair(a: Reg, b: Reg) -> CastTarget {
         CastTarget {
-            prefix: [Some(a.kind), None, None, None, None, None, None, None],
-            prefix_chunk_size: a.size,
+            prefix: [Some(a), None, None, None, None, None, None, None],
             rest: Uniform::from(b),
+            attrs: ArgAttributes {
+                regular: ArgAttribute::default(),
+                arg_ext: ArgExtension::None,
+                pointee_size: Size::ZERO,
+                pointee_align: None,
+            },
         }
     }
 
-    pub fn size<C: HasDataLayout>(&self, cx: &C) -> Size {
-        (self.prefix_chunk_size * self.prefix.iter().filter(|x| x.is_some()).count() as u64)
-            .align_to(self.rest.align(cx))
-            + self.rest.total
+    pub fn size<C: HasDataLayout>(&self, _cx: &C) -> Size {
+        let mut size = self.rest.total;
+        for i in 0..self.prefix.iter().count() {
+            match self.prefix[i] {
+                Some(v) => size += Size { raw: v.size.bytes() },
+                None => {}
+            }
+        }
+        return size;
     }
 
     pub fn align<C: HasDataLayout>(&self, cx: &C) -> Align {
         self.prefix
             .iter()
-            .filter_map(|x| x.map(|kind| Reg { kind, size: self.prefix_chunk_size }.align(cx)))
+            .filter_map(|x| x.map(|reg| reg.align(cx)))
             .fold(cx.data_layout().aggregate_align.abi.max(self.rest.align(cx)), |acc, align| {
                 acc.max(align)
             })
@@ -327,7 +348,7 @@ impl<'a, Ty> TyAndLayout<'a, Ty> {
 
             // The primitive for this algorithm.
             Abi::Scalar(scalar) => {
-                let kind = match scalar.value {
+                let kind = match scalar.primitive() {
                     abi::Int(..) | abi::Pointer => RegKind::Integer,
                     abi::F32 | abi::F64 => RegKind::Float,
                 };
@@ -461,7 +482,7 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
             Abi::Scalar(scalar) => PassMode::Direct(scalar_attrs(&layout, scalar, Size::ZERO)),
             Abi::ScalarPair(a, b) => PassMode::Pair(
                 scalar_attrs(&layout, a, Size::ZERO),
-                scalar_attrs(&layout, b, a.value.size(cx).align_to(b.value.align(cx).abi)),
+                scalar_attrs(&layout, b, a.size(cx).align_to(b.align(cx).abi)),
             ),
             Abi::Vector { .. } => PassMode::Direct(ArgAttributes::new()),
             Abi::Aggregate { .. } => PassMode::Direct(ArgAttributes::new()),
@@ -475,7 +496,11 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
         // For non-immediate arguments the callee gets its own copy of
         // the value on the stack, so there are no aliases. It's also
         // program-invisible so can't possibly capture
-        attrs.set(ArgAttribute::NoAlias).set(ArgAttribute::NoCapture).set(ArgAttribute::NonNull);
+        attrs
+            .set(ArgAttribute::NoAlias)
+            .set(ArgAttribute::NoCapture)
+            .set(ArgAttribute::NonNull)
+            .set(ArgAttribute::NoUndef);
         attrs.pointee_size = layout.size;
         // FIXME(eddyb) We should be doing this, but at least on
         // i686-pc-windows-msvc, it results in wrong stack offsets.
@@ -509,7 +534,7 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
     pub fn extend_integer_width_to(&mut self, bits: u64) {
         // Only integers have signedness
         if let Abi::Scalar(scalar) = self.layout.abi {
-            if let abi::Int(i, signed) = scalar.value {
+            if let abi::Int(i, signed) = scalar.primitive() {
                 if i.size().bits() < bits {
                     if let PassMode::Direct(ref mut attrs) = self.mode {
                         if signed {
@@ -604,10 +629,10 @@ pub struct FnAbi<'a, Ty> {
 }
 
 /// Error produced by attempting to adjust a `FnAbi`, for a "foreign" ABI.
-#[derive(Clone, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub enum AdjustForForeignAbiError {
     /// Target architecture doesn't support "foreign" (i.e. non-Rust) ABIs.
-    Unsupported { arch: String, abi: spec::abi::Abi },
+    Unsupported { arch: Symbol, abi: spec::abi::Abi },
 }
 
 impl fmt::Display for AdjustForForeignAbiError {
@@ -639,22 +664,24 @@ impl<'a, Ty> FnAbi<'a, Ty> {
 
         match &cx.target_spec().arch[..] {
             "x86" => {
-                let flavor = if abi == spec::abi::Abi::Fastcall {
+                let flavor = if let spec::abi::Abi::Fastcall { .. } = abi {
                     x86::Flavor::Fastcall
                 } else {
                     x86::Flavor::General
                 };
                 x86::compute_abi_info(cx, self, flavor);
             }
-            "x86_64" => {
-                if abi == spec::abi::Abi::SysV64 {
-                    x86_64::compute_abi_info(cx, self);
-                } else if abi == spec::abi::Abi::Win64 || cx.target_spec().is_like_windows {
-                    x86_win64::compute_abi_info(self);
-                } else {
-                    x86_64::compute_abi_info(cx, self);
+            "x86_64" => match abi {
+                spec::abi::Abi::SysV64 { .. } => x86_64::compute_abi_info(cx, self),
+                spec::abi::Abi::Win64 { .. } => x86_win64::compute_abi_info(self),
+                _ => {
+                    if cx.target_spec().is_like_windows {
+                        x86_win64::compute_abi_info(self)
+                    } else {
+                        x86_64::compute_abi_info(cx, self)
+                    }
                 }
-            }
+            },
             "aarch64" => aarch64::compute_abi_info(cx, self),
             "amdgpu" => amdgpu::compute_abi_info(cx, self),
             "arm" => arm::compute_abi_info(cx, self),
@@ -682,7 +709,10 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             "asmjs" => wasm::compute_c_abi_info(cx, self),
             "bpf" => bpf::compute_abi_info(self),
             arch => {
-                return Err(AdjustForForeignAbiError::Unsupported { arch: arch.to_string(), abi });
+                return Err(AdjustForForeignAbiError::Unsupported {
+                    arch: Symbol::intern(arch),
+                    abi,
+                });
             }
         }
 

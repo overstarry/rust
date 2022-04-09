@@ -6,7 +6,7 @@ use rustc_data_structures::stable_set::FxHashSet;
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
 use rustc_session::parse::feature_err;
-use rustc_span::{sym, Span, Symbol};
+use rustc_span::{sym, Span};
 use rustc_target::asm;
 use std::collections::hash_map::Entry;
 use std::fmt::Write;
@@ -48,6 +48,17 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
             self.sess
                 .struct_span_err(sp, "the `att_syntax` option is only supported on x86")
                 .emit();
+        }
+        if asm.options.contains(InlineAsmOptions::MAY_UNWIND)
+            && !self.sess.features_untracked().asm_unwind
+        {
+            feature_err(
+                &self.sess.parse_sess,
+                sym::asm_unwind,
+                sp,
+                "the `may_unwind` option is unstable",
+            )
+            .emit();
         }
 
         let mut clobber_abis = FxHashMap::default();
@@ -116,13 +127,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                 let lower_reg = |reg| match reg {
                     InlineAsmRegOrRegClass::Reg(s) => {
                         asm::InlineAsmRegOrRegClass::Reg(if let Some(asm_arch) = asm_arch {
-                            asm::InlineAsmReg::parse(
-                                asm_arch,
-                                |feature| sess.target_features.contains(&Symbol::intern(feature)),
-                                &sess.target,
-                                s,
-                            )
-                            .unwrap_or_else(|e| {
+                            asm::InlineAsmReg::parse(asm_arch, s).unwrap_or_else(|e| {
                                 let msg = format!("invalid register `{}`: {}", s.as_str(), e);
                                 sess.struct_span_err(*op_sp, &msg).emit();
                                 asm::InlineAsmReg::Err
@@ -322,9 +327,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
 
                                     let idx2 = *o.get();
                                     let &(ref op2, op_sp2) = &operands[idx2];
-                                    let reg2 = match op2.reg() {
-                                        Some(asm::InlineAsmRegOrRegClass::Reg(r)) => r,
-                                        _ => unreachable!(),
+                                    let Some(asm::InlineAsmRegOrRegClass::Reg(reg2)) = op2.reg() else {
+                                        unreachable!();
                                     };
 
                                     let msg = format!(
@@ -357,7 +361,9 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                                     err.emit();
                                 }
                                 Entry::Vacant(v) => {
-                                    v.insert(idx);
+                                    if r == reg {
+                                        v.insert(idx);
+                                    }
                                 }
                             }
                         };

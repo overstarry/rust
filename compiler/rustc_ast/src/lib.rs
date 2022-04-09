@@ -11,12 +11,13 @@
 #![feature(box_patterns)]
 #![feature(crate_visibility_modifier)]
 #![feature(if_let_guard)]
-#![feature(iter_zip)]
 #![feature(label_break_value)]
-#![feature(nll)]
+#![feature(let_chains)]
 #![feature(min_specialization)]
-#![recursion_limit = "256"]
+#![feature(nll)]
 #![feature(slice_internals)]
+#![feature(stmt_expr_attributes)]
+#![recursion_limit = "256"]
 
 #[macro_use]
 extern crate rustc_macros;
@@ -42,7 +43,7 @@ pub mod tokenstream;
 pub mod visit;
 
 pub use self::ast::*;
-pub use self::ast_like::AstLike;
+pub use self::ast_like::{AstLike, AstLikeWrapper};
 
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 

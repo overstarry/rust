@@ -58,7 +58,7 @@ crate struct CreateResult<'tcx> {
     crate normalized_inputs_and_output: NormalizedInputsAndOutput<'tcx>,
 }
 
-crate fn create(
+crate fn create<'tcx>(
     infcx: &InferCtxt<'_, 'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     implicit_region_bound: Option<ty::Region<'tcx>>,
@@ -81,7 +81,7 @@ crate fn create(
     .create()
 }
 
-impl UniversalRegionRelations<'tcx> {
+impl UniversalRegionRelations<'_> {
     /// Records in the `outlives_relation` (and
     /// `inverse_outlives_relation`) that `fr_a: fr_b`. Invoked by the
     /// builder below.
@@ -99,10 +99,9 @@ impl UniversalRegionRelations<'tcx> {
     crate fn postdom_upper_bound(&self, fr1: RegionVid, fr2: RegionVid) -> RegionVid {
         assert!(self.universal_regions.is_universal_region(fr1));
         assert!(self.universal_regions.is_universal_region(fr2));
-        *self
-            .inverse_outlives
-            .postdom_upper_bound(&fr1, &fr2)
-            .unwrap_or(&self.universal_regions.fr_static)
+        self.inverse_outlives
+            .postdom_upper_bound(fr1, fr2)
+            .unwrap_or(self.universal_regions.fr_static)
     }
 
     /// Finds an "upper bound" for `fr` that is not local. In other
@@ -110,7 +109,7 @@ impl UniversalRegionRelations<'tcx> {
     /// outlives `fr` and (b) is not local.
     ///
     /// (*) If there are multiple competing choices, we return all of them.
-    crate fn non_local_upper_bounds(&'a self, fr: &'a RegionVid) -> Vec<&'a RegionVid> {
+    crate fn non_local_upper_bounds<'a>(&'a self, fr: RegionVid) -> Vec<RegionVid> {
         debug!("non_local_upper_bound(fr={:?})", fr);
         let res = self.non_local_bounds(&self.inverse_outlives, fr);
         assert!(!res.is_empty(), "can't find an upper bound!?");
@@ -120,7 +119,7 @@ impl UniversalRegionRelations<'tcx> {
     /// Returns the "postdominating" bound of the set of
     /// `non_local_upper_bounds` for the given region.
     crate fn non_local_upper_bound(&self, fr: RegionVid) -> RegionVid {
-        let upper_bounds = self.non_local_upper_bounds(&fr);
+        let upper_bounds = self.non_local_upper_bounds(fr);
 
         // In case we find more than one, reduce to one for
         // convenience.  This is to prevent us from generating more
@@ -130,7 +129,7 @@ impl UniversalRegionRelations<'tcx> {
         debug!("non_local_bound: post_dom={:?}", post_dom);
 
         post_dom
-            .and_then(|&post_dom| {
+            .and_then(|post_dom| {
                 // If the mutual immediate postdom is not local, then
                 // there is no non-local result we can return.
                 if !self.universal_regions.is_local_free_region(post_dom) {
@@ -150,7 +149,7 @@ impl UniversalRegionRelations<'tcx> {
     /// one. See `TransitiveRelation::postdom_upper_bound` for details.
     crate fn non_local_lower_bound(&self, fr: RegionVid) -> Option<RegionVid> {
         debug!("non_local_lower_bound(fr={:?})", fr);
-        let lower_bounds = self.non_local_bounds(&self.outlives, &fr);
+        let lower_bounds = self.non_local_bounds(&self.outlives, fr);
 
         // In case we find more than one, reduce to one for
         // convenience.  This is to prevent us from generating more
@@ -159,7 +158,7 @@ impl UniversalRegionRelations<'tcx> {
 
         debug!("non_local_bound: post_dom={:?}", post_dom);
 
-        post_dom.and_then(|&post_dom| {
+        post_dom.and_then(|post_dom| {
             // If the mutual immediate postdom is not local, then
             // there is no non-local result we can return.
             if !self.universal_regions.is_local_free_region(post_dom) {
@@ -176,11 +175,11 @@ impl UniversalRegionRelations<'tcx> {
     fn non_local_bounds<'a>(
         &self,
         relation: &'a TransitiveRelation<RegionVid>,
-        fr0: &'a RegionVid,
-    ) -> Vec<&'a RegionVid> {
+        fr0: RegionVid,
+    ) -> Vec<RegionVid> {
         // This method assumes that `fr0` is one of the universally
         // quantified region variables.
-        assert!(self.universal_regions.is_universal_region(*fr0));
+        assert!(self.universal_regions.is_universal_region(fr0));
 
         let mut external_parents = vec![];
         let mut queue = vec![fr0];
@@ -188,7 +187,7 @@ impl UniversalRegionRelations<'tcx> {
         // Keep expanding `fr` into its parents until we reach
         // non-local regions.
         while let Some(fr) = queue.pop() {
-            if !self.universal_regions.is_local_free_region(*fr) {
+            if !self.universal_regions.is_local_free_region(fr) {
                 external_parents.push(fr);
                 continue;
             }
@@ -205,17 +204,17 @@ impl UniversalRegionRelations<'tcx> {
     ///
     /// This will only ever be true for universally quantified regions.
     crate fn outlives(&self, fr1: RegionVid, fr2: RegionVid) -> bool {
-        self.outlives.contains(&fr1, &fr2)
+        self.outlives.contains(fr1, fr2)
     }
 
     /// Returns a vector of free regions `x` such that `fr1: x` is
     /// known to hold.
-    crate fn regions_outlived_by(&self, fr1: RegionVid) -> Vec<&RegionVid> {
-        self.outlives.reachable_from(&fr1)
+    crate fn regions_outlived_by(&self, fr1: RegionVid) -> Vec<RegionVid> {
+        self.outlives.reachable_from(fr1)
     }
 
     /// Returns the _non-transitive_ set of known `outlives` constraints between free regions.
-    crate fn known_outlives(&self) -> impl Iterator<Item = (&RegionVid, &RegionVid)> {
+    crate fn known_outlives(&self) -> impl Iterator<Item = (RegionVid, RegionVid)> + '_ {
         self.outlives.base_edges()
     }
 }
@@ -232,7 +231,7 @@ struct UniversalRegionRelationsBuilder<'this, 'tcx> {
     region_bound_pairs: RegionBoundPairs<'tcx>,
 }
 
-impl UniversalRegionRelationsBuilder<'cx, 'tcx> {
+impl<'tcx> UniversalRegionRelationsBuilder<'_, 'tcx> {
     crate fn create(mut self) -> CreateResult<'tcx> {
         let unnormalized_input_output_tys = self
             .universal_regions
@@ -254,9 +253,10 @@ impl UniversalRegionRelationsBuilder<'cx, 'tcx> {
         let constraint_sets: Vec<_> = unnormalized_input_output_tys
             .flat_map(|ty| {
                 debug!("build: input_or_output={:?}", ty);
-                // We add implied bounds from both the unnormalized and normalized ty
-                // See issue #87748
-                let constraints_implied_1 = self.add_implied_bounds(ty);
+                // We only add implied bounds for the normalized type as the unnormalized
+                // type may not actually get checked by the caller.
+                //
+                // Can otherwise be unsound, see #91068.
                 let TypeOpOutput { output: norm_ty, constraints: constraints1, .. } = self
                     .param_env
                     .and(type_op::normalize::Normalize::new(ty))
@@ -269,7 +269,7 @@ impl UniversalRegionRelationsBuilder<'cx, 'tcx> {
                         TypeOpOutput {
                             output: self.infcx.tcx.ty_error(),
                             constraints: None,
-                            canonicalized_query: None,
+                            error_info: None,
                         }
                     });
                 // Note: we need this in examples like
@@ -284,10 +284,9 @@ impl UniversalRegionRelationsBuilder<'cx, 'tcx> {
                 // }
                 // ```
                 // Both &Self::Bar and &() are WF
-                let constraints_implied_2 =
-                    if ty != norm_ty { self.add_implied_bounds(norm_ty) } else { None };
+                let constraints_implied = self.add_implied_bounds(norm_ty);
                 normalized_inputs_and_output.push(norm_ty);
-                constraints1.into_iter().chain(constraints_implied_1).chain(constraints_implied_2)
+                constraints1.into_iter().chain(constraints_implied)
             })
             .collect();
 
@@ -360,7 +359,7 @@ impl UniversalRegionRelationsBuilder<'cx, 'tcx> {
                     // `where Type:` is lowered to `where Type: 'empty` so that
                     // we check `Type` is well formed, but there's no use for
                     // this bound here.
-                    if let ty::ReEmpty(_) = r1 {
+                    if r1.is_empty() {
                         return;
                     }
 

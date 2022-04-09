@@ -1,5 +1,6 @@
 macro_rules! uint_impl {
-    ($SelfT:ty, $ActualT:ident, $SignedT:ident, $BITS:expr, $MaxV:expr,
+    ($SelfT:ty, $ActualT:ident, $SignedT:ident, $NonZeroT:ident,
+        $BITS:expr, $MaxV:expr,
         $rot:expr, $rot_op:expr, $rot_result:expr, $swap_op:expr, $swapped:expr,
         $reversed:expr, $le_bytes:expr, $be_bytes:expr,
         $to_xe_bytes_doc:expr, $from_xe_bytes_doc:expr) => {
@@ -16,7 +17,7 @@ macro_rules! uint_impl {
         pub const MIN: Self = 0;
 
         /// The largest value that can be represented by this integer type,
-        #[doc = concat!("2<sup>", $BITS, "</sup> - 1.")]
+        #[doc = concat!("2<sup>", $BITS, "</sup> &minus; 1.")]
         ///
         /// # Examples
         ///
@@ -272,7 +273,7 @@ macro_rules! uint_impl {
         #[doc = concat!("assert_eq!(0, 0", stringify!($SelfT), ".reverse_bits());")]
         /// ```
         #[stable(feature = "reverse_bits", since = "1.37.0")]
-        #[rustc_const_stable(feature = "const_math", since = "1.37.0")]
+        #[rustc_const_stable(feature = "reverse_bits", since = "1.37.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
@@ -590,7 +591,7 @@ macro_rules! uint_impl {
         #[doc = concat!("assert_eq!(1", stringify!($SelfT), ".checked_div(0), None);")]
         /// ```
         #[stable(feature = "rust1", since = "1.0.0")]
-        #[rustc_const_stable(feature = "const_checked_int_methods", since = "1.52.0")]
+        #[rustc_const_stable(feature = "const_checked_int_div", since = "1.52.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
@@ -641,7 +642,7 @@ macro_rules! uint_impl {
         #[doc = concat!("assert_eq!(5", stringify!($SelfT), ".checked_rem(0), None);")]
         /// ```
         #[stable(feature = "wrapping", since = "1.7.0")]
-        #[rustc_const_stable(feature = "const_checked_int_methods", since = "1.52.0")]
+        #[rustc_const_stable(feature = "const_checked_int_div", since = "1.52.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
@@ -839,12 +840,10 @@ macro_rules! uint_impl {
                       without modifying the original"]
         #[inline]
         pub const fn checked_log2(self) -> Option<u32> {
-            if self <= 0 {
-                None
+            if let Some(x) = <$NonZeroT>::new(self) {
+                Some(x.log2())
             } else {
-                // SAFETY: We just checked that this number is positive
-                let log = (Self::BITS - 1) - unsafe { intrinsics::ctlz_nonzero(self) as u32 };
-                Some(log)
+                None
             }
         }
 
@@ -863,7 +862,11 @@ macro_rules! uint_impl {
                       without modifying the original"]
         #[inline]
         pub const fn checked_log10(self) -> Option<u32> {
-            int_log10::$ActualT(self as $ActualT)
+            if let Some(x) = <$NonZeroT>::new(self) {
+                Some(x.log10())
+            } else {
+                None
+            }
         }
 
         /// Checked negation. Computes `-self`, returning `None` unless `self ==
@@ -1129,6 +1132,7 @@ macro_rules! uint_impl {
         ///
         /// ```
         #[stable(feature = "saturating_div", since = "1.58.0")]
+        #[rustc_const_stable(feature = "saturating_div", since = "1.58.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
@@ -1631,11 +1635,11 @@ macro_rules! uint_impl {
         /// Basic usage:
         ///
         /// ```
-        /// #![feature(int_abs_diff)]
         #[doc = concat!("assert_eq!(100", stringify!($SelfT), ".abs_diff(80), 20", stringify!($SelfT), ");")]
         #[doc = concat!("assert_eq!(100", stringify!($SelfT), ".abs_diff(110), 10", stringify!($SelfT), ");")]
         /// ```
-        #[unstable(feature = "int_abs_diff", issue = "89492")]
+        #[stable(feature = "int_abs_diff", since = "1.60.0")]
+        #[rustc_const_stable(feature = "int_abs_diff", since = "1.60.0")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
@@ -2024,14 +2028,14 @@ macro_rules! uint_impl {
         ///
         /// ```
         /// #![feature(int_roundings)]
-        #[doc = concat!("assert_eq!(7_", stringify!($SelfT), ".unstable_div_floor(4), 1);")]
+        #[doc = concat!("assert_eq!(7_", stringify!($SelfT), ".div_floor(4), 1);")]
         /// ```
         #[unstable(feature = "int_roundings", issue = "88581")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline(always)]
         #[rustc_inherit_overflow_checks]
-        pub const fn unstable_div_floor(self, rhs: Self) -> Self {
+        pub const fn div_floor(self, rhs: Self) -> Self {
             self / rhs
         }
 
@@ -2047,14 +2051,14 @@ macro_rules! uint_impl {
         ///
         /// ```
         /// #![feature(int_roundings)]
-        #[doc = concat!("assert_eq!(7_", stringify!($SelfT), ".unstable_div_ceil(4), 2);")]
+        #[doc = concat!("assert_eq!(7_", stringify!($SelfT), ".div_ceil(4), 2);")]
         /// ```
         #[unstable(feature = "int_roundings", issue = "88581")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
         #[rustc_inherit_overflow_checks]
-        pub const fn unstable_div_ceil(self, rhs: Self) -> Self {
+        pub const fn div_ceil(self, rhs: Self) -> Self {
             let d = self / rhs;
             let r = self % rhs;
             if r > 0 && rhs > 0 {
@@ -2077,15 +2081,15 @@ macro_rules! uint_impl {
         ///
         /// ```
         /// #![feature(int_roundings)]
-        #[doc = concat!("assert_eq!(16_", stringify!($SelfT), ".unstable_next_multiple_of(8), 16);")]
-        #[doc = concat!("assert_eq!(23_", stringify!($SelfT), ".unstable_next_multiple_of(8), 24);")]
+        #[doc = concat!("assert_eq!(16_", stringify!($SelfT), ".next_multiple_of(8), 16);")]
+        #[doc = concat!("assert_eq!(23_", stringify!($SelfT), ".next_multiple_of(8), 24);")]
         /// ```
         #[unstable(feature = "int_roundings", issue = "88581")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
         #[rustc_inherit_overflow_checks]
-        pub const fn unstable_next_multiple_of(self, rhs: Self) -> Self {
+        pub const fn next_multiple_of(self, rhs: Self) -> Self {
             match self % rhs {
                 0 => self,
                 r => self + (rhs - r)
@@ -2115,7 +2119,8 @@ macro_rules! uint_impl {
         pub const fn checked_next_multiple_of(self, rhs: Self) -> Option<Self> {
             match try_opt!(self.checked_rem(rhs)) {
                 0 => Some(self),
-                r => self.checked_add(try_opt!(rhs.checked_sub(r)))
+                // rhs - r cannot overflow because r is smaller than rhs
+                r => self.checked_add(rhs - r)
             }
         }
 
@@ -2221,9 +2226,10 @@ macro_rules! uint_impl {
         #[doc = concat!("assert_eq!(3", stringify!($SelfT), ".wrapping_next_power_of_two(), 4);")]
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.wrapping_next_power_of_two(), 0);")]
         /// ```
+        #[inline]
         #[unstable(feature = "wrapping_next_power_of_two", issue = "32463",
                    reason = "needs decision on wrapping behaviour")]
-        #[rustc_const_stable(feature = "const_int_pow", since = "1.50.0")]
+        #[rustc_const_unstable(feature = "wrapping_next_power_of_two", issue = "32463")]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         pub const fn wrapping_next_power_of_two(self) -> Self {
@@ -2323,8 +2329,6 @@ macro_rules! uint_impl {
         /// When starting from a slice rather than an array, fallible conversion APIs can be used:
         ///
         /// ```
-        /// use std::convert::TryInto;
-        ///
         #[doc = concat!("fn read_be_", stringify!($SelfT), "(input: &mut &[u8]) -> ", stringify!($SelfT), " {")]
         #[doc = concat!("    let (int_bytes, rest) = input.split_at(std::mem::size_of::<", stringify!($SelfT), ">());")]
         ///     *input = rest;
@@ -2354,8 +2358,6 @@ macro_rules! uint_impl {
         /// When starting from a slice rather than an array, fallible conversion APIs can be used:
         ///
         /// ```
-        /// use std::convert::TryInto;
-        ///
         #[doc = concat!("fn read_le_", stringify!($SelfT), "(input: &mut &[u8]) -> ", stringify!($SelfT), " {")]
         #[doc = concat!("    let (int_bytes, rest) = input.split_at(std::mem::size_of::<", stringify!($SelfT), ">());")]
         ///     *input = rest;
@@ -2396,8 +2398,6 @@ macro_rules! uint_impl {
         /// When starting from a slice rather than an array, fallible conversion APIs can be used:
         ///
         /// ```
-        /// use std::convert::TryInto;
-        ///
         #[doc = concat!("fn read_ne_", stringify!($SelfT), "(input: &mut &[u8]) -> ", stringify!($SelfT), " {")]
         #[doc = concat!("    let (int_bytes, rest) = input.split_at(std::mem::size_of::<", stringify!($SelfT), ">());")]
         ///     *input = rest;

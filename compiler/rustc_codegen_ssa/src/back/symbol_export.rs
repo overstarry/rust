@@ -76,7 +76,7 @@ fn reachable_non_generics_provider(tcx: TyCtxt<'_>, cnum: CrateNum) -> DefIdMap<
             //
             // As a result, if this id is an FFI item (foreign item) then we only
             // let it through if it's included statically.
-            match tcx.hir().get(tcx.hir().local_def_id_to_hir_id(def_id)) {
+            match tcx.hir().get_by_def_id(def_id) {
                 Node::ForeignItem(..) => {
                     tcx.is_statically_included_foreign_item(def_id).then_some(def_id)
                 }
@@ -91,7 +91,7 @@ fn reachable_non_generics_provider(tcx: TyCtxt<'_>, cnum: CrateNum) -> DefIdMap<
                     if !generics.requires_monomorphization(tcx)
                         // Functions marked with #[inline] are codegened with "internal"
                         // linkage and are not exported unless marked with an extern
-                        // inidicator
+                        // indicator
                         && (!Instance::mono(tcx, def_id.to_def_id()).def.generates_cgu_internal_copy(tcx)
                             || tcx.codegen_fn_attrs(def_id.to_def_id()).contains_extern_indicator())
                     {
@@ -154,7 +154,7 @@ fn is_reachable_non_generic_provider_extern(tcx: TyCtxt<'_>, def_id: DefId) -> b
     tcx.reachable_non_generics(def_id.krate).contains_key(&def_id)
 }
 
-fn exported_symbols_provider_local(
+fn exported_symbols_provider_local<'tcx>(
     tcx: TyCtxt<'tcx>,
     cnum: CrateNum,
 ) -> &'tcx [(ExportedSymbol<'tcx>, SymbolExportLevel)] {
@@ -448,10 +448,7 @@ fn wasm_import_module_map(tcx: TyCtxt<'_>, cnum: CrateNum) -> FxHashMap<DefId, S
     let mut ret = FxHashMap::default();
     for (def_id, lib) in tcx.foreign_modules(cnum).iter() {
         let module = def_id_to_native_lib.get(&def_id).and_then(|s| s.wasm_import_module);
-        let module = match module {
-            Some(s) => s,
-            None => continue,
-        };
+        let Some(module) = module else { continue };
         ret.extend(lib.foreign_items.iter().map(|id| {
             assert_eq!(id.krate, cnum);
             (*id, module.to_string())

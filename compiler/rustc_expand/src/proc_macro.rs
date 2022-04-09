@@ -6,7 +6,7 @@ use rustc_ast::ptr::P;
 use rustc_ast::token;
 use rustc_ast::tokenstream::{CanSynthesizeMissingTokens, TokenStream, TokenTree};
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::ErrorReported;
+use rustc_errors::ErrorGuaranteed;
 use rustc_parse::nt_to_tokenstream;
 use rustc_parse::parser::ForceCollect;
 use rustc_span::{Span, DUMMY_SP};
@@ -23,7 +23,9 @@ impl base::ProcMacro for BangProcMacro {
         ecx: &'cx mut ExtCtxt<'_>,
         span: Span,
         input: TokenStream,
-    ) -> Result<TokenStream, ErrorReported> {
+    ) -> Result<TokenStream, ErrorGuaranteed> {
+        let _timer =
+            ecx.sess.prof.generic_activity_with_arg("expand_proc_macro", ecx.expansion_descr());
         let proc_macro_backtrace = ecx.ecfg.proc_macro_backtrace;
         let server = proc_macro_server::Rustc::new(ecx);
         self.client.run(&EXEC_STRATEGY, server, input, proc_macro_backtrace).map_err(|e| {
@@ -31,8 +33,7 @@ impl base::ProcMacro for BangProcMacro {
             if let Some(s) = e.as_str() {
                 err.help(&format!("message: {}", s));
             }
-            err.emit();
-            ErrorReported
+            err.emit()
         })
     }
 }
@@ -48,7 +49,9 @@ impl base::AttrProcMacro for AttrProcMacro {
         span: Span,
         annotation: TokenStream,
         annotated: TokenStream,
-    ) -> Result<TokenStream, ErrorReported> {
+    ) -> Result<TokenStream, ErrorGuaranteed> {
+        let _timer =
+            ecx.sess.prof.generic_activity_with_arg("expand_proc_macro", ecx.expansion_descr());
         let proc_macro_backtrace = ecx.ecfg.proc_macro_backtrace;
         let server = proc_macro_server::Rustc::new(ecx);
         self.client
@@ -58,8 +61,7 @@ impl base::AttrProcMacro for AttrProcMacro {
                 if let Some(s) = e.as_str() {
                     err.help(&format!("message: {}", s));
                 }
-                err.emit();
-                ErrorReported
+                err.emit()
             })
     }
 }
@@ -88,7 +90,7 @@ impl MultiItemModifier for ProcMacroDerive {
                 // A proc macro can't observe the fact that we're passing
                 // them an `NtStmt` - it can only see the underlying tokens
                 // of the wrapped item
-                token::NtStmt(stmt.into_inner())
+                token::NtStmt(stmt)
             }
             _ => unreachable!(),
         };
@@ -99,17 +101,21 @@ impl MultiItemModifier for ProcMacroDerive {
             nt_to_tokenstream(&item, &ecx.sess.parse_sess, CanSynthesizeMissingTokens::No)
         };
 
-        let proc_macro_backtrace = ecx.ecfg.proc_macro_backtrace;
-        let server = proc_macro_server::Rustc::new(ecx);
-        let stream = match self.client.run(&EXEC_STRATEGY, server, input, proc_macro_backtrace) {
-            Ok(stream) => stream,
-            Err(e) => {
-                let mut err = ecx.struct_span_err(span, "proc-macro derive panicked");
-                if let Some(s) = e.as_str() {
-                    err.help(&format!("message: {}", s));
+        let stream = {
+            let _timer =
+                ecx.sess.prof.generic_activity_with_arg("expand_proc_macro", ecx.expansion_descr());
+            let proc_macro_backtrace = ecx.ecfg.proc_macro_backtrace;
+            let server = proc_macro_server::Rustc::new(ecx);
+            match self.client.run(&EXEC_STRATEGY, server, input, proc_macro_backtrace) {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let mut err = ecx.struct_span_err(span, "proc-macro derive panicked");
+                    if let Some(s) = e.as_str() {
+                        err.help(&format!("message: {}", s));
+                    }
+                    err.emit();
+                    return ExpandResult::Ready(vec![]);
                 }
-                err.emit();
-                return ExpandResult::Ready(vec![]);
             }
         };
 

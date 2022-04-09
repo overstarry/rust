@@ -15,7 +15,7 @@ use crate::ty::subst::SubstsRef;
 use crate::ty::{self, AdtKind, Ty, TyCtxt};
 
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::{Applicability, DiagnosticBuilder};
+use rustc_errors::{Applicability, Diagnostic};
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_span::symbol::Symbol;
@@ -23,9 +23,7 @@ use rustc_span::{Span, DUMMY_SP};
 use smallvec::SmallVec;
 
 use std::borrow::Cow;
-use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::ops::Deref;
 
 pub use self::select::{EvaluationCache, EvaluationResult, OverflowError, SelectionCache};
 
@@ -80,38 +78,14 @@ pub enum Reveal {
 
 /// The reason why we incurred this obligation; used for error reporting.
 ///
-/// As the happy path does not care about this struct, storing this on the heap
-/// ends up increasing performance.
+/// Non-misc `ObligationCauseCode`s are stored on the heap. This gives the
+/// best trade-off between keeping the type small (which makes copies cheaper)
+/// while not doing too many heap allocations.
 ///
 /// We do not want to intern this as there are a lot of obligation causes which
 /// only live for a short period of time.
-#[derive(Clone, PartialEq, Eq, Hash, Lift)]
-pub struct ObligationCause<'tcx> {
-    /// `None` for `ObligationCause::dummy`, `Some` otherwise.
-    data: Option<Lrc<ObligationCauseData<'tcx>>>,
-}
-
-const DUMMY_OBLIGATION_CAUSE_DATA: ObligationCauseData<'static> =
-    ObligationCauseData { span: DUMMY_SP, body_id: hir::CRATE_HIR_ID, code: MiscObligation };
-
-// Correctly format `ObligationCause::dummy`.
-impl<'tcx> fmt::Debug for ObligationCause<'tcx> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ObligationCauseData::fmt(self, f)
-    }
-}
-
-impl Deref for ObligationCause<'tcx> {
-    type Target = ObligationCauseData<'tcx>;
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        self.data.as_deref().unwrap_or(&DUMMY_OBLIGATION_CAUSE_DATA)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Lift)]
-pub struct ObligationCauseData<'tcx> {
+pub struct ObligationCause<'tcx> {
     pub span: Span,
 
     /// The ID of the fn body that triggered this obligation. This is
@@ -122,16 +96,24 @@ pub struct ObligationCauseData<'tcx> {
     /// information.
     pub body_id: hir::HirId,
 
-    pub code: ObligationCauseCode<'tcx>,
+    /// `None` for `MISC_OBLIGATION_CAUSE_CODE` (a common case, occurs ~60% of
+    /// the time). `Some` otherwise.
+    code: Option<Lrc<ObligationCauseCode<'tcx>>>,
 }
 
-impl Hash for ObligationCauseData<'_> {
+// This custom hash function speeds up hashing for `Obligation` deduplication
+// greatly by skipping the `code` field, which can be large and complex. That
+// shouldn't affect hash quality much since there are several other fields in
+// `Obligation` which should be unique enough, especially the predicate itself
+// which is hashed as an interned pointer. See #90996.
+impl Hash for ObligationCause<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.body_id.hash(state);
         self.span.hash(state);
-        std::mem::discriminant(&self.code).hash(state);
     }
 }
+
+const MISC_OBLIGATION_CAUSE_CODE: ObligationCauseCode<'static> = MiscObligation;
 
 impl<'tcx> ObligationCause<'tcx> {
     #[inline]
@@ -140,28 +122,32 @@ impl<'tcx> ObligationCause<'tcx> {
         body_id: hir::HirId,
         code: ObligationCauseCode<'tcx>,
     ) -> ObligationCause<'tcx> {
-        ObligationCause { data: Some(Lrc::new(ObligationCauseData { span, body_id, code })) }
+        ObligationCause {
+            span,
+            body_id,
+            code: if code == MISC_OBLIGATION_CAUSE_CODE { None } else { Some(Lrc::new(code)) },
+        }
     }
 
     pub fn misc(span: Span, body_id: hir::HirId) -> ObligationCause<'tcx> {
         ObligationCause::new(span, body_id, MiscObligation)
     }
 
-    pub fn dummy_with_span(span: Span) -> ObligationCause<'tcx> {
-        ObligationCause::new(span, hir::CRATE_HIR_ID, MiscObligation)
-    }
-
     #[inline(always)]
     pub fn dummy() -> ObligationCause<'tcx> {
-        ObligationCause { data: None }
+        ObligationCause { span: DUMMY_SP, body_id: hir::CRATE_HIR_ID, code: None }
     }
 
-    pub fn make_mut(&mut self) -> &mut ObligationCauseData<'tcx> {
-        Lrc::make_mut(self.data.get_or_insert_with(|| Lrc::new(DUMMY_OBLIGATION_CAUSE_DATA)))
+    pub fn dummy_with_span(span: Span) -> ObligationCause<'tcx> {
+        ObligationCause { span, body_id: hir::CRATE_HIR_ID, code: None }
+    }
+
+    pub fn make_mut_code(&mut self) -> &mut ObligationCauseCode<'tcx> {
+        Lrc::make_mut(self.code.get_or_insert_with(|| Lrc::new(MISC_OBLIGATION_CAUSE_CODE)))
     }
 
     pub fn span(&self, tcx: TyCtxt<'tcx>) -> Span {
-        match self.code {
+        match *self.code() {
             ObligationCauseCode::CompareImplMethodObligation { .. }
             | ObligationCauseCode::MainFunctionType
             | ObligationCauseCode::StartFunctionType => {
@@ -172,6 +158,18 @@ impl<'tcx> ObligationCause<'tcx> {
                 ..
             }) => arm_span,
             _ => self.span,
+        }
+    }
+
+    #[inline]
+    pub fn code(&self) -> &ObligationCauseCode<'tcx> {
+        self.code.as_deref().unwrap_or(&MISC_OBLIGATION_CAUSE_CODE)
+    }
+
+    pub fn clone_code(&self) -> Lrc<ObligationCauseCode<'tcx>> {
+        match &self.code {
+            Some(code) => code.clone(),
+            None => Lrc::new(MISC_OBLIGATION_CAUSE_CODE),
         }
     }
 }
@@ -238,11 +236,12 @@ pub enum ObligationCauseCode<'tcx> {
     SizedBoxType,
     /// Inline asm operand type must be `Sized`.
     InlineAsmSized,
-    /// `[T, ..n]` implies that `T` must be `Copy`.
-    /// If the function in the array repeat expression is a `const fn`,
-    /// display a help message suggesting to move the function call to a
-    /// new `const` item while saying that `T` doesn't implement `Copy`.
-    RepeatVec(bool),
+    /// `[expr; N]` requires `type_of(expr): Copy`.
+    RepeatElementCopy {
+        /// If element is a `const fn` we display a help message suggesting to move the
+        /// function call to a new `const` item while saying that `T` doesn't implement `Copy`.
+        is_const_fn: bool,
+    },
 
     /// Types of fields (other than the last, except for packed structs) in a struct must be sized.
     FieldSized {
@@ -259,7 +258,7 @@ pub enum ObligationCauseCode<'tcx> {
 
     BuiltinDerivedObligation(DerivedObligationCause<'tcx>),
 
-    ImplDerivedObligation(DerivedObligationCause<'tcx>),
+    ImplDerivedObligation(Box<ImplDerivedObligationCause<'tcx>>),
 
     DerivedObligation(DerivedObligationCause<'tcx>),
 
@@ -277,18 +276,23 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// Error derived when matching traits/impls; see ObligationCause for more details
     CompareImplMethodObligation {
-        impl_item_def_id: DefId,
+        impl_item_def_id: LocalDefId,
         trait_item_def_id: DefId,
     },
 
     /// Error derived when matching traits/impls; see ObligationCause for more details
     CompareImplTypeObligation {
-        impl_item_def_id: DefId,
+        impl_item_def_id: LocalDefId,
         trait_item_def_id: DefId,
     },
 
-    /// Checking that this expression can be assigned where it needs to be
-    // FIXME(eddyb) #11161 is the original Expr required?
+    /// Checking that the bounds of a trait's associated type hold for a given impl
+    CheckAssociatedTypeBounds {
+        impl_item_def_id: LocalDefId,
+        trait_item_def_id: DefId,
+    },
+
+    /// Checking that this expression can be assigned to its target.
     ExprAssignable,
 
     /// Computing common supertype in the arms of a match expression
@@ -348,6 +352,12 @@ pub enum ObligationCauseCode<'tcx> {
     /// If `X` is the concrete type of an opaque type `impl Y`, then `X` must implement `Y`
     OpaqueType,
 
+    AwaitableExpr(Option<hir::HirId>),
+
+    ForLoopIterator,
+
+    QuestionMark,
+
     /// Well-formed checking. If a `WellFormedLoc` is provided,
     /// then it will be used to eprform HIR-based wf checking
     /// after an error occurs, in order to generate a more precise error span.
@@ -358,6 +368,11 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// From `match_impl`. The cause for us having to match an impl, and the DefId we are matching against.
     MatchImpl(ObligationCause<'tcx>, DefId),
+
+    BinOp {
+        rhs_span: Option<Span>,
+        is_lit: bool,
+    },
 }
 
 /// The 'location' at which we try to perform HIR-based wf checking.
@@ -381,16 +396,29 @@ pub enum WellFormedLoc {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Lift)]
+pub struct ImplDerivedObligationCause<'tcx> {
+    pub derived: DerivedObligationCause<'tcx>,
+    pub impl_def_id: DefId,
+    pub span: Span,
+}
+
 impl ObligationCauseCode<'_> {
     // Return the base obligation, ignoring derived obligations.
     pub fn peel_derives(&self) -> &Self {
         let mut base_cause = self;
-        while let BuiltinDerivedObligation(DerivedObligationCause { parent_code, .. })
-        | ImplDerivedObligation(DerivedObligationCause { parent_code, .. })
-        | DerivedObligation(DerivedObligationCause { parent_code, .. })
-        | FunctionArgumentObligation { parent_code, .. } = base_cause
-        {
-            base_cause = &parent_code;
+        loop {
+            match base_cause {
+                BuiltinDerivedObligation(DerivedObligationCause { parent_code, .. })
+                | DerivedObligation(DerivedObligationCause { parent_code, .. })
+                | FunctionArgumentObligation { parent_code, .. } => {
+                    base_cause = &parent_code;
+                }
+                ImplDerivedObligation(obligation_cause) => {
+                    base_cause = &*obligation_cause.derived.parent_code;
+                }
+                _ => break,
+            }
         }
         base_cause
     }
@@ -398,7 +426,7 @@ impl ObligationCauseCode<'_> {
 
 // `ObligationCauseCode` is used a lot. Make sure it doesn't unintentionally get bigger.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-static_assert_size!(ObligationCauseCode<'_>, 40);
+static_assert_size!(ObligationCauseCode<'_>, 48);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StatementAsExpression {
@@ -436,11 +464,11 @@ pub struct IfExpressionCause {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Lift)]
 pub struct DerivedObligationCause<'tcx> {
-    /// The trait reference of the parent obligation that led to the
+    /// The trait predicate of the parent obligation that led to the
     /// current obligation. Note that only trait obligations lead to
-    /// derived obligations, so we just store the trait reference here
+    /// derived obligations, so we just store the trait predicate here
     /// directly.
-    pub parent_trait_ref: ty::PolyTraitRef<'tcx>,
+    pub parent_trait_pred: ty::PolyTraitPredicate<'tcx>,
 
     /// The parent trait had this cause.
     pub parent_code: Lrc<ObligationCauseCode<'tcx>>,
@@ -463,7 +491,7 @@ pub enum SelectionError<'tcx> {
     /// A given constant couldn't be evaluated.
     NotConstEvaluatable(NotConstEvaluatable),
     /// Exceeded the recursion depth during type projection.
-    Overflow,
+    Overflow(OverflowError),
     /// Signaling that an error has already been emitted, to avoid
     /// multiple errors being shown.
     ErrorReporting,
@@ -496,7 +524,7 @@ pub type SelectionResult<'tcx, T> = Result<Option<T>, SelectionError<'tcx>>;
 ///     // Case A: ImplSource points at a specific impl. Only possible when
 ///     // type is concretely known. If the impl itself has bounded
 ///     // type parameters, ImplSource will carry resolutions for those as well:
-///     concrete.clone(); // ImpleSource(Impl_1, [ImplSource(Impl_2, [ImplSource(Impl_3)])])
+///     concrete.clone(); // ImplSource(Impl_1, [ImplSource(Impl_2, [ImplSource(Impl_3)])])
 ///
 ///     // Case A: ImplSource points at a specific impl. Only possible when
 ///     // type is concretely known. If the impl itself has bounded
@@ -562,7 +590,7 @@ pub enum ImplSource<'tcx, N> {
     TraitAlias(ImplSourceTraitAliasData<'tcx, N>),
 
     /// ImplSource for a `const Drop` implementation.
-    ConstDrop(ImplSourceConstDropData),
+    ConstDestruct(ImplSourceConstDestructData<N>),
 }
 
 impl<'tcx, N> ImplSource<'tcx, N> {
@@ -577,28 +605,28 @@ impl<'tcx, N> ImplSource<'tcx, N> {
             ImplSource::Object(d) => d.nested,
             ImplSource::FnPointer(d) => d.nested,
             ImplSource::DiscriminantKind(ImplSourceDiscriminantKindData)
-            | ImplSource::Pointee(ImplSourcePointeeData)
-            | ImplSource::ConstDrop(ImplSourceConstDropData) => Vec::new(),
+            | ImplSource::Pointee(ImplSourcePointeeData) => Vec::new(),
             ImplSource::TraitAlias(d) => d.nested,
             ImplSource::TraitUpcasting(d) => d.nested,
+            ImplSource::ConstDestruct(i) => i.nested,
         }
     }
 
     pub fn borrow_nested_obligations(&self) -> &[N] {
         match &self {
             ImplSource::UserDefined(i) => &i.nested[..],
-            ImplSource::Param(n, _) => &n[..],
-            ImplSource::Builtin(i) => &i.nested[..],
-            ImplSource::AutoImpl(d) => &d.nested[..],
-            ImplSource::Closure(c) => &c.nested[..],
-            ImplSource::Generator(c) => &c.nested[..],
-            ImplSource::Object(d) => &d.nested[..],
-            ImplSource::FnPointer(d) => &d.nested[..],
+            ImplSource::Param(n, _) => &n,
+            ImplSource::Builtin(i) => &i.nested,
+            ImplSource::AutoImpl(d) => &d.nested,
+            ImplSource::Closure(c) => &c.nested,
+            ImplSource::Generator(c) => &c.nested,
+            ImplSource::Object(d) => &d.nested,
+            ImplSource::FnPointer(d) => &d.nested,
             ImplSource::DiscriminantKind(ImplSourceDiscriminantKindData)
-            | ImplSource::Pointee(ImplSourcePointeeData)
-            | ImplSource::ConstDrop(ImplSourceConstDropData) => &[],
-            ImplSource::TraitAlias(d) => &d.nested[..],
-            ImplSource::TraitUpcasting(d) => &d.nested[..],
+            | ImplSource::Pointee(ImplSourcePointeeData) => &[],
+            ImplSource::TraitAlias(d) => &d.nested,
+            ImplSource::TraitUpcasting(d) => &d.nested,
+            ImplSource::ConstDestruct(i) => &i.nested,
         }
     }
 
@@ -657,8 +685,10 @@ impl<'tcx, N> ImplSource<'tcx, N> {
                     nested: d.nested.into_iter().map(f).collect(),
                 })
             }
-            ImplSource::ConstDrop(ImplSourceConstDropData) => {
-                ImplSource::ConstDrop(ImplSourceConstDropData)
+            ImplSource::ConstDestruct(i) => {
+                ImplSource::ConstDestruct(ImplSourceConstDestructData {
+                    nested: i.nested.into_iter().map(f).collect(),
+                })
             }
         }
     }
@@ -751,8 +781,10 @@ pub struct ImplSourceDiscriminantKindData;
 #[derive(Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, HashStable)]
 pub struct ImplSourcePointeeData;
 
-#[derive(Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, HashStable)]
-pub struct ImplSourceConstDropData;
+#[derive(Clone, PartialEq, Eq, TyEncodable, TyDecodable, HashStable, TypeFoldable, Lift)]
+pub struct ImplSourceConstDestructData<N> {
+    pub nested: Vec<N>,
+}
 
 #[derive(Clone, PartialEq, Eq, TyEncodable, TyDecodable, HashStable, TypeFoldable, Lift)]
 pub struct ImplSourceTraitAliasData<'tcx, N> {
@@ -829,7 +861,7 @@ impl ObjectSafetyViolation {
         }
     }
 
-    pub fn solution(&self, err: &mut DiagnosticBuilder<'_>) {
+    pub fn solution(&self, err: &mut Diagnostic) {
         match *self {
             ObjectSafetyViolation::SizedSelf(_) | ObjectSafetyViolation::SupertraitSelf(_) => {}
             ObjectSafetyViolation::Method(

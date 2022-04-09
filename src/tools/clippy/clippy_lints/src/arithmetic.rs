@@ -25,6 +25,7 @@ declare_clippy_lint! {
     /// # let a = 0;
     /// a + 1;
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub INTEGER_ARITHMETIC,
     restriction,
     "any integer arithmetic expression which could overflow or panic"
@@ -43,6 +44,7 @@ declare_clippy_lint! {
     /// # let a = 0.0;
     /// a + 1.0;
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub FLOAT_ARITHMETIC,
     restriction,
     "any floating-point arithmetic statement"
@@ -137,11 +139,11 @@ impl<'tcx> LateLintPass<'tcx> for Arithmetic {
     }
 
     fn check_body(&mut self, cx: &LateContext<'_>, body: &hir::Body<'_>) {
-        let body_owner = cx.tcx.hir().body_owner(body.id());
+        let body_owner = cx.tcx.hir().body_owner_def_id(body.id());
 
         match cx.tcx.hir().body_owner_kind(body_owner) {
             hir::BodyOwnerKind::Static(_) | hir::BodyOwnerKind::Const => {
-                let body_span = cx.tcx.hir().span(body_owner);
+                let body_span = cx.tcx.def_span(body_owner);
 
                 if let Some(span) = self.const_span {
                     if span.contains(body_span) {

@@ -1,3 +1,4 @@
+use cranelift_codegen::isa::TargetFrontendConfig;
 use rustc_index::vec::IndexVec;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers,
@@ -20,7 +21,7 @@ pub(crate) fn pointer_ty(tcx: TyCtxt<'_>) -> types::Type {
 }
 
 pub(crate) fn scalar_to_clif_type(tcx: TyCtxt<'_>, scalar: Scalar) -> Type {
-    match scalar.value {
+    match scalar.primitive() {
         Primitive::Int(int, _sign) => match int {
             Integer::I8 => types::I8,
             Integer::I16 => types::I16,
@@ -60,13 +61,13 @@ fn clif_type_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<types::Typ
         },
         ty::FnPtr(_) => pointer_ty(tcx),
         ty::RawPtr(TypeAndMut { ty: pointee_ty, mutbl: _ }) | ty::Ref(_, pointee_ty, _) => {
-            if has_ptr_meta(tcx, pointee_ty) {
+            if has_ptr_meta(tcx, *pointee_ty) {
                 return None;
             } else {
                 pointer_ty(tcx)
             }
         }
-        ty::Adt(adt_def, _) if adt_def.repr.simd() => {
+        ty::Adt(adt_def, _) if adt_def.repr().simd() => {
             let (element, count) = match &tcx.layout_of(ParamEnv::reveal_all().and(ty)).unwrap().abi
             {
                 Abi::Vector { element, count } => (element.clone(), *count),
@@ -89,17 +90,16 @@ fn clif_pair_type_from_ty<'tcx>(
     ty: Ty<'tcx>,
 ) -> Option<(types::Type, types::Type)> {
     Some(match ty.kind() {
-        ty::Tuple(substs) if substs.len() == 2 => {
-            let mut types = substs.types();
-            let a = clif_type_from_ty(tcx, types.next().unwrap())?;
-            let b = clif_type_from_ty(tcx, types.next().unwrap())?;
+        ty::Tuple(types) if types.len() == 2 => {
+            let a = clif_type_from_ty(tcx, types[0])?;
+            let b = clif_type_from_ty(tcx, types[1])?;
             if a.is_vector() || b.is_vector() {
                 return None;
             }
             (a, b)
         }
         ty::RawPtr(TypeAndMut { ty: pointee_ty, mutbl: _ }) | ty::Ref(_, pointee_ty, _) => {
-            if has_ptr_meta(tcx, pointee_ty) {
+            if has_ptr_meta(tcx, *pointee_ty) {
                 (pointer_ty(tcx), pointer_ty(tcx))
             } else {
                 return None;
@@ -235,7 +235,8 @@ pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
     pub(crate) cx: &'clif mut crate::CodegenCx<'tcx>,
     pub(crate) module: &'m mut dyn Module,
     pub(crate) tcx: TyCtxt<'tcx>,
-    pub(crate) pointer_type: Type, // Cached from module
+    pub(crate) target_config: TargetFrontendConfig, // Cached from module
+    pub(crate) pointer_type: Type,                  // Cached from module
     pub(crate) constants_cx: ConstantCx,
 
     pub(crate) instance: Instance<'tcx>,
@@ -255,8 +256,6 @@ pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
 
     /// This should only be accessed by `CPlace::new_var`.
     pub(crate) next_ssa_var: u32,
-
-    pub(crate) inline_asm_index: u32,
 }
 
 impl<'tcx> LayoutOfHelpers<'tcx> for FunctionCx<'_, '_, 'tcx> {
@@ -357,10 +356,6 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
             caller.col_display as u32 + 1,
         ));
         crate::constant::codegen_const_value(self, const_loc, self.tcx.caller_location_ty())
-    }
-
-    pub(crate) fn triple(&self) -> &target_lexicon::Triple {
-        self.module.isa().triple()
     }
 
     pub(crate) fn anonymous_str(&mut self, msg: &str) -> Value {

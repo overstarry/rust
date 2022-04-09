@@ -8,10 +8,10 @@ fn configure(cmd: &str, host: &[&str], target: &[&str]) -> Config {
     config.save_toolstates = None;
     config.dry_run = true;
     config.ninja_in_file = false;
-    // try to avoid spurious failures in dist where we create/delete each others file
     config.out = PathBuf::from(env::var_os("BOOTSTRAP_OUTPUT_DIRECTORY").unwrap());
     config.initial_rustc = PathBuf::from(env::var_os("RUSTC").unwrap());
     config.initial_cargo = PathBuf::from(env::var_os("BOOTSTRAP_INITIAL_CARGO").unwrap());
+    // try to avoid spurious failures in dist where we create/delete each others file
     let dir = config
         .out
         .join("tmp-rustbuild-tests")
@@ -499,7 +499,7 @@ mod dist {
         let host = TargetSelection::from_user("A");
 
         builder.run_step_descriptions(
-            &[StepDescription::from::<test::Crate>()],
+            &[StepDescription::from::<test::Crate>(Kind::Test)],
             &["library/std".into()],
         );
 
@@ -520,7 +520,7 @@ mod dist {
     #[test]
     fn test_exclude() {
         let mut config = configure(&["A"], &["A"]);
-        config.exclude = vec!["src/tools/tidy".into()];
+        config.exclude = vec![TaskPath::parse("src/tools/tidy")];
         config.cmd = Subcommand::Test {
             paths: Vec::new(),
             test_args: Vec::new(),

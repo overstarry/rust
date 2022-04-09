@@ -1,22 +1,19 @@
 use crate::base::ExtCtxt;
 
 use rustc_ast as ast;
-use rustc_ast::token::{self, Nonterminal, NtIdent};
+use rustc_ast::token;
 use rustc_ast::tokenstream::{self, CanSynthesizeMissingTokens};
 use rustc_ast::tokenstream::{DelimSpan, Spacing::*, TokenStream, TreeAndSpacing};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::Lrc;
-use rustc_errors::{Diagnostic, PResult};
-use rustc_lint_defs::builtin::PROC_MACRO_BACK_COMPAT;
-use rustc_lint_defs::BuiltinLintDiagnostics;
+use rustc_errors::{Diagnostic, MultiSpan, PResult};
 use rustc_parse::lexer::nfc_normalize;
 use rustc_parse::{nt_to_tokenstream, parse_stream_from_source_str};
 use rustc_session::parse::ParseSess;
 use rustc_span::def_id::CrateNum;
-use rustc_span::hygiene::ExpnKind;
 use rustc_span::symbol::{self, kw, sym, Symbol};
-use rustc_span::{BytePos, FileName, MultiSpan, Pos, RealFileName, SourceFile, Span};
+use rustc_span::{BytePos, FileName, Pos, SourceFile, Span};
 
 use pm::bridge::{server, TokenTree};
 use pm::{Delimiter, Level, LineColumn, Spacing};
@@ -158,7 +155,7 @@ impl FromInternal<(TreeAndSpacing, &'_ mut Vec<Self>, &mut Rustc<'_, '_>)>
                 for ch in data.as_str().chars() {
                     escaped.extend(ch.escape_debug());
                 }
-                let stream = vec![
+                let stream = [
                     Ident(sym::doc, false),
                     Eq,
                     TokenKind::lit(token::Str, Symbol::intern(&escaped), None),
@@ -178,10 +175,8 @@ impl FromInternal<(TreeAndSpacing, &'_ mut Vec<Self>, &mut Rustc<'_, '_>)>
                 tt!(Punct::new('#', false))
             }
 
-            Interpolated(nt)
-                if let Some((name, is_raw)) = ident_name_compatibility_hack(&nt, span, rustc) =>
-            {
-                TokenTree::Ident(Ident::new(rustc.sess(), name.name, is_raw, name.span))
+            Interpolated(nt) if let NtIdent(ident, is_raw) = *nt => {
+                TokenTree::Ident(Ident::new(rustc.sess(), ident.name, is_raw, ident.span))
             }
             Interpolated(nt) => {
                 let stream = nt_to_tokenstream(&nt, rustc.sess(), CanSynthesizeMissingTokens::No);
@@ -221,7 +216,7 @@ impl ToInternal<TokenStream> for TokenTree<Group, Punct, Ident, Literal> {
                 let integer = TokenKind::lit(token::Integer, symbol, suffix);
                 let a = tokenstream::TokenTree::token(minus, span);
                 let b = tokenstream::TokenTree::token(integer, span);
-                return vec![a, b].into_iter().collect();
+                return [a, b].into_iter().collect();
             }
             TokenTree::Literal(self::Literal {
                 lit: token::Lit { kind: token::Float, symbol, suffix },
@@ -232,7 +227,7 @@ impl ToInternal<TokenStream> for TokenTree<Group, Punct, Ident, Literal> {
                 let float = TokenKind::lit(token::Float, symbol, suffix);
                 let a = tokenstream::TokenTree::token(minus, span);
                 let b = tokenstream::TokenTree::token(float, span);
-                return vec![a, b].into_iter().collect();
+                return [a, b].into_iter().collect();
             }
             TokenTree::Literal(self::Literal { lit, span }) => {
                 return tokenstream::TokenTree::token(Literal(lit), span).into();
@@ -331,9 +326,9 @@ pub struct Ident {
 
 impl Ident {
     fn new(sess: &ParseSess, sym: Symbol, is_raw: bool, span: Span) -> Ident {
-        let sym = nfc_normalize(&sym.as_str());
+        let sym = nfc_normalize(sym.as_str());
         let string = sym.as_str();
-        if !rustc_lexer::is_ident(&string) {
+        if !rustc_lexer::is_ident(string) {
             panic!("`{:?}` is not a valid identifier", string)
         }
         if is_raw && !sym.can_be_raw() {
@@ -446,7 +441,9 @@ impl server::TokenStream for Rustc<'_, '_> {
             }
             expr
         };
-        let expr = expr.map_err(|mut err| err.emit())?;
+        let expr = expr.map_err(|mut err| {
+            err.emit();
+        })?;
 
         // Perform eager expansion on the expression.
         let expr = self
@@ -466,13 +463,12 @@ impl server::TokenStream for Rustc<'_, '_> {
             ast::ExprKind::Unary(ast::UnOp::Neg, e) => match &e.kind {
                 ast::ExprKind::Lit(l) => match l.token {
                     token::Lit { kind: token::Integer | token::Float, .. } => {
-                        Ok(std::array::IntoIter::new([
+                        Ok(Self::TokenStream::from_iter([
                             // FIXME: The span of the `-` token is lost when
                             // parsing, so we cannot faithfully recover it here.
                             tokenstream::TokenTree::token(token::BinOp(token::Minus), e.span),
                             tokenstream::TokenTree::token(token::Literal(l.token), l.span),
-                        ])
-                        .collect())
+                        ]))
                     }
                     _ => Err(()),
                 },
@@ -597,9 +593,8 @@ impl server::Literal for Rustc<'_, '_> {
         let minus_present = parser.eat(&token::BinOp(token::Minus));
 
         let lit_span = parser.token.span.data();
-        let mut lit = match parser.token.kind {
-            token::Literal(lit) => lit,
-            _ => return Err(()),
+        let token::Literal(mut lit) = parser.token.kind else {
+            return Err(());
         };
 
         // Check no comment or whitespace surrounding the (possibly negative)
@@ -663,16 +658,16 @@ impl server::Literal for Rustc<'_, '_> {
         self.lit(token::Float, Symbol::intern(n), Some(sym::f64))
     }
     fn string(&mut self, string: &str) -> Self::Literal {
-        let mut escaped = String::new();
-        for ch in string.chars() {
-            escaped.extend(ch.escape_debug());
-        }
-        self.lit(token::Str, Symbol::intern(&escaped), None)
+        let quoted = format!("{:?}", string);
+        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+        let symbol = &quoted[1..quoted.len() - 1];
+        self.lit(token::Str, Symbol::intern(symbol), None)
     }
     fn character(&mut self, ch: char) -> Self::Literal {
-        let mut escaped = String::new();
-        escaped.extend(ch.escape_unicode());
-        self.lit(token::Char, Symbol::intern(&escaped), None)
+        let quoted = format!("{:?}", ch);
+        assert!(quoted.starts_with('\'') && quoted.ends_with('\''));
+        let symbol = &quoted[1..quoted.len() - 1];
+        self.lit(token::Char, Symbol::intern(symbol), None)
     }
     fn byte_string(&mut self, bytes: &[u8]) -> Self::Literal {
         let string = bytes
@@ -771,8 +766,8 @@ impl server::Diagnostic for Rustc<'_, '_> {
     ) {
         diag.sub(level.to_internal(), msg, MultiSpan::from_spans(spans), None);
     }
-    fn emit(&mut self, diag: Self::Diagnostic) {
-        self.sess().span_diagnostic.emit_diagnostic(&diag);
+    fn emit(&mut self, mut diag: Self::Diagnostic) {
+        self.sess().span_diagnostic.emit_diagnostic(&mut diag);
     }
 }
 
@@ -847,7 +842,7 @@ impl server::Span for Rustc<'_, '_> {
     /// the `quote` proc-macro. This will save the span of
     /// "hello" into the metadata of `my_proc_macro`. As a result,
     /// the body of `my_proc_macro` (after expansion) will end
-    /// up containg a call that looks like this:
+    /// up containing a call that looks like this:
     /// `proc_macro::Ident::new("hello", proc_macro::Span::recover_proc_macro_span(0))`
     ///
     /// where `0` is the id returned by this function.
@@ -867,101 +862,4 @@ impl server::Span for Rustc<'_, '_> {
             resolver.get_proc_macro_quoted_span(krate, id).with_ctxt(def_site.ctxt())
         })
     }
-}
-
-// See issue #74616 for details
-fn ident_name_compatibility_hack(
-    nt: &Nonterminal,
-    orig_span: Span,
-    rustc: &mut Rustc<'_, '_>,
-) -> Option<(rustc_span::symbol::Ident, bool)> {
-    if let NtIdent(ident, is_raw) = nt {
-        if let ExpnKind::Macro(_, macro_name) = orig_span.ctxt().outer_expn_data().kind {
-            let source_map = rustc.sess().source_map();
-            let filename = source_map.span_to_filename(orig_span);
-            if let FileName::Real(RealFileName::LocalPath(path)) = filename {
-                let matches_prefix = |prefix, filename| {
-                    // Check for a path that ends with 'prefix*/src/<filename>'
-                    let mut iter = path.components().rev();
-                    iter.next().and_then(|p| p.as_os_str().to_str()) == Some(filename)
-                        && iter.next().and_then(|p| p.as_os_str().to_str()) == Some("src")
-                        && iter
-                            .next()
-                            .and_then(|p| p.as_os_str().to_str())
-                            .map_or(false, |p| p.starts_with(prefix))
-                };
-
-                let time_macros_impl =
-                    macro_name == sym::impl_macros && matches_prefix("time-macros-impl", "lib.rs");
-                let js_sys = macro_name == sym::arrays && matches_prefix("js-sys", "lib.rs");
-                if time_macros_impl || js_sys {
-                    let snippet = source_map.span_to_snippet(orig_span);
-                    if snippet.as_deref() == Ok("$name") {
-                        if time_macros_impl {
-                            rustc.sess().buffer_lint_with_diagnostic(
-                                &PROC_MACRO_BACK_COMPAT,
-                                orig_span,
-                                ast::CRATE_NODE_ID,
-                                "using an old version of `time-macros-impl`",
-                                BuiltinLintDiagnostics::ProcMacroBackCompat(
-                                "the `time-macros-impl` crate will stop compiling in futures version of Rust. \
-                                Please update to the latest version of the `time` crate to avoid breakage".to_string())
-                            );
-                            return Some((*ident, *is_raw));
-                        }
-                        if js_sys {
-                            if let Some(c) = path
-                                .components()
-                                .flat_map(|c| c.as_os_str().to_str())
-                                .find(|c| c.starts_with("js-sys"))
-                            {
-                                let mut version = c.trim_start_matches("js-sys-").split('.');
-                                if version.next() == Some("0")
-                                    && version.next() == Some("3")
-                                    && version
-                                        .next()
-                                        .and_then(|c| c.parse::<u32>().ok())
-                                        .map_or(false, |v| v < 40)
-                                {
-                                    rustc.sess().buffer_lint_with_diagnostic(
-                                        &PROC_MACRO_BACK_COMPAT,
-                                        orig_span,
-                                        ast::CRATE_NODE_ID,
-                                        "using an old version of `js-sys`",
-                                        BuiltinLintDiagnostics::ProcMacroBackCompat(
-                                        "older versions of the `js-sys` crate will stop compiling in future versions of Rust; \
-                                        please update to `js-sys` v0.3.40 or above".to_string())
-                                    );
-                                    return Some((*ident, *is_raw));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if macro_name == sym::tuple_from_req && matches_prefix("actix-web", "extract.rs") {
-                    let snippet = source_map.span_to_snippet(orig_span);
-                    if snippet.as_deref() == Ok("$T") {
-                        if let FileName::Real(RealFileName::LocalPath(macro_path)) =
-                            source_map.span_to_filename(rustc.def_site)
-                        {
-                            if macro_path.to_string_lossy().contains("pin-project-internal-0.") {
-                                rustc.sess().buffer_lint_with_diagnostic(
-                                    &PROC_MACRO_BACK_COMPAT,
-                                    orig_span,
-                                    ast::CRATE_NODE_ID,
-                                    "using an old version of `actix-web`",
-                                    BuiltinLintDiagnostics::ProcMacroBackCompat(
-                                    "the version of `actix-web` you are using might stop compiling in future versions of Rust; \
-                                    please update to the latest version of the `actix-web` crate to avoid breakage".to_string())
-                                );
-                                return Some((*ident, *is_raw));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
 }

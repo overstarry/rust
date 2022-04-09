@@ -5,6 +5,7 @@
 use self::EvaluationResult::*;
 
 use super::{SelectionError, SelectionResult};
+use rustc_errors::ErrorGuaranteed;
 
 use crate::ty;
 
@@ -12,12 +13,17 @@ use rustc_hir::def_id::DefId;
 use rustc_query_system::cache::Cache;
 
 pub type SelectionCache<'tcx> = Cache<
-    (ty::ConstnessAnd<ty::ParamEnvAnd<'tcx, ty::TraitRef<'tcx>>>, ty::ImplPolarity),
+    // This cache does not use `ParamEnvAnd` in its keys because `ParamEnv::and` can replace
+    // caller bounds with an empty list if the `TraitPredicate` looks global, which may happen
+    // after erasing lifetimes from the predicate.
+    (ty::ParamEnv<'tcx>, ty::TraitPredicate<'tcx>),
     SelectionResult<'tcx, SelectionCandidate<'tcx>>,
 >;
 
 pub type EvaluationCache<'tcx> = Cache<
-    (ty::ParamEnvAnd<'tcx, ty::ConstnessAnd<ty::PolyTraitRef<'tcx>>>, ty::ImplPolarity),
+    // See above: this cache does not use `ParamEnvAnd` in its keys due to sometimes incorrectly
+    // caching with the wrong `ParamEnv`.
+    (ty::ParamEnv<'tcx>, ty::PolyTraitPredicate<'tcx>),
     EvaluationResult,
 >;
 
@@ -103,7 +109,7 @@ pub enum SelectionCandidate<'tcx> {
         /// `false` if there are no *further* obligations.
         has_nested: bool,
     },
-    ParamCandidate((ty::ConstnessAnd<ty::PolyTraitRef<'tcx>>, ty::ImplPolarity)),
+    ParamCandidate(ty::PolyTraitPredicate<'tcx>),
     ImplCandidate(DefId),
     AutoImplCandidate(DefId),
 
@@ -148,8 +154,8 @@ pub enum SelectionCandidate<'tcx> {
 
     BuiltinUnsizeCandidate,
 
-    /// Implementation of `const Drop`.
-    ConstDropCandidate,
+    /// Implementation of `const Destruct`, optionally from a custom `impl const Drop`.
+    ConstDestructCandidate(Option<DefId>),
 }
 
 /// The result of trait evaluation. The order is important
@@ -266,14 +272,26 @@ impl EvaluationResult {
 /// Indicates that trait evaluation caused overflow and in which pass.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, HashStable)]
 pub enum OverflowError {
+    Error(ErrorGuaranteed),
     Canonical,
     ErrorReporting,
+}
+
+impl From<ErrorGuaranteed> for OverflowError {
+    fn from(e: ErrorGuaranteed) -> OverflowError {
+        OverflowError::Error(e)
+    }
+}
+
+TrivialTypeFoldableAndLiftImpls! {
+    OverflowError,
 }
 
 impl<'tcx> From<OverflowError> for SelectionError<'tcx> {
     fn from(overflow_error: OverflowError) -> SelectionError<'tcx> {
         match overflow_error {
-            OverflowError::Canonical => SelectionError::Overflow,
+            OverflowError::Error(e) => SelectionError::Overflow(OverflowError::Error(e)),
+            OverflowError::Canonical => SelectionError::Overflow(OverflowError::Canonical),
             OverflowError::ErrorReporting => SelectionError::ErrorReporting,
         }
     }

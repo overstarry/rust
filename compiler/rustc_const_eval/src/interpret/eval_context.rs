@@ -7,7 +7,11 @@ use rustc_hir::{self as hir, def_id::DefId, definitions::DefPathData};
 use rustc_index::vec::IndexVec;
 use rustc_macros::HashStable;
 use rustc_middle::mir;
-use rustc_middle::ty::layout::{self, LayoutError, LayoutOf, LayoutOfHelpers, TyAndLayout};
+use rustc_middle::mir::interpret::{InterpError, InvalidProgramInfo};
+use rustc_middle::ty::layout::{
+    self, FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOf, LayoutOfHelpers,
+    TyAndLayout,
+};
 use rustc_middle::ty::{
     self, query::TyCtxtAt, subst::SubstsRef, ParamEnv, Ty, TyCtxt, TypeFoldable,
 };
@@ -15,12 +19,12 @@ use rustc_mir_dataflow::storage::AlwaysLiveLocals;
 use rustc_query_system::ich::StableHashingContext;
 use rustc_session::Limit;
 use rustc_span::{Pos, Span};
-use rustc_target::abi::{Align, HasDataLayout, Size, TargetDataLayout};
+use rustc_target::abi::{call::FnAbi, Align, HasDataLayout, Size, TargetDataLayout};
 
 use super::{
     AllocId, GlobalId, Immediate, InterpErrorInfo, InterpResult, MPlaceTy, Machine, MemPlace,
-    MemPlaceMeta, Memory, MemoryKind, Operand, Place, PlaceTy, Pointer, Provenance, Scalar,
-    ScalarMaybeUninit, StackPopJump,
+    MemPlaceMeta, Memory, MemoryKind, Operand, Place, PlaceTy, PointerArithmetic, Provenance,
+    Scalar, ScalarMaybeUninit, StackPopJump,
 };
 use crate::transform::validate::equal_up_to_regions;
 
@@ -152,15 +156,15 @@ pub enum StackPopCleanup {
     /// `ret` stores the block we jump to on a normal return, while `unwind`
     /// stores the block used for cleanup during unwinding.
     Goto { ret: Option<mir::BasicBlock>, unwind: StackPopUnwind },
-    /// Just do nothing: Used by Main and for the `box_alloc` hook in miri.
+    /// The root frame of the stack: nowhere else to jump to.
     /// `cleanup` says whether locals are deallocated. Static computation
     /// wants them leaked to intern what they need (and just throw away
     /// the entire `ecx` when it is done).
-    None { cleanup: bool },
+    Root { cleanup: bool },
 }
 
 /// State of a local variable including a memoized layout
-#[derive(Clone, PartialEq, Eq, HashStable)]
+#[derive(Clone, Debug, PartialEq, Eq, HashStable)]
 pub struct LocalState<'tcx, Tag: Provenance = AllocId> {
     pub value: LocalValue<Tag>,
     /// Don't modify if `Some`, this is only used to prevent computing the layout twice
@@ -173,11 +177,10 @@ pub struct LocalState<'tcx, Tag: Provenance = AllocId> {
 pub enum LocalValue<Tag: Provenance = AllocId> {
     /// This local is not currently alive, and cannot be used at all.
     Dead,
-    /// This local is alive but not yet initialized. It can be written to
-    /// but not read from or its address taken. Locals get initialized on
-    /// first write because for unsized locals, we do not know their size
-    /// before that.
-    Uninitialized,
+    /// This local is alive but not yet allocated. It cannot be read from or have its address taken,
+    /// and will be allocated on the first write. This is to support unsized locals, where we cannot
+    /// know their size in advance.
+    Unallocated,
     /// A normal, live local.
     /// Mostly for convenience, we re-use the `Operand` type here.
     /// This is an optimization over just always having a pointer here;
@@ -194,7 +197,7 @@ impl<'tcx, Tag: Provenance + 'static> LocalState<'tcx, Tag> {
     pub fn access(&self) -> InterpResult<'tcx, Operand<Tag>> {
         match self.value {
             LocalValue::Dead => throw_ub!(DeadLocal),
-            LocalValue::Uninitialized => {
+            LocalValue::Unallocated => {
                 bug!("The type checker should prevent reading from a never-written local")
             }
             LocalValue::Live(val) => Ok(val),
@@ -212,8 +215,7 @@ impl<'tcx, Tag: Provenance + 'static> LocalState<'tcx, Tag> {
         match self.value {
             LocalValue::Dead => throw_ub!(DeadLocal),
             LocalValue::Live(Operand::Indirect(mplace)) => Ok(Err(mplace)),
-            ref mut
-            local @ (LocalValue::Live(Operand::Immediate(_)) | LocalValue::Uninitialized) => {
+            ref mut local @ (LocalValue::Live(Operand::Immediate(_)) | LocalValue::Unallocated) => {
                 Ok(Ok(local))
             }
         }
@@ -332,6 +334,24 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> LayoutOfHelpers<'tcx> for InterpC
     }
 }
 
+impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> FnAbiOfHelpers<'tcx> for InterpCx<'mir, 'tcx, M> {
+    type FnAbiOfResult = InterpResult<'tcx, &'tcx FnAbi<'tcx, Ty<'tcx>>>;
+
+    fn handle_fn_abi_err(
+        &self,
+        err: FnAbiError<'tcx>,
+        _span: Span,
+        _fn_abi_request: FnAbiRequest<'tcx>,
+    ) -> InterpErrorInfo<'tcx> {
+        match err {
+            FnAbiError::Layout(err) => err_inval!(Layout(err)).into(),
+            FnAbiError::AdjustForForeignAbi(err) => {
+                err_inval!(FnAbiAdjustForForeignAbi(err)).into()
+            }
+        }
+    }
+}
+
 /// Test if it is valid for a MIR assignment to assign `src`-typed place to `dest`-typed value.
 /// This test should be symmetric, as it is primarily about layout compatibility.
 pub(super) fn mir_assign_valid_types<'tcx>(
@@ -393,13 +413,12 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         root_span: Span,
         param_env: ty::ParamEnv<'tcx>,
         machine: M,
-        memory_extra: M::MemoryExtra,
     ) -> Self {
         InterpCx {
             machine,
             tcx: tcx.at(root_span),
             param_env,
-            memory: Memory::new(tcx, memory_extra),
+            memory: Memory::new(),
             recursion_limit: tcx.recursion_limit(),
         }
     }
@@ -411,25 +430,6 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             .rev()
             .find(|frame| !frame.instance.def.requires_caller_location(*self.tcx))
             .map_or(self.tcx.span, |f| f.current_span())
-    }
-
-    #[inline(always)]
-    pub fn scalar_to_ptr(&self, scalar: Scalar<M::PointerTag>) -> Pointer<Option<M::PointerTag>> {
-        self.memory.scalar_to_ptr(scalar)
-    }
-
-    /// Call this to turn untagged "global" pointers (obtained via `tcx`) into
-    /// the machine pointer to the allocation.  Must never be used
-    /// for any other pointers, nor for TLS statics.
-    ///
-    /// Using the resulting pointer represents a *direct* access to that memory
-    /// (e.g. by directly using a `static`),
-    /// as opposed to access through a pointer that was created by the program.
-    ///
-    /// This function can fail only if `ptr` points to an `extern static`.
-    #[inline(always)]
-    pub fn global_base_pointer(&self, ptr: Pointer) -> InterpResult<'tcx, Pointer<M::PointerTag>> {
-        self.memory.global_base_pointer(ptr)
     }
 
     #[inline(always)]
@@ -487,20 +487,18 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         instance: ty::InstanceDef<'tcx>,
         promoted: Option<mir::Promoted>,
     ) -> InterpResult<'tcx, &'tcx mir::Body<'tcx>> {
-        // do not continue if typeck errors occurred (can only occur in local crate)
         let def = instance.with_opt_param();
-        if let Some(def) = def.as_local() {
-            if self.tcx.has_typeck_results(def.did) {
-                if let Some(error_reported) = self.tcx.typeck_opt_const_arg(def).tainted_by_errors {
-                    throw_inval!(AlreadyReported(error_reported))
-                }
-            }
-        }
         trace!("load mir(instance={:?}, promoted={:?})", instance, promoted);
-        if let Some(promoted) = promoted {
-            return Ok(&self.tcx.promoted_mir_opt_const_arg(def)[promoted]);
+        let body = if let Some(promoted) = promoted {
+            &self.tcx.promoted_mir_opt_const_arg(def)[promoted]
+        } else {
+            M::load_mir(self, instance)?
+        };
+        // do not continue if typeck errors occurred (can only occur in local crate)
+        if let Some(err) = body.tainted_by_errors {
+            throw_inval!(AlreadyReported(err));
         }
-        M::load_mir(self, instance)
+        Ok(body)
     }
 
     /// Call this on things you got out of the MIR (so it is as generic as the current
@@ -508,7 +506,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     pub(super) fn subst_from_current_frame_and_normalize_erasing_regions<T: TypeFoldable<'tcx>>(
         &self,
         value: T,
-    ) -> T {
+    ) -> Result<T, InterpError<'tcx>> {
         self.subst_from_frame_and_normalize_erasing_regions(self.frame(), value)
     }
 
@@ -518,8 +516,18 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         &self,
         frame: &Frame<'mir, 'tcx, M::PointerTag, M::FrameExtra>,
         value: T,
-    ) -> T {
-        frame.instance.subst_mir_and_normalize_erasing_regions(*self.tcx, self.param_env, value)
+    ) -> Result<T, InterpError<'tcx>> {
+        frame
+            .instance
+            .try_subst_mir_and_normalize_erasing_regions(*self.tcx, self.param_env, value)
+            .or_else(|e| {
+                self.tcx.sess.delay_span_bug(
+                    self.cur_span(),
+                    format!("failed to normalize {}", e.get_type_for_failure()).as_str(),
+                );
+
+                Err(InterpError::InvalidProgram(InvalidProgramInfo::TooGeneric))
+            })
     }
 
     /// The `substs` are assumed to already be in our interpreter "universe" (param_env).
@@ -554,7 +562,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let layout = from_known_layout(self.tcx, self.param_env, layout, || {
                     let local_ty = frame.body.local_decls[local].ty;
                     let local_ty =
-                        self.subst_from_frame_and_normalize_erasing_regions(frame, local_ty);
+                        self.subst_from_frame_and_normalize_erasing_regions(frame, local_ty)?;
                     self.layout_of(local_ty)
                 })?;
                 if let Some(state) = frame.locals.get(local) {
@@ -601,25 +609,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 // the last field).  Can't have foreign types here, how would we
                 // adjust alignment and size for them?
                 let field = layout.field(self, layout.fields.count() - 1);
-                let (unsized_size, unsized_align) =
-                    match self.size_and_align_of(metadata, &field)? {
-                        Some(size_and_align) => size_and_align,
-                        None => {
-                            // A field with extern type.  If this field is at offset 0, we behave
-                            // like the underlying extern type.
-                            // FIXME: Once we have made decisions for how to handle size and alignment
-                            // of `extern type`, this should be adapted.  It is just a temporary hack
-                            // to get some code to work that probably ought to work.
-                            if sized_size == Size::ZERO {
-                                return Ok(None);
-                            } else {
-                                span_bug!(
-                                    self.cur_span(),
-                                    "Fields cannot be extern types, unless they are at offset 0"
-                                )
-                            }
-                        }
-                    };
+                let Some((unsized_size, unsized_align)) = self.size_and_align_of(metadata, &field)? else {
+                    // A field with an extern type. We don't know the actual dynamic size
+                    // or the alignment.
+                    return Ok(None);
+                };
 
                 // FIXME (#26403, #27023): We should be adding padding
                 // to `sized_size` (to accommodate the `unsized_align`
@@ -640,7 +634,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let size = size.align_to(align);
 
                 // Check if this brought us over the size limit.
-                if size.bytes() >= self.tcx.data_layout.obj_size_bound() {
+                if size > self.max_size_of_val() {
                     throw_ub!(InvalidMeta("total size is bigger than largest supported object"));
                 }
                 Ok(Some((size, align)))
@@ -656,9 +650,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let elem = layout.field(self, 0);
 
                 // Make sure the slice is not too big.
-                let size = elem.size.checked_mul(len, self).ok_or_else(|| {
-                    err_ub!(InvalidMeta("slice is bigger than largest supported object"))
-                })?;
+                let size = elem.size.bytes().saturating_mul(len); // we rely on `max_size_of_val` being smaller than `u64::MAX`.
+                let size = Size::from_bytes(size);
+                if size > self.max_size_of_val() {
+                    throw_ub!(InvalidMeta("slice is bigger than largest supported object"));
+                }
                 Ok(Some((size, elem.align.abi)))
             }
 
@@ -675,6 +671,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         self.size_and_align_of(&mplace.meta, &mplace.layout)
     }
 
+    #[instrument(skip(self, body, return_place, return_to_block), level = "debug")]
     pub fn push_stack_frame(
         &mut self,
         instance: ty::Instance<'tcx>,
@@ -682,6 +679,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         return_place: Option<&PlaceTy<'tcx, M::PointerTag>>,
         return_to_block: StackPopCleanup,
     ) -> InterpResult<'tcx> {
+        debug!("body: {:#?}", body);
         // first push a stack frame so we have access to the local substs
         let pre_frame = Frame {
             body,
@@ -702,7 +700,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         for const_ in &body.required_consts {
             let span = const_.span;
             let const_ =
-                self.subst_from_current_frame_and_normalize_erasing_regions(const_.literal);
+                self.subst_from_current_frame_and_normalize_erasing_regions(const_.literal)?;
             self.mir_const_to_op(&const_, None).map_err(|err| {
                 // If there was an error, set the span of the current frame to this constant.
                 // Avoiding doing this when evaluation succeeds.
@@ -711,8 +709,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             })?;
         }
 
-        // Locals are initially uninitialized.
-        let dummy = LocalState { value: LocalValue::Uninitialized, layout: Cell::new(None) };
+        // Locals are initially unallocated.
+        let dummy = LocalState { value: LocalValue::Unallocated, layout: Cell::new(None) };
         let mut locals = IndexVec::from_elem(dummy, &body.local_decls);
 
         // Now mark those locals as dead that we do not want to initialize
@@ -785,6 +783,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// `Drop` impls for any locals that have been initialized at this point.
     /// The cleanup block ends with a special `Resume` terminator, which will
     /// cause us to continue unwinding.
+    #[instrument(skip(self), level = "debug")]
     pub(super) fn pop_stack_frame(&mut self, unwinding: bool) -> InterpResult<'tcx> {
         info!(
             "popping stack frame ({})",
@@ -827,7 +826,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         // because this is CTFE and the final value will be thoroughly validated anyway.
         let cleanup = match return_to_block {
             StackPopCleanup::Goto { .. } => true,
-            StackPopCleanup::None { cleanup, .. } => cleanup,
+            StackPopCleanup::Root { cleanup, .. } => cleanup,
         };
 
         if !cleanup {
@@ -836,6 +835,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // Leak the locals, skip validation, skip machine hook.
             return Ok(());
         }
+
+        debug!("locals: {:#?}", frame.locals);
 
         // Cleanup: deallocate all locals that are backed by an allocation.
         for local in &frame.locals {
@@ -852,8 +853,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // Follow the unwind edge.
             let unwind = match return_to_block {
                 StackPopCleanup::Goto { unwind, .. } => unwind,
-                StackPopCleanup::None { .. } => {
-                    panic!("Encountered StackPopCleanup::None when unwinding!")
+                StackPopCleanup::Root { .. } => {
+                    panic!("encountered StackPopCleanup::Root when unwinding!")
                 }
             };
             self.unwind_to_block(unwind)
@@ -861,7 +862,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // Follow the normal return edge.
             match return_to_block {
                 StackPopCleanup::Goto { ret, .. } => self.return_to_block(ret),
-                StackPopCleanup::None { .. } => Ok(()),
+                StackPopCleanup::Root { .. } => {
+                    assert!(
+                        self.stack().is_empty(),
+                        "only the topmost frame can have StackPopCleanup::Root"
+                    );
+                    Ok(())
+                }
             }
         }
     }
@@ -871,7 +878,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         assert!(local != mir::RETURN_PLACE, "Cannot make return place live");
         trace!("{:?} is now live", local);
 
-        let local_val = LocalValue::Uninitialized;
+        let local_val = LocalValue::Unallocated;
         // StorageLive expects the local to be dead, and marks it live.
         let old = mem::replace(&mut self.frame_mut().locals[local].value, local_val);
         if !matches!(old, LocalValue::Dead) {
@@ -890,6 +897,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         Ok(())
     }
 
+    #[instrument(skip(self), level = "debug")]
     fn deallocate_local(&mut self, local: LocalValue<M::PointerTag>) -> InterpResult<'tcx> {
         if let LocalValue::Live(Operand::Indirect(MemPlace { ptr, .. })) = local {
             // All locals have a backing allocation, even if the allocation is empty
@@ -897,9 +905,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             trace!(
                 "deallocating local {:?}: {:?}",
                 local,
-                self.memory.dump_alloc(ptr.provenance.unwrap().get_alloc_id())
+                self.dump_alloc(ptr.provenance.unwrap().get_alloc_id())
             );
-            self.memory.deallocate(ptr, None, MemoryKind::Stack)?;
+            self.deallocate_ptr(ptr, None, MemoryKind::Stack)?;
         };
         Ok(())
     }
@@ -918,12 +926,13 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         } else {
             self.param_env
         };
+        let param_env = param_env.with_const();
         let val = self.tcx.eval_to_allocation_raw(param_env.and(gid))?;
         self.raw_const_to_mplace(val)
     }
 
     #[must_use]
-    pub fn dump_place(&'a self, place: Place<M::PointerTag>) -> PlacePrinter<'a, 'mir, 'tcx, M> {
+    pub fn dump_place(&self, place: Place<M::PointerTag>) -> PlacePrinter<'_, 'mir, 'tcx, M> {
         PlacePrinter { ecx: self, place }
     }
 
@@ -973,7 +982,7 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> std::fmt::Debug
 
                 match self.ecx.stack()[frame].locals[local].value {
                     LocalValue::Dead => write!(fmt, " is dead")?,
-                    LocalValue::Uninitialized => write!(fmt, " is uninitialized")?,
+                    LocalValue::Unallocated => write!(fmt, " is unallocated")?,
                     LocalValue::Live(Operand::Indirect(mplace)) => {
                         write!(
                             fmt,
@@ -1004,7 +1013,7 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> std::fmt::Debug
                     }
                 }
 
-                write!(fmt, ": {:?}", self.ecx.memory.dump_allocs(allocs))
+                write!(fmt, ": {:?}", self.ecx.dump_allocs(allocs))
             }
             Place::Ptr(mplace) => match mplace.ptr.provenance.map(Provenance::get_alloc_id) {
                 Some(alloc_id) => write!(
@@ -1012,7 +1021,7 @@ impl<'a, 'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> std::fmt::Debug
                     "by align({}) ref {:?}: {:?}",
                     mplace.align.bytes(),
                     mplace.ptr,
-                    self.ecx.memory.dump_alloc(alloc_id)
+                    self.ecx.dump_alloc(alloc_id)
                 ),
                 ptr => write!(fmt, " integral by ref: {:?}", ptr),
             },

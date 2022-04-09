@@ -1,3 +1,7 @@
+// revisions: base nll
+// ignore-compare-mode-nll
+//[nll] compile-flags: -Z borrowck=mir
+
 #![allow(dead_code)]
 
 fn non_elidable<'a, 'b>(a: &'a u8, b: &'b u8) -> &'a u8 {
@@ -14,15 +18,23 @@ struct SomeStruct<'x, 'y, 'z: 'x> {
     f: &'y dyn for<'a, 'b> Fn(&'a Foo<'b>) -> &'a Foo<'b>,
 }
 
+// Without this, the wf-check will fail early so we'll never see the
+// error in SOME_STRUCT's body.
+unsafe impl<'x, 'y, 'z: 'x> Sync for SomeStruct<'x, 'y, 'z> {}
+
 fn id<T>(t: T) -> T {
     t
 }
 
 static SOME_STRUCT: &SomeStruct = &SomeStruct {
+    //[nll]~^ ERROR mismatched types
+    //[nll]~| ERROR mismatched types
+    //[nll]~| ERROR implementation of `FnOnce` is not general enough
+    //[nll]~| ERROR implementation of `FnOnce` is not general enough
     foo: &Foo { bools: &[false, true] },
     bar: &Bar { bools: &[true, true] },
     f: &id,
-    //~^ ERROR implementation of `FnOnce` is not general enough
+    //[base]~^ ERROR implementation of `FnOnce` is not general enough
 };
 
 // very simple test for a 'static static with default lifetime

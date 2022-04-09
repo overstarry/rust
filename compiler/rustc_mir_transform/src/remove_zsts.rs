@@ -8,6 +8,10 @@ use rustc_middle::ty::{self, Ty, TyCtxt};
 pub struct RemoveZsts;
 
 impl<'tcx> MirPass<'tcx> for RemoveZsts {
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.mir_opt_level() > 0
+    }
+
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         // Avoid query cycles (generators require optimized MIR for layout).
         if tcx.type_of(body.source.def_id()).is_generator() {
@@ -22,9 +26,8 @@ impl<'tcx> MirPass<'tcx> for RemoveZsts {
                     if !maybe_zst(place_ty) {
                         continue;
                     }
-                    let layout = match tcx.layout_of(param_env.and(place_ty)) {
-                        Ok(layout) => layout,
-                        Err(_) => continue,
+                    let Ok(layout) = tcx.layout_of(param_env.and(place_ty)) else {
+                        continue;
                     };
                     if !layout.is_zst() {
                         continue;

@@ -62,7 +62,7 @@
 //!
 //! Note: we will often abbreviate "constructor" as "ctor".
 //!
-//! The idea that powers everything that is done in this file is the following: a (matcheable)
+//! The idea that powers everything that is done in this file is the following: a (matchable)
 //! value is made from a constructor applied to a number of subvalues. Examples of constructors are
 //! `Some`, `None`, `(,)` (the 2-tuple constructor), `Foo {..}` (the constructor for a struct
 //! `Foo`), and `2` (the constructor for the number `2`). This is natural when we think of
@@ -71,7 +71,7 @@
 //! Some of the ctors listed above might feel weird: `None` and `2` don't take any arguments.
 //! That's ok: those are ctors that take a list of 0 arguments; they are the simplest case of
 //! ctors. We treat `2` as a ctor because `u64` and other number types behave exactly like a huge
-//! `enum`, with one variant for each number. This allows us to see any matcheable value as made up
+//! `enum`, with one variant for each number. This allows us to see any matchable value as made up
 //! from a tree of ctors, each having a set number of children. For example: `Foo { bar: None,
 //! baz: Ok(0) }` is made from 4 different ctors, namely `Foo{..}`, `None`, `Ok` and `0`.
 //!
@@ -289,6 +289,7 @@ use super::deconstruct_pat::{Constructor, DeconstructedPat, Fields, SplitWildcar
 use rustc_data_structures::captures::Captures;
 
 use rustc_arena::TypedArena;
+use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hir::def_id::DefId;
 use rustc_hir::HirId;
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -324,7 +325,7 @@ impl<'a, 'tcx> MatchCheckCtxt<'a, 'tcx> {
     pub(super) fn is_foreign_non_exhaustive_enum(&self, ty: Ty<'tcx>) -> bool {
         match ty.kind() {
             ty::Adt(def, ..) => {
-                def.is_enum() && def.is_variant_list_non_exhaustive() && !def.did.is_local()
+                def.is_enum() && def.is_variant_list_non_exhaustive() && !def.did().is_local()
             }
             _ => false,
         }
@@ -341,7 +342,7 @@ pub(super) struct PatCtxt<'a, 'p, 'tcx> {
     /// Whether the current pattern is the whole pattern as found in a match arm, or if it's a
     /// subpattern.
     pub(super) is_top_level: bool,
-    /// Wether the current pattern is from a `non_exhaustive` enum.
+    /// Whether the current pattern is from a `non_exhaustive` enum.
     pub(super) is_non_exhaustive: bool,
 }
 
@@ -808,8 +809,9 @@ fn is_useful<'p, 'tcx>(
         // We try each or-pattern branch in turn.
         let mut matrix = matrix.clone();
         for v in v.expand_or_pat() {
-            let usefulness =
-                is_useful(cx, &matrix, &v, witness_preference, hir_id, is_under_guard, false);
+            let usefulness = ensure_sufficient_stack(|| {
+                is_useful(cx, &matrix, &v, witness_preference, hir_id, is_under_guard, false)
+            });
             ret.extend(usefulness);
             // If pattern has a guard don't add it to the matrix.
             if !is_under_guard {
@@ -840,8 +842,9 @@ fn is_useful<'p, 'tcx>(
             // We cache the result of `Fields::wildcards` because it is used a lot.
             let spec_matrix = start_matrix.specialize_constructor(pcx, &ctor);
             let v = v.pop_head_constructor(cx, &ctor);
-            let usefulness =
-                is_useful(cx, &spec_matrix, &v, witness_preference, hir_id, is_under_guard, false);
+            let usefulness = ensure_sufficient_stack(|| {
+                is_useful(cx, &spec_matrix, &v, witness_preference, hir_id, is_under_guard, false)
+            });
             let usefulness = usefulness.apply_constructor(pcx, start_matrix, &ctor);
 
             // When all the conditions are met we have a match with a `non_exhaustive` enum

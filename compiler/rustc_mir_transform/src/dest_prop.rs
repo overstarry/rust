@@ -38,12 +38,6 @@
 //!   It must also not contain any indexing projections, since those take an arbitrary `Local` as
 //!   the index, and that local might only be initialized shortly before `dest` is used.
 //!
-//!   Subtle case: If `dest` is a, or projects through a union, then we have to make sure that there
-//!   remains an assignment to it, since that sets the "active field" of the union. But if `src` is
-//!   a ZST, it might not be initialized, so there might not be any use of it before the assignment,
-//!   and performing the optimization would simply delete the assignment, leaving `dest`
-//!   uninitialized.
-//!
 //! * `src` must be a bare `Local` without any indirections or field projections (FIXME: Is this a
 //!   fundamental restriction or just current impl state?). It can be copied or moved by the
 //!   assignment.
@@ -103,7 +97,6 @@ use rustc_index::{
     bit_set::{BitMatrix, BitSet},
     vec::IndexVec,
 };
-use rustc_middle::mir::tcx::PlaceTy;
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext, Visitor};
 use rustc_middle::mir::{dump_mir, PassWhere};
 use rustc_middle::mir::{
@@ -124,21 +117,18 @@ const MAX_BLOCKS: usize = 250;
 pub struct DestinationPropagation;
 
 impl<'tcx> MirPass<'tcx> for DestinationPropagation {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        //  FIXME(#79191, #82678)
-        if !tcx.sess.opts.debugging_opts.unsound_mir_opts {
-            return;
-        }
-
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        //  FIXME(#79191, #82678): This is unsound.
+        //
         // Only run at mir-opt-level=3 or higher for now (we don't fix up debuginfo and remove
         // storage statements at the moment).
-        if tcx.sess.mir_opt_level() < 3 {
-            return;
-        }
+        sess.opts.debugging_opts.unsound_mir_opts && sess.mir_opt_level() >= 3
+    }
 
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let def_id = body.source.def_id();
 
-        let candidates = find_candidates(tcx, body);
+        let candidates = find_candidates(body);
         if candidates.is_empty() {
             debug!("{:?}: no dest prop candidates, done", def_id);
             return;
@@ -225,9 +215,11 @@ impl From<Local> for UnifyLocal {
 
 impl UnifyKey for UnifyLocal {
     type Value = ();
+    #[inline]
     fn index(&self) -> u32 {
         self.0.as_u32()
     }
+    #[inline]
     fn from_index(u: u32) -> Self {
         Self(Local::from_u32(u))
     }
@@ -244,7 +236,7 @@ struct Replacements<'tcx> {
     kill: BitSet<Local>,
 }
 
-impl Replacements<'tcx> {
+impl<'tcx> Replacements<'tcx> {
     fn new(locals: usize) -> Self {
         Self { map: IndexVec::from_elem_n(None, locals), kill: BitSet::new_empty(locals) }
     }
@@ -301,7 +293,7 @@ struct Replacer<'tcx> {
 }
 
 impl<'tcx> MutVisitor<'tcx> for Replacer<'tcx> {
-    fn tcx<'a>(&'a self) -> TyCtxt<'tcx> {
+    fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -313,28 +305,6 @@ impl<'tcx> MutVisitor<'tcx> for Replacer<'tcx> {
                 context,
                 location,
             );
-        }
-    }
-
-    fn process_projection_elem(
-        &mut self,
-        elem: PlaceElem<'tcx>,
-        _: Location,
-    ) -> Option<PlaceElem<'tcx>> {
-        match elem {
-            PlaceElem::Index(local) => {
-                if let Some(replacement) = self.replacements.for_src(local) {
-                    bug!(
-                        "cannot replace {:?} with {:?} in index projection {:?}",
-                        local,
-                        replacement,
-                        elem,
-                    );
-                } else {
-                    None
-                }
-            }
-            _ => None,
         }
     }
 
@@ -397,7 +367,7 @@ struct Conflicts<'a> {
     unified_locals: InPlaceUnificationTable<UnifyLocal>,
 }
 
-impl Conflicts<'a> {
+impl<'a> Conflicts<'a> {
     fn build<'tcx>(
         tcx: TyCtxt<'tcx>,
         body: &'_ Body<'tcx>,
@@ -559,25 +529,6 @@ impl Conflicts<'a> {
             // eliminate the resulting self-assignments automatically.
             StatementKind::Assign(_) => {}
 
-            StatementKind::LlvmInlineAsm(asm) => {
-                // Inputs and outputs must not overlap.
-                for (_, input) in &*asm.inputs {
-                    if let Some(in_place) = input.place() {
-                        if !in_place.is_indirect() {
-                            for out_place in &*asm.outputs {
-                                if !out_place.is_indirect() && !in_place.is_indirect() {
-                                    self.record_local_conflict(
-                                        in_place.local,
-                                        out_place.local,
-                                        "aliasing llvm_asm! operands",
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             StatementKind::SetDiscriminant { .. }
             | StatementKind::StorageLive(..)
             | StatementKind::StorageDead(..)
@@ -598,14 +549,15 @@ impl Conflicts<'a> {
                 target: _,
                 unwind: _,
             } => {
-                if let Some(place) = value.place() {
-                    if !place.is_indirect() && !dropped_place.is_indirect() {
-                        self.record_local_conflict(
-                            place.local,
-                            dropped_place.local,
-                            "DropAndReplace operand overlap",
-                        );
-                    }
+                if let Some(place) = value.place()
+                    && !place.is_indirect()
+                    && !dropped_place.is_indirect()
+                {
+                    self.record_local_conflict(
+                        place.local,
+                        dropped_place.local,
+                        "DropAndReplace operand overlap",
+                    );
                 }
             }
             TerminatorKind::Yield { value, resume: _, resume_arg, drop: _ } => {
@@ -646,6 +598,7 @@ impl Conflicts<'a> {
                 options: _,
                 line_spans: _,
                 destination: _,
+                cleanup: _,
             } => {
                 // The intended semantics here aren't documented, we just assume that nothing that
                 // could be written to by the assembly may overlap with any other operands.
@@ -662,14 +615,15 @@ impl Conflicts<'a> {
                             for op in operands {
                                 match op {
                                     InlineAsmOperand::In { reg: _, value } => {
-                                        if let Some(p) = value.place() {
-                                            if !p.is_indirect() && !dest_place.is_indirect() {
-                                                self.record_local_conflict(
-                                                    p.local,
-                                                    dest_place.local,
-                                                    "asm! operand overlap",
-                                                );
-                                            }
+                                        if let Some(p) = value.place()
+                                            && !p.is_indirect()
+                                            && !dest_place.is_indirect()
+                                        {
+                                            self.record_local_conflict(
+                                                p.local,
+                                                dest_place.local,
+                                                "asm! operand overlap",
+                                            );
                                         }
                                     }
                                     InlineAsmOperand::Out {
@@ -691,24 +645,26 @@ impl Conflicts<'a> {
                                         in_value,
                                         out_place,
                                     } => {
-                                        if let Some(place) = in_value.place() {
-                                            if !place.is_indirect() && !dest_place.is_indirect() {
-                                                self.record_local_conflict(
-                                                    place.local,
-                                                    dest_place.local,
-                                                    "asm! operand overlap",
-                                                );
-                                            }
+                                        if let Some(place) = in_value.place()
+                                            && !place.is_indirect()
+                                            && !dest_place.is_indirect()
+                                        {
+                                            self.record_local_conflict(
+                                                place.local,
+                                                dest_place.local,
+                                                "asm! operand overlap",
+                                            );
                                         }
 
-                                        if let Some(place) = out_place {
-                                            if !place.is_indirect() && !dest_place.is_indirect() {
-                                                self.record_local_conflict(
-                                                    place.local,
-                                                    dest_place.local,
-                                                    "asm! operand overlap",
-                                                );
-                                            }
+                                        if let Some(place) = out_place
+                                            && !place.is_indirect()
+                                            && !dest_place.is_indirect()
+                                        {
+                                            self.record_local_conflict(
+                                                place.local,
+                                                dest_place.local,
+                                                "asm! operand overlap",
+                                            );
                                         }
                                     }
                                     InlineAsmOperand::Out { reg: _, late: _, place: None }
@@ -844,12 +800,8 @@ struct CandidateAssignment<'tcx> {
 /// comment) and also throw out assignments that involve a local that has its address taken or is
 /// otherwise ineligible (eg. locals used as array indices are ignored because we cannot propagate
 /// arbitrary places into array indices).
-fn find_candidates<'a, 'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &'a Body<'tcx>,
-) -> Vec<CandidateAssignment<'tcx>> {
+fn find_candidates<'tcx>(body: &Body<'tcx>) -> Vec<CandidateAssignment<'tcx>> {
     let mut visitor = FindAssignments {
-        tcx,
         body,
         candidates: Vec::new(),
         ever_borrowed_locals: ever_borrowed_locals(body),
@@ -860,14 +812,13 @@ fn find_candidates<'a, 'tcx>(
 }
 
 struct FindAssignments<'a, 'tcx> {
-    tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
     candidates: Vec<CandidateAssignment<'tcx>>,
     ever_borrowed_locals: BitSet<Local>,
     locals_used_as_array_index: BitSet<Local>,
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for FindAssignments<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for FindAssignments<'_, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         if let StatementKind::Assign(box (
             dest,
@@ -889,10 +840,11 @@ impl<'a, 'tcx> Visitor<'tcx> for FindAssignments<'a, 'tcx> {
                 return;
             }
 
-            // Can't optimize if both locals ever have their address taken (can introduce
-            // aliasing).
-            // FIXME: This can be smarter and take `StorageDead` into account (which
-            // invalidates borrows).
+            // Can't optimize if either local ever has their address taken. This optimization does
+            // liveness analysis only based on assignments, and a local can be live even if its
+            // never assigned to again, because a reference to it might be live.
+            // FIXME: This can be smarter and take `StorageDead` into  account (which invalidates
+            // borrows).
             if self.ever_borrowed_locals.contains(dest.local)
                 || self.ever_borrowed_locals.contains(src.local)
             {
@@ -906,20 +858,9 @@ impl<'a, 'tcx> Visitor<'tcx> for FindAssignments<'a, 'tcx> {
                 return;
             }
 
-            // Handle the "subtle case" described above by rejecting any `dest` that is or
-            // projects through a union.
-            let mut place_ty = PlaceTy::from_ty(self.body.local_decls[dest.local].ty);
-            if place_ty.ty.is_union() {
-                return;
-            }
             for elem in dest.projection {
                 if let PlaceElem::Index(_) = elem {
                     // `dest` contains an indexing projection.
-                    return;
-                }
-
-                place_ty = place_ty.projection_ty(self.tcx, elem);
-                if place_ty.ty.is_union() {
                     return;
                 }
             }

@@ -1,8 +1,9 @@
 //! This calculates the types which has storage which lives across a suspension point in a
 //! generator from the perspective of typeck. The actual types used at runtime
-//! is calculated in `rustc_const_eval::transform::generator` and may be a subset of the
+//! is calculated in `rustc_mir_transform::generator` and may be a subset of the
 //! types computed here.
 
+use self::drop_ranges::DropRanges;
 use super::FnCtxt;
 use rustc_data_structures::fx::{FxHashSet, FxIndexSet};
 use rustc_errors::pluralize;
@@ -10,14 +11,16 @@ use rustc_hir as hir;
 use rustc_hir::def::{CtorKind, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::hir_id::HirIdSet;
-use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
+use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Arm, Expr, ExprKind, Guard, HirId, Pat, PatKind};
-use rustc_middle::middle::region::{self, YieldData};
+use rustc_middle::middle::region::{self, Scope, ScopeData, YieldData};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::symbol::sym;
 use rustc_span::Span;
 use smallvec::SmallVec;
 use tracing::debug;
+
+mod drop_ranges;
 
 struct InteriorVisitor<'a, 'tcx> {
     fcx: &'a FnCtxt<'a, 'tcx>,
@@ -34,6 +37,7 @@ struct InteriorVisitor<'a, 'tcx> {
     guard_bindings: SmallVec<[SmallVec<[HirId; 4]>; 1]>,
     guard_bindings_set: HirIdSet,
     linted_values: HirIdSet,
+    drop_ranges: DropRanges,
 }
 
 impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
@@ -48,9 +52,11 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
     ) {
         use rustc_span::DUMMY_SP;
 
+        let ty = self.fcx.resolve_vars_if_possible(ty);
+
         debug!(
-            "generator_interior: attempting to record type {:?} {:?} {:?} {:?}",
-            ty, scope, expr, source_span
+            "attempting to record type ty={:?}; hir_id={:?}; scope={:?}; expr={:?}; source_span={:?}; expr_count={:?}",
+            ty, hir_id, scope, expr, source_span, self.expr_count,
         );
 
         let live_across_yield = scope
@@ -63,21 +69,30 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
                     //
                     // See the mega-comment at `yield_in_scope` for a proof.
 
-                    debug!(
-                        "comparing counts yield: {} self: {}, source_span = {:?}",
-                        yield_data.expr_and_pat_count, self.expr_count, source_span
-                    );
+                    yield_data
+                        .iter()
+                        .find(|yield_data| {
+                            debug!(
+                                "comparing counts yield: {} self: {}, source_span = {:?}",
+                                yield_data.expr_and_pat_count, self.expr_count, source_span
+                            );
 
-                    // If it is a borrowing happening in the guard,
-                    // it needs to be recorded regardless because they
-                    // do live across this yield point.
-                    if guard_borrowing_from_pattern
-                        || yield_data.expr_and_pat_count >= self.expr_count
-                    {
-                        Some(yield_data)
-                    } else {
-                        None
-                    }
+                            if self.fcx.sess().opts.debugging_opts.drop_tracking
+                                && self
+                                    .drop_ranges
+                                    .is_dropped_at(hir_id, yield_data.expr_and_pat_count)
+                            {
+                                debug!("value is dropped at yield point; not recording");
+                                return false;
+                            }
+
+                            // If it is a borrowing happening in the guard,
+                            // it needs to be recorded regardless because they
+                            // do live across this yield point.
+                            guard_borrowing_from_pattern
+                                || yield_data.expr_and_pat_count >= self.expr_count
+                        })
+                        .cloned()
                 })
             })
             .unwrap_or_else(|| {
@@ -85,7 +100,6 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
             });
 
         if let Some(yield_data) = live_across_yield {
-            let ty = self.fcx.resolve_vars_if_possible(ty);
             debug!(
                 "type in expr = {:?}, scope = {:?}, type = {:?}, count = {}, yield_span = {:?}",
                 expr, scope, ty, self.expr_count, yield_data.span
@@ -141,7 +155,7 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
 
                 self.types.insert(ty::GeneratorInteriorTypeCause {
                     span: source_span,
-                    ty: &ty,
+                    ty,
                     scope_span,
                     yield_span: yield_data.span,
                     expr: expr.map(|e| e.hir_id),
@@ -154,7 +168,6 @@ impl<'a, 'tcx> InteriorVisitor<'a, 'tcx> {
                 self.expr_count,
                 expr.map(|e| e.span)
             );
-            let ty = self.fcx.resolve_vars_if_possible(ty);
             if let Some((unresolved_type, unresolved_type_span)) =
                 self.fcx.unresolved_type_vars(&ty)
             {
@@ -186,10 +199,11 @@ pub fn resolve_interior<'a, 'tcx>(
         guard_bindings: <_>::default(),
         guard_bindings_set: <_>::default(),
         linted_values: <_>::default(),
+        drop_ranges: drop_ranges::compute_drop_ranges(fcx, def_id, body),
     };
     intravisit::walk_body(&mut visitor, body);
 
-    // Check that we visited the same amount of expressions and the RegionResolutionVisitor
+    // Check that we visited the same amount of expressions as the RegionResolutionVisitor
     let region_expr_count = visitor.region_scope_tree.body_expr_count(body_id).unwrap();
     assert_eq!(region_expr_count, visitor.expr_count);
 
@@ -266,12 +280,6 @@ pub fn resolve_interior<'a, 'tcx>(
 // librustc_middle/middle/region.rs since `expr_count` is compared against the results
 // there.
 impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
-    type Map = intravisit::ErasedMap<'tcx>;
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
-    }
-
     fn visit_arm(&mut self, arm: &'tcx Arm<'tcx>) {
         let Arm { guard, pat, body, .. } = arm;
         self.visit_pat(pat);
@@ -319,6 +327,7 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         let mut guard_borrowing_from_pattern = false;
+
         match &expr.kind {
             ExprKind::Call(callee, args) => match &callee.kind {
                 ExprKind::Path(qpath) => {
@@ -360,7 +369,25 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
 
         self.expr_count += 1;
 
-        let scope = self.region_scope_tree.temporary_scope(expr.hir_id.local_id);
+        debug!("is_borrowed_temporary: {:?}", self.drop_ranges.is_borrowed_temporary(expr));
+
+        // Typically, the value produced by an expression is consumed by its parent in some way,
+        // so we only have to check if the parent contains a yield (note that the parent may, for
+        // example, store the value into a local variable, but then we already consider local
+        // variables to be live across their scope).
+        //
+        // However, in the case of temporary values, we are going to store the value into a
+        // temporary on the stack that is live for the current temporary scope and then return a
+        // reference to it. That value may be live across the entire temporary scope.
+        let scope = if self.drop_ranges.is_borrowed_temporary(expr) {
+            self.region_scope_tree.temporary_scope(expr.hir_id.local_id)
+        } else {
+            debug!("parent_node: {:?}", self.fcx.tcx.hir().find_parent_node(expr.hir_id));
+            match self.fcx.tcx.hir().find_parent_node(expr.hir_id) {
+                Some(parent) => Some(Scope { id: parent.local_id, data: ScopeData::Node }),
+                None => self.region_scope_tree.temporary_scope(expr.hir_id.local_id),
+            }
+        };
 
         // If there are adjustments, then record the final type --
         // this is the actual value that is being produced.
@@ -407,7 +434,7 @@ impl<'a, 'tcx> Visitor<'tcx> for InteriorVisitor<'a, 'tcx> {
                 let tcx = self.fcx.tcx;
                 let ref_ty = tcx.mk_ref(
                     // Use `ReErased` as `resolve_interior` is going to replace all the regions anyway.
-                    tcx.mk_region(ty::RegionKind::ReErased),
+                    tcx.mk_region(ty::ReErased),
                     ty::TypeAndMut { ty, mutbl: hir::Mutability::Not },
                 );
                 self.record(
@@ -439,12 +466,6 @@ struct ArmPatCollector<'a> {
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for ArmPatCollector<'a> {
-    type Map = intravisit::ErasedMap<'tcx>;
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
-    }
-
     fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) {
         intravisit::walk_pat(self, pat);
         if let PatKind::Binding(_, id, ..) = pat.kind {
@@ -465,11 +486,11 @@ pub struct SuspendCheckData<'a, 'tcx> {
 }
 
 // Returns whether it emitted a diagnostic or not
-// Note that this fn and the proceding one are based on the code
+// Note that this fn and the proceeding one are based on the code
 // for creating must_use diagnostics
 //
 // Note that this technique was chosen over things like a `Suspend` marker trait
-// as it is simpler and has precendent in the compiler
+// as it is simpler and has precedent in the compiler
 pub fn check_must_not_suspend_ty<'tcx>(
     fcx: &FnCtxt<'_, 'tcx>,
     ty: Ty<'tcx>,
@@ -493,7 +514,7 @@ pub fn check_must_not_suspend_ty<'tcx>(
             let descr_pre = &format!("{}boxed ", data.descr_pre);
             check_must_not_suspend_ty(fcx, boxed_ty, hir_id, SuspendCheckData { descr_pre, ..data })
         }
-        ty::Adt(def, _) => check_must_not_suspend_def(fcx.tcx, def.did, hir_id, data),
+        ty::Adt(def, _) => check_must_not_suspend_def(fcx.tcx, def.did(), hir_id, data),
         // FIXME: support adding the attribute to TAITs
         ty::Opaque(def, _) => {
             let mut has_emitted = false;
@@ -536,22 +557,28 @@ pub fn check_must_not_suspend_ty<'tcx>(
             }
             has_emitted
         }
-        ty::Tuple(ref tys) => {
+        ty::Tuple(fields) => {
             let mut has_emitted = false;
-            let spans = if let Some(hir::ExprKind::Tup(comps)) = data.expr.map(|e| &e.kind) {
-                debug_assert_eq!(comps.len(), tys.len());
-                comps.iter().map(|e| e.span).collect()
-            } else {
-                vec![]
+            let comps = match data.expr.map(|e| &e.kind) {
+                Some(hir::ExprKind::Tup(comps)) => {
+                    debug_assert_eq!(comps.len(), fields.len());
+                    Some(comps)
+                }
+                _ => None,
             };
-            for (i, ty) in tys.iter().map(|k| k.expect_ty()).enumerate() {
+            for (i, ty) in fields.iter().enumerate() {
                 let descr_post = &format!(" in tuple element {}", i);
-                let span = *spans.get(i).unwrap_or(&data.source_span);
+                let span = comps.and_then(|c| c.get(i)).map(|e| e.span).unwrap_or(data.source_span);
                 if check_must_not_suspend_ty(
                     fcx,
                     ty,
                     hir_id,
-                    SuspendCheckData { descr_post, source_span: span, ..data },
+                    SuspendCheckData {
+                        descr_post,
+                        expr: comps.and_then(|comps| comps.get(i)),
+                        source_span: span,
+                        ..data
+                    },
                 ) {
                     has_emitted = true;
                 }
@@ -603,7 +630,7 @@ fn check_must_not_suspend_def(
                     // Add optional reason note
                     if let Some(note) = attr.value_str() {
                         // FIXME(guswynn): consider formatting this better
-                        err.span_note(data.source_span, &note.as_str());
+                        err.span_note(data.source_span, note.as_str());
                     }
 
                     // Add some quick suggestions on what to do

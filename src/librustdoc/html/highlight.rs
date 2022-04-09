@@ -187,7 +187,7 @@ struct TokenIter<'a> {
     src: &'a str,
 }
 
-impl Iterator for TokenIter<'a> {
+impl<'a> Iterator for TokenIter<'a> {
     type Item = (TokenKind, &'a str);
     fn next(&mut self) -> Option<(TokenKind, &'a str)> {
         if self.src.is_empty() {
@@ -227,7 +227,7 @@ struct PeekIter<'a> {
     iter: TokenIter<'a>,
 }
 
-impl PeekIter<'a> {
+impl<'a> PeekIter<'a> {
     fn new(iter: TokenIter<'a>) -> Self {
         Self { stored: VecDeque::new(), peek_pos: 0, iter }
     }
@@ -254,7 +254,7 @@ impl PeekIter<'a> {
     }
 }
 
-impl Iterator for PeekIter<'a> {
+impl<'a> Iterator for PeekIter<'a> {
     type Item = (TokenKind, &'a str);
     fn next(&mut self) -> Option<Self::Item> {
         self.peek_pos = 0;
@@ -274,8 +274,7 @@ impl Decorations {
         let (mut starts, mut ends): (Vec<_>, Vec<_>) = info
             .0
             .into_iter()
-            .map(|(kind, ranges)| ranges.into_iter().map(move |(lo, hi)| ((lo, kind), hi)))
-            .flatten()
+            .flat_map(|(kind, ranges)| ranges.into_iter().map(move |(lo, hi)| ((lo, kind), hi)))
             .unzip();
 
         // Sort the sequences in document order.
@@ -690,16 +689,12 @@ fn string<T: Display>(
     klass: Option<Class>,
     context_info: &Option<ContextInfo<'_, '_, '_>>,
 ) {
-    let klass = match klass {
-        None => return write!(out, "{}", text),
-        Some(klass) => klass,
-    };
-    let def_span = match klass.get_span() {
-        Some(d) => d,
-        None => {
-            write!(out, "<span class=\"{}\">{}</span>", klass.as_html(), text);
-            return;
-        }
+    let Some(klass) = klass
+    else { return write!(out, "{}", text) };
+    let Some(def_span) = klass.get_span()
+    else {
+        write!(out, "<span class=\"{}\">{}</span>", klass.as_html(), text);
+        return;
     };
     let mut text_s = text.to_string();
     if text_s.contains("::") {

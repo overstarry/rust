@@ -10,18 +10,18 @@ macro_rules! impl_uint_arith {
             /// # Examples
             /// ```
             /// # #![feature(portable_simd)]
-            /// # #[cfg(feature = "std")] use core_simd::Simd;
-            /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+            /// # use core::simd::Simd;
             #[doc = concat!("# use core::", stringify!($ty), "::MAX;")]
             /// let x = Simd::from_array([2, 1, 0, MAX]);
             /// let max = Simd::splat(MAX);
             /// let unsat = x + max;
             /// let sat = x.saturating_add(max);
-            /// assert_eq!(x - 1, unsat);
+            /// assert_eq!(unsat, Simd::from_array([1, 0, MAX, MAX - 1]));
             /// assert_eq!(sat, max);
             /// ```
             #[inline]
             pub fn saturating_add(self, second: Self) -> Self {
+                // Safety: `self` is a vector
                 unsafe { simd_saturating_add(self, second) }
             }
 
@@ -30,17 +30,17 @@ macro_rules! impl_uint_arith {
             /// # Examples
             /// ```
             /// # #![feature(portable_simd)]
-            /// # #[cfg(feature = "std")] use core_simd::Simd;
-            /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+            /// # use core::simd::Simd;
             #[doc = concat!("# use core::", stringify!($ty), "::MAX;")]
             /// let x = Simd::from_array([2, 1, 0, MAX]);
             /// let max = Simd::splat(MAX);
             /// let unsat = x - max;
             /// let sat = x.saturating_sub(max);
-            /// assert_eq!(unsat, x + 1);
+            /// assert_eq!(unsat, Simd::from_array([3, 2, 1, 0]));
             /// assert_eq!(sat, Simd::splat(0));
             #[inline]
             pub fn saturating_sub(self, second: Self) -> Self {
+                // Safety: `self` is a vector
                 unsafe { simd_saturating_sub(self, second) }
             }
         })+
@@ -56,8 +56,7 @@ macro_rules! impl_int_arith {
             /// # Examples
             /// ```
             /// # #![feature(portable_simd)]
-            /// # #[cfg(feature = "std")] use core_simd::Simd;
-            /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+            /// # use core::simd::Simd;
             #[doc = concat!("# use core::", stringify!($ty), "::{MIN, MAX};")]
             /// let x = Simd::from_array([MIN, 0, 1, MAX]);
             /// let max = Simd::splat(MAX);
@@ -68,6 +67,7 @@ macro_rules! impl_int_arith {
             /// ```
             #[inline]
             pub fn saturating_add(self, second: Self) -> Self {
+                // Safety: `self` is a vector
                 unsafe { simd_saturating_add(self, second) }
             }
 
@@ -76,8 +76,7 @@ macro_rules! impl_int_arith {
             /// # Examples
             /// ```
             /// # #![feature(portable_simd)]
-            /// # #[cfg(feature = "std")] use core_simd::Simd;
-            /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+            /// # use core::simd::Simd;
             #[doc = concat!("# use core::", stringify!($ty), "::{MIN, MAX};")]
             /// let x = Simd::from_array([MIN, -2, -1, MAX]);
             /// let max = Simd::splat(MAX);
@@ -87,6 +86,7 @@ macro_rules! impl_int_arith {
             /// assert_eq!(sat, Simd::from_array([MIN, MIN, MIN, 0]));
             #[inline]
             pub fn saturating_sub(self, second: Self) -> Self {
+                // Safety: `self` is a vector
                 unsafe { simd_saturating_sub(self, second) }
             }
 
@@ -96,8 +96,7 @@ macro_rules! impl_int_arith {
             /// # Examples
             /// ```
             /// # #![feature(portable_simd)]
-            /// # #[cfg(feature = "std")] use core_simd::Simd;
-            /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+            /// # use core::simd::Simd;
             #[doc = concat!("# use core::", stringify!($ty), "::{MIN, MAX};")]
             /// let xs = Simd::from_array([MIN, MIN +1, -5, 0]);
             /// assert_eq!(xs.abs(), Simd::from_array([MIN, MAX, 5, 0]));
@@ -105,7 +104,7 @@ macro_rules! impl_int_arith {
             #[inline]
             pub fn abs(self) -> Self {
                 const SHR: $ty = <$ty>::BITS as $ty - 1;
-                let m = self >> SHR;
+                let m = self >> Simd::splat(SHR);
                 (self^m) - m
             }
 
@@ -115,8 +114,7 @@ macro_rules! impl_int_arith {
             /// # Examples
             /// ```
             /// # #![feature(portable_simd)]
-            /// # #[cfg(feature = "std")] use core_simd::Simd;
-            /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+            /// # use core::simd::Simd;
             #[doc = concat!("# use core::", stringify!($ty), "::{MIN, MAX};")]
             /// let xs = Simd::from_array([MIN, -2, 0, 3]);
             /// let unsat = xs.abs();
@@ -128,7 +126,7 @@ macro_rules! impl_int_arith {
             pub fn saturating_abs(self) -> Self {
                 // arith shift for -1 or 0 mask based on sign bit, giving 2s complement
                 const SHR: $ty = <$ty>::BITS as $ty - 1;
-                let m = self >> SHR;
+                let m = self >> Simd::splat(SHR);
                 (self^m).saturating_sub(m)
             }
 
@@ -138,8 +136,7 @@ macro_rules! impl_int_arith {
             /// # Examples
             /// ```
             /// # #![feature(portable_simd)]
-            /// # #[cfg(feature = "std")] use core_simd::Simd;
-            /// # #[cfg(not(feature = "std"))] use core::simd::Simd;
+            /// # use core::simd::Simd;
             #[doc = concat!("# use core::", stringify!($ty), "::{MIN, MAX};")]
             /// let x = Simd::from_array([MIN, -2, 3, MAX]);
             /// let unsat = -x;

@@ -37,6 +37,7 @@ pub(super) fn generate<'mir, 'tcx>(
     flow_inits: &mut ResultsCursor<'mir, 'tcx, MaybeInitializedPlaces<'mir, 'tcx>>,
     move_data: &MoveData<'tcx>,
     location_table: &LocationTable,
+    use_polonius: bool,
 ) {
     debug!("liveness::generate");
 
@@ -46,7 +47,7 @@ pub(super) fn generate<'mir, 'tcx>(
         &typeck.borrowck_context.constraints.outlives_constraints,
     );
     let live_locals = compute_live_locals(typeck.tcx(), &free_regions, &body);
-    let facts_enabled = AllFacts::enabled(typeck.tcx());
+    let facts_enabled = use_polonius || AllFacts::enabled(typeck.tcx());
 
     let polonius_drop_used = if facts_enabled {
         let mut drop_used = Vec::new();
@@ -74,7 +75,7 @@ pub(super) fn generate<'mir, 'tcx>(
 // to compute whether a variable `X` is live if that variable contains
 // some region `R` in its type where `R` is not known to outlive a free
 // region (i.e., where `R` may be valid for just a subset of the fn body).
-fn compute_live_locals(
+fn compute_live_locals<'tcx>(
     tcx: TyCtxt<'tcx>,
     free_regions: &FxHashSet<RegionVid>,
     body: &Body<'tcx>,
@@ -104,7 +105,7 @@ fn compute_live_locals(
 /// regions. For these regions, we do not need to compute
 /// liveness, since the outlives constraints will ensure that they
 /// are live over the whole fn body anyhow.
-fn regions_that_outlive_free_regions(
+fn regions_that_outlive_free_regions<'tcx>(
     num_region_vars: usize,
     universal_regions: &UniversalRegions<'tcx>,
     constraint_set: &OutlivesConstraintSet<'tcx>,

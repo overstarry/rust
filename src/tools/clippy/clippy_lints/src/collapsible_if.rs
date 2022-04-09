@@ -42,11 +42,12 @@ declare_clippy_lint! {
     ///
     /// Should be written:
     ///
-    /// ```rust.ignore
+    /// ```rust,ignore
     /// if x && y {
     ///     …
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub COLLAPSIBLE_IF,
     style,
     "nested `if`s that can be collapsed (e.g., `if x { if y { ... } }`"
@@ -75,13 +76,14 @@ declare_clippy_lint! {
     ///
     /// Should be written:
     ///
-    /// ```rust.ignore
+    /// ```rust,ignore
     /// if x {
     ///     …
     /// } else if y {
     ///     …
     /// }
     /// ```
+    #[clippy::version = "1.51.0"]
     pub COLLAPSIBLE_ELSE_IF,
     style,
     "nested `else`-`if` expressions that can be collapsed (e.g., `else { if x { ... } }`)"

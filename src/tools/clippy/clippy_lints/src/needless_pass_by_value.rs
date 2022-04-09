@@ -6,7 +6,7 @@ use clippy_utils::{get_trait_def_id, is_self, paths};
 use if_chain::if_chain;
 use rustc_ast::ast::Attribute;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{Applicability, DiagnosticBuilder};
+use rustc_errors::{Applicability, Diagnostic};
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{BindingAnnotation, Body, FnDecl, GenericArg, HirId, Impl, ItemKind, Node, PatKind, QPath, TyKind};
 use rustc_hir::{HirIdMap, HirIdSet};
@@ -51,6 +51,7 @@ declare_clippy_lint! {
     ///     assert_eq!(v.len(), 42);
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub NEEDLESS_PASS_BY_VALUE,
     pedantic,
     "functions taking arguments by value, but not consuming them in its body"
@@ -117,7 +118,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
         let fn_def_id = cx.tcx.hir().local_def_id(hir_id);
 
         let preds = traits::elaborate_predicates(cx.tcx, cx.param_env.caller_bounds().iter())
-            .filter(|p| !p.is_global(cx.tcx))
+            .filter(|p| !p.is_global())
             .filter_map(|obligation| {
                 // Note that we do not want to deal with qualified predicates here.
                 match obligation.predicate.kind().no_bound_vars() {
@@ -195,10 +196,15 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
                     }
 
                     // Dereference suggestion
-                    let sugg = |diag: &mut DiagnosticBuilder<'_>| {
+                    let sugg = |diag: &mut Diagnostic| {
                         if let ty::Adt(def, ..) = ty.kind() {
-                            if let Some(span) = cx.tcx.hir().span_if_local(def.did) {
-                                if can_type_implement_copy(cx.tcx, cx.param_env, ty).is_ok() {
+                            if let Some(span) = cx.tcx.hir().span_if_local(def.did()) {
+                                if can_type_implement_copy(
+                                    cx.tcx,
+                                    cx.param_env,
+                                    ty,
+                                    traits::ObligationCause::dummy_with_span(span),
+                                ).is_ok() {
                                     diag.span_help(span, "consider marking this type as `Copy`");
                                 }
                             }
@@ -229,11 +235,12 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
                                 for (span, suggestion) in clone_spans {
                                     diag.span_suggestion(
                                         span,
-                                        &snippet_opt(cx, span)
+                                        snippet_opt(cx, span)
                                             .map_or(
                                                 "change the call to".into(),
                                                 |x| Cow::from(format!("change `{}` to", x)),
-                                            ),
+                                            )
+                                            .as_ref(),
                                         suggestion.into(),
                                         Applicability::Unspecified,
                                     );
@@ -258,11 +265,12 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
                                 for (span, suggestion) in clone_spans {
                                     diag.span_suggestion(
                                         span,
-                                        &snippet_opt(cx, span)
+                                        snippet_opt(cx, span)
                                             .map_or(
                                                 "change the call to".into(),
                                                 |x| Cow::from(format!("change `{}` to", x))
-                                            ),
+                                            )
+                                            .as_ref(),
                                         suggestion.into(),
                                         Applicability::Unspecified,
                                     );

@@ -647,10 +647,10 @@ fn test_ord() {
 #[test]
 fn test_show() {
     let ringbuf: VecDeque<_> = (0..10).collect();
-    assert_eq!(format!("{:?}", ringbuf), "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]");
+    assert_eq!(format!("{ringbuf:?}"), "[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]");
 
     let ringbuf: VecDeque<_> = vec!["just", "one", "test", "more"].iter().cloned().collect();
-    assert_eq!(format!("{:?}", ringbuf), "[\"just\", \"one\", \"test\", \"more\"]");
+    assert_eq!(format!("{ringbuf:?}"), "[\"just\", \"one\", \"test\", \"more\"]");
 }
 
 #[test]
@@ -927,8 +927,8 @@ fn test_as_mut_slices() {
 
 #[test]
 fn test_append() {
-    let mut a: VecDeque<_> = vec![1, 2, 3].into_iter().collect();
-    let mut b: VecDeque<_> = vec![4, 5, 6].into_iter().collect();
+    let mut a: VecDeque<_> = [1, 2, 3].into_iter().collect();
+    let mut b: VecDeque<_> = [4, 5, 6].into_iter().collect();
 
     // normal append
     a.append(&mut b);
@@ -1209,7 +1209,7 @@ fn test_try_reserve() {
 
     {
         // Same basic idea, but with non-zero len
-        let mut ten_bytes: VecDeque<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
+        let mut ten_bytes: VecDeque<u8> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
 
         if let Err(CapacityOverflow) = ten_bytes.try_reserve(MAX_CAP - 10).map_err(|e| e.kind()) {
             panic!("isize::MAX shouldn't trigger an overflow!");
@@ -1240,7 +1240,7 @@ fn test_try_reserve() {
 
     {
         // Same basic idea, but with interesting type size
-        let mut ten_u32s: VecDeque<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
+        let mut ten_u32s: VecDeque<u32> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
 
         if let Err(CapacityOverflow) = ten_u32s.try_reserve(MAX_CAP / 4 - 10).map_err(|e| e.kind())
         {
@@ -1322,7 +1322,7 @@ fn test_try_reserve_exact() {
     }
 
     {
-        let mut ten_bytes: VecDeque<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
+        let mut ten_bytes: VecDeque<u8> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
 
         if let Err(CapacityOverflow) =
             ten_bytes.try_reserve_exact(MAX_CAP - 10).map_err(|e| e.kind())
@@ -1355,7 +1355,7 @@ fn test_try_reserve_exact() {
     }
 
     {
-        let mut ten_u32s: VecDeque<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
+        let mut ten_u32s: VecDeque<u32> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into_iter().collect();
 
         if let Err(CapacityOverflow) =
             ten_u32s.try_reserve_exact(MAX_CAP / 4 - 10).map_err(|e| e.kind())

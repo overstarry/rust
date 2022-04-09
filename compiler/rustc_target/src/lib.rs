@@ -8,14 +8,17 @@
 //! LLVM.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bool_to_option)]
-#![feature(nll)]
-#![feature(never_type)]
 #![feature(associated_type_bounds)]
+#![feature(bool_to_option)]
 #![feature(exhaustive_patterns)]
+#![feature(let_else)]
 #![feature(min_specialization)]
+#![feature(never_type)]
+#![feature(nll)]
+#![feature(rustc_attrs)]
 #![feature(step_trait)]
 
+use std::iter::FromIterator;
 use std::path::{Path, PathBuf};
 
 #[macro_use]
@@ -47,12 +50,11 @@ const RUST_LIB_DIR: &str = "rustlib";
 /// `"lib*/rustlib/x86_64-unknown-linux-gnu"`.
 pub fn target_rustlib_path(sysroot: &Path, target_triple: &str) -> PathBuf {
     let libdir = find_libdir(sysroot);
-    std::array::IntoIter::new([
+    PathBuf::from_iter([
         Path::new(libdir.as_ref()),
         Path::new(RUST_LIB_DIR),
         Path::new(target_triple),
     ])
-    .collect::<PathBuf>()
 }
 
 /// The name of the directory rustc expects libraries to be located.

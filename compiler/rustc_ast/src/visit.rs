@@ -190,8 +190,8 @@ pub trait Visitor<'ast>: Sized {
     fn visit_generic_arg(&mut self, generic_arg: &'ast GenericArg) {
         walk_generic_arg(self, generic_arg)
     }
-    fn visit_assoc_ty_constraint(&mut self, constraint: &'ast AssocTyConstraint) {
-        walk_assoc_ty_constraint(self, constraint)
+    fn visit_assoc_constraint(&mut self, constraint: &'ast AssocConstraint) {
+        walk_assoc_constraint(self, constraint)
     }
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
         walk_attribute(self, attr)
@@ -210,6 +210,9 @@ pub trait Visitor<'ast>: Sized {
     }
     fn visit_pat_field(&mut self, fp: &'ast PatField) {
         walk_pat_field(self, fp)
+    }
+    fn visit_crate(&mut self, krate: &'ast Crate) {
+        walk_crate(self, krate)
     }
 }
 
@@ -300,7 +303,7 @@ pub fn walk_item<'a, V: Visitor<'a>>(visitor: &mut V, item: &'a Item) {
             walk_list!(visitor, visit_foreign_item, &foreign_module.items);
         }
         ItemKind::GlobalAsm(ref asm) => walk_inline_asm(visitor, asm),
-        ItemKind::TyAlias(box TyAlias { defaultness: _, ref generics, ref bounds, ref ty }) => {
+        ItemKind::TyAlias(box TyAlias { ref generics, ref bounds, ref ty, .. }) => {
             visitor.visit_generics(generics);
             walk_list!(visitor, visit_param_bound, bounds);
             walk_list!(visitor, visit_ty, ty);
@@ -461,7 +464,7 @@ where
             for arg in &data.args {
                 match arg {
                     AngleBracketedArg::Arg(a) => visitor.visit_generic_arg(a),
-                    AngleBracketedArg::Constraint(c) => visitor.visit_assoc_ty_constraint(c),
+                    AngleBracketedArg::Constraint(c) => visitor.visit_assoc_constraint(c),
                 }
             }
         }
@@ -483,19 +486,17 @@ where
     }
 }
 
-pub fn walk_assoc_ty_constraint<'a, V: Visitor<'a>>(
-    visitor: &mut V,
-    constraint: &'a AssocTyConstraint,
-) {
+pub fn walk_assoc_constraint<'a, V: Visitor<'a>>(visitor: &mut V, constraint: &'a AssocConstraint) {
     visitor.visit_ident(constraint.ident);
     if let Some(ref gen_args) = constraint.gen_args {
         visitor.visit_generic_args(gen_args.span(), gen_args);
     }
     match constraint.kind {
-        AssocTyConstraintKind::Equality { ref ty } => {
-            visitor.visit_ty(ty);
-        }
-        AssocTyConstraintKind::Bound { ref bounds } => {
+        AssocConstraintKind::Equality { ref term } => match term {
+            Term::Ty(ty) => visitor.visit_ty(ty),
+            Term::Const(c) => visitor.visit_anon_const(c),
+        },
+        AssocConstraintKind::Bound { ref bounds } => {
             walk_list!(visitor, visit_param_bound, bounds);
         }
     }
@@ -558,7 +559,7 @@ pub fn walk_foreign_item<'a, V: Visitor<'a>>(visitor: &mut V, item: &'a ForeignI
             let kind = FnKind::Fn(FnCtxt::Foreign, ident, sig, vis, body.as_deref());
             visitor.visit_fn(kind, span, id);
         }
-        ForeignItemKind::TyAlias(box TyAlias { defaultness: _, generics, bounds, ty }) => {
+        ForeignItemKind::TyAlias(box TyAlias { generics, bounds, ty, .. }) => {
             visitor.visit_generics(generics);
             walk_list!(visitor, visit_param_bound, bounds);
             walk_list!(visitor, visit_ty, ty);
@@ -664,7 +665,7 @@ pub fn walk_assoc_item<'a, V: Visitor<'a>>(visitor: &mut V, item: &'a AssocItem,
             let kind = FnKind::Fn(FnCtxt::Assoc(ctxt), ident, sig, vis, body.as_deref());
             visitor.visit_fn(kind, span, id);
         }
-        AssocItemKind::TyAlias(box TyAlias { defaultness: _, generics, bounds, ty }) => {
+        AssocItemKind::TyAlias(box TyAlias { generics, bounds, ty, .. }) => {
             visitor.visit_generics(generics);
             walk_list!(visitor, visit_param_bound, bounds);
             walk_list!(visitor, visit_ty, ty);
@@ -861,14 +862,6 @@ pub fn walk_expr<'a, V: Visitor<'a>>(visitor: &mut V, expression: &'a Expr) {
         ExprKind::MacCall(ref mac) => visitor.visit_mac_call(mac),
         ExprKind::Paren(ref subexpression) => visitor.visit_expr(subexpression),
         ExprKind::InlineAsm(ref asm) => walk_inline_asm(visitor, asm),
-        ExprKind::LlvmInlineAsm(ref ia) => {
-            for &(_, ref input) in &ia.inputs {
-                visitor.visit_expr(input)
-            }
-            for output in &ia.outputs {
-                visitor.visit_expr(&output.expr)
-            }
-        }
         ExprKind::Yield(ref optional_expression) => {
             walk_list!(visitor, visit_expr, optional_expression);
         }

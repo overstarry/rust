@@ -1,3 +1,6 @@
+use core::alloc::{Allocator, Layout};
+use core::ptr::NonNull;
+use std::alloc::System;
 use std::assert_matches::assert_matches;
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -100,7 +103,7 @@ fn test_debug_fmt() {
     assert_eq!("[0, 1]", format!("{:?}", vec2));
 
     let slice: &[isize] = &[4, 5];
-    assert_eq!("[4, 5]", format!("{:?}", slice));
+    assert_eq!("[4, 5]", format!("{slice:?}"));
 }
 
 #[test]
@@ -449,10 +452,10 @@ fn zero_sized_values() {
 
 #[test]
 fn test_partition() {
-    assert_eq!(vec![].into_iter().partition(|x: &i32| *x < 3), (vec![], vec![]));
-    assert_eq!(vec![1, 2, 3].into_iter().partition(|x| *x < 4), (vec![1, 2, 3], vec![]));
-    assert_eq!(vec![1, 2, 3].into_iter().partition(|x| *x < 2), (vec![1], vec![2, 3]));
-    assert_eq!(vec![1, 2, 3].into_iter().partition(|x| *x < 0), (vec![], vec![1, 2, 3]));
+    assert_eq!([].into_iter().partition(|x: &i32| *x < 3), (vec![], vec![]));
+    assert_eq!([1, 2, 3].into_iter().partition(|x| *x < 4), (vec![1, 2, 3], vec![]));
+    assert_eq!([1, 2, 3].into_iter().partition(|x| *x < 2), (vec![1], vec![2, 3]));
+    assert_eq!([1, 2, 3].into_iter().partition(|x| *x < 0), (vec![], vec![1, 2, 3]));
 }
 
 #[test]
@@ -918,13 +921,13 @@ fn test_into_iter_as_mut_slice() {
 fn test_into_iter_debug() {
     let vec = vec!['a', 'b', 'c'];
     let into_iter = vec.into_iter();
-    let debug = format!("{:?}", into_iter);
+    let debug = format!("{into_iter:?}");
     assert_eq!(debug, "IntoIter(['a', 'b', 'c'])");
 }
 
 #[test]
 fn test_into_iter_count() {
-    assert_eq!(vec![1, 2, 3].into_iter().count(), 3);
+    assert_eq!([1, 2, 3].into_iter().count(), 3);
 }
 
 #[test]
@@ -933,7 +936,7 @@ fn test_into_iter_clone() {
         let v: Vec<i32> = it.collect();
         assert_eq!(&v[..], slice);
     }
-    let mut it = vec![1, 2, 3].into_iter();
+    let mut it = [1, 2, 3].into_iter();
     iter_equal(it.clone(), &[1, 2, 3]);
     assert_eq!(it.next(), Some(1));
     let mut it = it.rev();
@@ -972,7 +975,7 @@ fn test_into_iter_leak() {
 
 #[test]
 fn test_into_iter_advance_by() {
-    let mut i = vec![1, 2, 3, 4, 5].into_iter();
+    let mut i = [1, 2, 3, 4, 5].into_iter();
     i.advance_by(0).unwrap();
     i.advance_back_by(0).unwrap();
     assert_eq!(i.as_slice(), [1, 2, 3, 4, 5]);
@@ -985,7 +988,35 @@ fn test_into_iter_advance_by() {
 
     assert_eq!(i.advance_by(usize::MAX), Err(0));
 
+    i.advance_by(0).unwrap();
+    i.advance_back_by(0).unwrap();
+
     assert_eq!(i.len(), 0);
+}
+
+#[test]
+fn test_into_iter_drop_allocator() {
+    struct ReferenceCountedAllocator<'a>(DropCounter<'a>);
+
+    unsafe impl Allocator for ReferenceCountedAllocator<'_> {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
+            System.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            System.deallocate(ptr, layout)
+        }
+    }
+
+    let mut drop_count = 0;
+
+    let allocator = ReferenceCountedAllocator(DropCounter { count: &mut drop_count });
+    let _ = Vec::<u32, _>::new_in(allocator);
+    assert_eq!(drop_count, 1);
+
+    let allocator = ReferenceCountedAllocator(DropCounter { count: &mut drop_count });
+    let _ = Vec::<u32, _>::new_in(allocator).into_iter();
+    assert_eq!(drop_count, 2);
 }
 
 #[test]
@@ -1796,7 +1827,7 @@ fn test_stable_pointers() {
     assert_eq!(*v0, 13);
     next_then_drop(v.splice(5..8, vec![1])); // replacement is smaller than original range
     assert_eq!(*v0, 13);
-    next_then_drop(v.splice(5..6, vec![1; 10].into_iter().filter(|_| true))); // lower bound not exact
+    next_then_drop(v.splice(5..6, [1; 10].into_iter().filter(|_| true))); // lower bound not exact
     assert_eq!(*v0, 13);
 
     // spare_capacity_mut
@@ -2333,7 +2364,7 @@ fn test_vec_dedup_panicking() {
     let ok = vec.iter().zip(expected.iter()).all(|(x, y)| x.index == y.index);
 
     if !ok {
-        panic!("expected: {:?}\ngot: {:?}\n", expected, vec);
+        panic!("expected: {expected:?}\ngot: {vec:?}\n");
     }
 }
 
@@ -2376,4 +2407,11 @@ fn test_extend_from_within_panicing_clone() {
     std::panic::catch_unwind(move || vec.extend_from_within(..)).unwrap_err();
 
     assert_eq!(count.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+#[should_panic = "vec len overflow"]
+fn test_into_flattened_size_overflow() {
+    let v = vec![[(); usize::MAX]; 2];
+    let _ = v.into_flattened();
 }

@@ -26,15 +26,14 @@ use crate::infer::outlives::env::OutlivesEnvironment;
 use crate::infer::{InferCtxt, RegionckMode, TyCtxtInferExt};
 use crate::traits::error_reporting::InferCtxtExt as _;
 use crate::traits::query::evaluate_obligation::InferCtxtExt as _;
-use rustc_errors::ErrorReported;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::lang_items::LangItem;
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::subst::{InternalSubsts, SubstsRef};
 use rustc_middle::ty::{
-    self, GenericParamDefKind, ToPredicate, Ty, TyCtxt, VtblEntry, WithConstness,
-    COMMON_VTABLE_ENTRIES,
+    self, GenericParamDefKind, ToPredicate, Ty, TyCtxt, VtblEntry, COMMON_VTABLE_ENTRIES,
 };
 use rustc_span::{sym, Span};
 use smallvec::SmallVec;
@@ -207,7 +206,7 @@ fn do_normalize_predicates<'tcx>(
     cause: ObligationCause<'tcx>,
     elaborated_env: ty::ParamEnv<'tcx>,
     predicates: Vec<ty::Predicate<'tcx>>,
-) -> Result<Vec<ty::Predicate<'tcx>>, ErrorReported> {
+) -> Result<Vec<ty::Predicate<'tcx>>, ErrorGuaranteed> {
     debug!(
         "do_normalize_predicates(predicates={:?}, region_context={:?}, cause={:?})",
         predicates, region_context, cause,
@@ -232,8 +231,8 @@ fn do_normalize_predicates<'tcx>(
             match fully_normalize(&infcx, fulfill_cx, cause, elaborated_env, predicates) {
                 Ok(predicates) => predicates,
                 Err(errors) => {
-                    infcx.report_fulfillment_errors(&errors, None, false);
-                    return Err(ErrorReported);
+                    let reported = infcx.report_fulfillment_errors(&errors, None, false);
+                    return Err(reported);
                 }
             };
 
@@ -259,13 +258,15 @@ fn do_normalize_predicates<'tcx>(
                 // represents a legitimate failure due to some kind of
                 // unconstrained variable, and it seems better not to ICE,
                 // all things considered.
-                tcx.sess.span_err(span, &fixup_err.to_string());
-                return Err(ErrorReported);
+                let reported = tcx.sess.span_err(span, &fixup_err.to_string());
+                return Err(reported);
             }
         };
         if predicates.needs_infer() {
-            tcx.sess.delay_span_bug(span, "encountered inference variables after `fully_resolve`");
-            Err(ErrorReported)
+            let reported = tcx
+                .sess
+                .delay_span_bug(span, "encountered inference variables after `fully_resolve`");
+            Err(reported)
         } else {
             Ok(predicates)
         }
@@ -292,7 +293,7 @@ pub fn normalize_param_env_or_error<'tcx>(
     //
     // In any case, in practice, typeck constructs all the
     // parameter environments once for every fn as it goes,
-    // and errors will get reported then; so after typeck we
+    // and errors will get reported then; so outside of type inference we
     // can be sure that no errors should occur.
 
     debug!(
@@ -307,8 +308,11 @@ pub fn normalize_param_env_or_error<'tcx>(
 
     debug!("normalize_param_env_or_error: elaborated-predicates={:?}", predicates);
 
-    let elaborated_env =
-        ty::ParamEnv::new(tcx.intern_predicates(&predicates), unnormalized_env.reveal());
+    let elaborated_env = ty::ParamEnv::new(
+        tcx.intern_predicates(&predicates),
+        unnormalized_env.reveal(),
+        unnormalized_env.constness(),
+    );
 
     // HACK: we are trying to normalize the param-env inside *itself*. The problem is that
     // normalization expects its param-env to be already normalized, which means we have
@@ -338,19 +342,16 @@ pub fn normalize_param_env_or_error<'tcx>(
         "normalize_param_env_or_error: predicates=(non-outlives={:?}, outlives={:?})",
         predicates, outlives_predicates
     );
-    let non_outlives_predicates = match do_normalize_predicates(
+    let Ok(non_outlives_predicates) = do_normalize_predicates(
         tcx,
         region_context,
         cause.clone(),
         elaborated_env,
         predicates,
-    ) {
-        Ok(predicates) => predicates,
+    ) else {
         // An unnormalized env is better than nothing.
-        Err(ErrorReported) => {
-            debug!("normalize_param_env_or_error: errored resolving non-outlives predicates");
-            return elaborated_env;
-        }
+        debug!("normalize_param_env_or_error: errored resolving non-outlives predicates");
+        return elaborated_env;
     };
 
     debug!("normalize_param_env_or_error: non-outlives predicates={:?}", non_outlives_predicates);
@@ -360,28 +361,32 @@ pub fn normalize_param_env_or_error<'tcx>(
     // predicates here anyway. Keeping them here anyway because it seems safer.
     let outlives_env: Vec<_> =
         non_outlives_predicates.iter().chain(&outlives_predicates).cloned().collect();
-    let outlives_env =
-        ty::ParamEnv::new(tcx.intern_predicates(&outlives_env), unnormalized_env.reveal());
-    let outlives_predicates = match do_normalize_predicates(
+    let outlives_env = ty::ParamEnv::new(
+        tcx.intern_predicates(&outlives_env),
+        unnormalized_env.reveal(),
+        unnormalized_env.constness(),
+    );
+    let Ok(outlives_predicates) = do_normalize_predicates(
         tcx,
         region_context,
         cause,
         outlives_env,
         outlives_predicates,
-    ) {
-        Ok(predicates) => predicates,
+    ) else {
         // An unnormalized env is better than nothing.
-        Err(ErrorReported) => {
-            debug!("normalize_param_env_or_error: errored resolving outlives predicates");
-            return elaborated_env;
-        }
+        debug!("normalize_param_env_or_error: errored resolving outlives predicates");
+        return elaborated_env;
     };
     debug!("normalize_param_env_or_error: outlives predicates={:?}", outlives_predicates);
 
     let mut predicates = non_outlives_predicates;
     predicates.extend(outlives_predicates);
     debug!("normalize_param_env_or_error: final predicates={:?}", predicates);
-    ty::ParamEnv::new(tcx.intern_predicates(&predicates), unnormalized_env.reveal())
+    ty::ParamEnv::new(
+        tcx.intern_predicates(&predicates),
+        unnormalized_env.reveal(),
+        unnormalized_env.constness(),
+    )
 }
 
 pub fn fully_normalize<'a, 'tcx, T>(
@@ -456,7 +461,7 @@ fn subst_and_check_impossible_predicates<'tcx>(
     debug!("subst_and_check_impossible_predicates(key={:?})", key);
 
     let mut predicates = tcx.predicates_of(key.0).instantiate(tcx, key.1).predicates;
-    predicates.retain(|predicate| !predicate.definitely_needs_subst(tcx));
+    predicates.retain(|predicate| !predicate.needs_subst());
     let result = impossible_predicates(tcx, predicates);
 
     debug!("subst_and_check_impossible_predicates(key={:?}) = {:?}", key, result);
@@ -533,8 +538,8 @@ fn prepare_vtable_segments<'tcx, T>(
 
     // the main traversal loop:
     // basically we want to cut the inheritance directed graph into a few non-overlapping slices of nodes
-    // that each node is emited after all its descendents have been emitted.
-    // so we convert the directed graph into a tree by skipping all previously visted nodes using a visited set.
+    // that each node is emitted after all its descendents have been emitted.
+    // so we convert the directed graph into a tree by skipping all previously visited nodes using a visited set.
     // this is done on the fly.
     // Each loop run emits a slice - it starts by find a "childless" unvisited node, backtracking upwards, and it
     // stops after it finds a node that has a next-sibling node.
@@ -548,10 +553,10 @@ fn prepare_vtable_segments<'tcx, T>(
     // Starting point 0 stack [D]
     // Loop run #0: Stack after diving in is [D B A], A is "childless"
     // after this point, all newly visited nodes won't have a vtable that equals to a prefix of this one.
-    // Loop run #0: Emiting the slice [B A] (in reverse order), B has a next-sibling node, so this slice stops here.
+    // Loop run #0: Emitting the slice [B A] (in reverse order), B has a next-sibling node, so this slice stops here.
     // Loop run #0: Stack after exiting out is [D C], C is the next starting point.
     // Loop run #1: Stack after diving in is [D C], C is "childless", since its child A is skipped(already emitted).
-    // Loop run #1: Emiting the slice [D C] (in reverse order). No one has a next-sibling node.
+    // Loop run #1: Emitting the slice [D C] (in reverse order). No one has a next-sibling node.
     // Loop run #1: Stack after exiting out is []. Now the function exits.
 
     loop {
@@ -564,14 +569,17 @@ fn prepare_vtable_segments<'tcx, T>(
                     .predicates
                     .into_iter()
                     .filter_map(move |(pred, _)| {
-                        pred.subst_supertrait(tcx, &inner_most_trait_ref).to_opt_poly_trait_ref()
+                        pred.subst_supertrait(tcx, &inner_most_trait_ref).to_opt_poly_trait_pred()
                     });
 
                 'diving_in_skip_visited_traits: loop {
                     if let Some(next_super_trait) = direct_super_traits_iter.next() {
                         if visited.insert(next_super_trait.to_predicate(tcx)) {
+                            // We're throwing away potential constness of super traits here.
+                            // FIXME: handle ~const super traits
+                            let next_super_trait = next_super_trait.map_bound(|t| t.trait_ref);
                             stack.push((
-                                next_super_trait.value,
+                                next_super_trait,
                                 emit_vptr_on_new_entry,
                                 Some(direct_super_traits_iter),
                             ));
@@ -603,7 +611,11 @@ fn prepare_vtable_segments<'tcx, T>(
                     if let Some(siblings) = siblings_opt {
                         if let Some(next_inner_most_trait_ref) = siblings.next() {
                             if visited.insert(next_inner_most_trait_ref.to_predicate(tcx)) {
-                                *inner_most_trait_ref = next_inner_most_trait_ref.value;
+                                // We're throwing away potential constness of super traits here.
+                                // FIXME: handle ~const super traits
+                                let next_inner_most_trait_ref =
+                                    next_inner_most_trait_ref.map_bound(|t| t.trait_ref);
+                                *inner_most_trait_ref = next_inner_most_trait_ref;
                                 *emit_vptr = emit_vptr_on_new_entry;
                                 break 'exiting_out;
                             } else {
@@ -785,7 +797,7 @@ fn vtable_trait_first_method_offset<'tcx>(
 }
 
 /// Find slot offset for trait vptr within vtable entries of another trait
-pub fn vtable_trait_upcasting_coercion_new_vptr_slot(
+pub fn vtable_trait_upcasting_coercion_new_vptr_slot<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: (
         Ty<'tcx>, // trait object type whose trait owning vtable
@@ -818,9 +830,8 @@ pub fn vtable_trait_upcasting_coercion_new_vptr_slot(
         selcx.select(&obligation).unwrap()
     });
 
-    let implsrc_traitcasting = match implsrc {
-        Some(ImplSource::TraitUpcasting(data)) => data,
-        _ => bug!(),
+    let Some(ImplSource::TraitUpcasting(implsrc_traitcasting)) = implsrc else {
+        bug!();
     };
 
     implsrc_traitcasting.vtable_vptr_slot
@@ -851,7 +862,10 @@ pub fn provide(providers: &mut ty::query::Providers) {
                 ty::WithOptConstParam { did, const_param_did: Some(param_did) },
             )
         },
-        try_unify_abstract_consts: const_evaluatable::try_unify_abstract_consts,
+        try_unify_abstract_consts: |tcx, param_env_and| {
+            let (param_env, (a, b)) = param_env_and.into_parts();
+            const_evaluatable::try_unify_abstract_consts(tcx, (a, b), param_env)
+        },
         ..*providers
     };
 }

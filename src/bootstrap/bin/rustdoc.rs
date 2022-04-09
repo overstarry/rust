@@ -7,11 +7,17 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 
+include!("../dylib_util.rs");
+
 fn main() {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let rustdoc = env::var_os("RUSTDOC_REAL").expect("RUSTDOC_REAL was not set");
     let libdir = env::var_os("RUSTDOC_LIBDIR").expect("RUSTDOC_LIBDIR was not set");
     let sysroot = env::var_os("RUSTC_SYSROOT").expect("RUSTC_SYSROOT was not set");
+
+    // Detect whether or not we're a build script depending on whether --target
+    // is passed (a bit janky...)
+    let target = args.windows(2).find(|w| &*w[0] == "--target").and_then(|w| w[1].to_str());
 
     use std::str::FromStr;
 
@@ -20,14 +26,22 @@ fn main() {
         Err(_) => 0,
     };
 
-    let mut dylib_path = bootstrap::util::dylib_path();
+    let mut dylib_path = dylib_path();
     dylib_path.insert(0, PathBuf::from(libdir.clone()));
 
     let mut cmd = Command::new(rustdoc);
-    cmd.args(&args)
-        .arg("--sysroot")
-        .arg(&sysroot)
-        .env(bootstrap::util::dylib_path_var(), env::join_paths(&dylib_path).unwrap());
+
+    if target.is_some() {
+        // The stage0 compiler has a special sysroot distinct from what we
+        // actually downloaded, so we just always pass the `--sysroot` option,
+        // unless one is already set.
+        if !args.iter().any(|arg| arg == "--sysroot") {
+            cmd.arg("--sysroot").arg(&sysroot);
+        }
+    }
+
+    cmd.args(&args);
+    cmd.env(dylib_path_var(), env::join_paths(&dylib_path).unwrap());
 
     // Force all crates compiled by this compiler to (a) be unstable and (b)
     // allow the `rustc_private` feature to link to other unstable crates
@@ -59,7 +73,7 @@ fn main() {
     if verbose > 1 {
         eprintln!(
             "rustdoc command: {:?}={:?} {:?}",
-            bootstrap::util::dylib_path_var(),
+            dylib_path_var(),
             env::join_paths(&dylib_path).unwrap(),
             cmd,
         );

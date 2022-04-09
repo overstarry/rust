@@ -5,10 +5,9 @@ use rustc_middle::ty::RegionVid;
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::impls::{EverInitializedPlaces, MaybeUninitializedPlaces};
 use rustc_mir_dataflow::ResultsVisitable;
-use rustc_mir_dataflow::{self, fmt::DebugWithContext, GenKill};
+use rustc_mir_dataflow::{self, fmt::DebugWithContext, CallReturnPlaces, GenKill};
 use rustc_mir_dataflow::{Analysis, Direction, Results};
 use std::fmt;
-use std::iter;
 
 use crate::{
     places_conflict, BorrowSet, PlaceConflictBias, PlaceExt, RegionInferenceContext, ToRegionVid,
@@ -385,14 +384,6 @@ impl<'tcx> rustc_mir_dataflow::GenKillAnalysis<'tcx> for Borrows<'_, 'tcx> {
                 self.kill_borrows_on_place(trans, Place::from(local));
             }
 
-            mir::StatementKind::LlvmInlineAsm(ref asm) => {
-                for (output, kind) in iter::zip(&*asm.outputs, &asm.asm.outputs) {
-                    if !kind.is_indirect && !kind.is_rw {
-                        self.kill_borrows_on_place(trans, *output);
-                    }
-                }
-            }
-
             mir::StatementKind::FakeRead(..)
             | mir::StatementKind::SetDiscriminant { .. }
             | mir::StatementKind::StorageLive(..)
@@ -416,10 +407,10 @@ impl<'tcx> rustc_mir_dataflow::GenKillAnalysis<'tcx> for Borrows<'_, 'tcx> {
     fn terminator_effect(
         &self,
         trans: &mut impl GenKill<Self::Idx>,
-        teminator: &mir::Terminator<'tcx>,
+        terminator: &mir::Terminator<'tcx>,
         _location: Location,
     ) {
-        if let mir::TerminatorKind::InlineAsm { operands, .. } = &teminator.kind {
+        if let mir::TerminatorKind::InlineAsm { operands, .. } = &terminator.kind {
             for op in operands {
                 if let mir::InlineAsmOperand::Out { place: Some(place), .. }
                 | mir::InlineAsmOperand::InOut { out_place: Some(place), .. } = *op
@@ -434,9 +425,7 @@ impl<'tcx> rustc_mir_dataflow::GenKillAnalysis<'tcx> for Borrows<'_, 'tcx> {
         &self,
         _trans: &mut impl GenKill<Self::Idx>,
         _block: mir::BasicBlock,
-        _func: &mir::Operand<'tcx>,
-        _args: &[mir::Operand<'tcx>],
-        _dest_place: mir::Place<'tcx>,
+        _return_places: CallReturnPlaces<'_, 'tcx>,
     ) {
     }
 }

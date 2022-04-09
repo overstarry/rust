@@ -30,10 +30,9 @@
 //!
 //! [gen-kill]: https://en.wikipedia.org/wiki/Data-flow_analysis#Bit_vector_problems
 
-use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 
-use rustc_index::bit_set::{BitSet, HybridBitSet};
+use rustc_index::bit_set::{BitSet, ChunkedBitSet, HybridBitSet};
 use rustc_index::vec::Idx;
 use rustc_middle::mir::{self, BasicBlock, Location};
 use rustc_middle::ty::TyCtxt;
@@ -51,6 +50,51 @@ pub use self::direction::{Backward, Direction, Forward};
 pub use self::engine::{Engine, Results};
 pub use self::lattice::{JoinSemiLattice, MeetSemiLattice};
 pub use self::visitor::{visit_results, ResultsVisitable, ResultsVisitor};
+
+/// Analysis domains are all bitsets of various kinds. This trait holds
+/// operations needed by all of them.
+pub trait BitSetExt<T> {
+    fn domain_size(&self) -> usize;
+    fn contains(&self, elem: T) -> bool;
+    fn union(&mut self, other: &HybridBitSet<T>);
+    fn subtract(&mut self, other: &HybridBitSet<T>);
+}
+
+impl<T: Idx> BitSetExt<T> for BitSet<T> {
+    fn domain_size(&self) -> usize {
+        self.domain_size()
+    }
+
+    fn contains(&self, elem: T) -> bool {
+        self.contains(elem)
+    }
+
+    fn union(&mut self, other: &HybridBitSet<T>) {
+        self.union(other);
+    }
+
+    fn subtract(&mut self, other: &HybridBitSet<T>) {
+        self.subtract(other);
+    }
+}
+
+impl<T: Idx> BitSetExt<T> for ChunkedBitSet<T> {
+    fn domain_size(&self) -> usize {
+        self.domain_size()
+    }
+
+    fn contains(&self, elem: T) -> bool {
+        self.contains(elem)
+    }
+
+    fn union(&mut self, other: &HybridBitSet<T>) {
+        self.union(other);
+    }
+
+    fn subtract(&mut self, other: &HybridBitSet<T>) {
+        self.subtract(other);
+    }
+}
 
 /// Define the domain of a dataflow problem.
 ///
@@ -160,9 +204,7 @@ pub trait Analysis<'tcx>: AnalysisDomain<'tcx> {
         &self,
         state: &mut Self::Domain,
         block: BasicBlock,
-        func: &mir::Operand<'tcx>,
-        args: &[mir::Operand<'tcx>],
-        return_place: mir::Place<'tcx>,
+        return_places: CallReturnPlaces<'_, 'tcx>,
     );
 
     /// Updates the current dataflow state with the effect of resuming from a `Yield` terminator.
@@ -192,8 +234,6 @@ pub trait Analysis<'tcx>: AnalysisDomain<'tcx> {
     /// about a given `SwitchInt` terminator for each one of its edges—and more efficient—the
     /// engine doesn't need to clone the exit state for a block unless
     /// `SwitchIntEdgeEffects::apply` is actually called.
-    ///
-    /// FIXME: This class of effects is not supported for backward dataflow analyses.
     fn apply_switch_int_edge_effects(
         &self,
         _block: BasicBlock,
@@ -216,7 +256,11 @@ pub trait Analysis<'tcx>: AnalysisDomain<'tcx> {
     ///     .iterate_to_fixpoint()
     ///     .into_results_cursor(body);
     /// ```
-    fn into_engine(self, tcx: TyCtxt<'tcx>, body: &'mir mir::Body<'tcx>) -> Engine<'mir, 'tcx, Self>
+    fn into_engine<'mir>(
+        self,
+        tcx: TyCtxt<'tcx>,
+        body: &'mir mir::Body<'tcx>,
+    ) -> Engine<'mir, 'tcx, Self>
     where
         Self: Sized,
     {
@@ -276,9 +320,7 @@ pub trait GenKillAnalysis<'tcx>: Analysis<'tcx> {
         &self,
         trans: &mut impl GenKill<Self::Idx>,
         block: BasicBlock,
-        func: &mir::Operand<'tcx>,
-        args: &[mir::Operand<'tcx>],
-        return_place: mir::Place<'tcx>,
+        return_places: CallReturnPlaces<'_, 'tcx>,
     );
 
     /// See `Analysis::apply_yield_resume_effect`.
@@ -300,10 +342,10 @@ pub trait GenKillAnalysis<'tcx>: Analysis<'tcx> {
     }
 }
 
-impl<A> Analysis<'tcx> for A
+impl<'tcx, A> Analysis<'tcx> for A
 where
     A: GenKillAnalysis<'tcx>,
-    A::Domain: GenKill<A::Idx> + BorrowMut<BitSet<A::Idx>>,
+    A::Domain: GenKill<A::Idx> + BitSetExt<A::Idx>,
 {
     fn apply_statement_effect(
         &self,
@@ -347,11 +389,9 @@ where
         &self,
         state: &mut A::Domain,
         block: BasicBlock,
-        func: &mir::Operand<'tcx>,
-        args: &[mir::Operand<'tcx>],
-        return_place: mir::Place<'tcx>,
+        return_places: CallReturnPlaces<'_, 'tcx>,
     ) {
-        self.call_return_effect(state, block, func, args, return_place);
+        self.call_return_effect(state, block, return_places);
     }
 
     fn apply_yield_resume_effect(
@@ -374,7 +414,11 @@ where
 
     /* Extension methods */
 
-    fn into_engine(self, tcx: TyCtxt<'tcx>, body: &'mir mir::Body<'tcx>) -> Engine<'mir, 'tcx, Self>
+    fn into_engine<'mir>(
+        self,
+        tcx: TyCtxt<'tcx>,
+        body: &'mir mir::Body<'tcx>,
+    ) -> Engine<'mir, 'tcx, Self>
     where
         Self: Sized,
     {
@@ -433,7 +477,7 @@ impl<T: Idx> GenKillSet<T> {
         }
     }
 
-    pub fn apply(&self, state: &mut BitSet<T>) {
+    pub fn apply(&self, state: &mut impl BitSetExt<T>) {
         state.union(&self.gen);
         state.subtract(&self.kill);
     }
@@ -452,6 +496,16 @@ impl<T: Idx> GenKill<T> for GenKillSet<T> {
 }
 
 impl<T: Idx> GenKill<T> for BitSet<T> {
+    fn gen(&mut self, elem: T) {
+        self.insert(elem);
+    }
+
+    fn kill(&mut self, elem: T) {
+        self.remove(elem);
+    }
+}
+
+impl<T: Idx> GenKill<T> for ChunkedBitSet<T> {
     fn gen(&mut self, elem: T) {
         self.insert(elem);
     }
@@ -540,6 +594,30 @@ pub trait SwitchIntEdgeEffects<D> {
     /// Calls `apply_edge_effect` for each outgoing edge from a `SwitchInt` terminator and
     /// records the results.
     fn apply(&mut self, apply_edge_effect: impl FnMut(&mut D, SwitchIntTarget));
+}
+
+/// List of places that are written to after a successful (non-unwind) return
+/// from a `Call` or `InlineAsm`.
+pub enum CallReturnPlaces<'a, 'tcx> {
+    Call(mir::Place<'tcx>),
+    InlineAsm(&'a [mir::InlineAsmOperand<'tcx>]),
+}
+
+impl<'tcx> CallReturnPlaces<'_, 'tcx> {
+    pub fn for_each(&self, mut f: impl FnMut(mir::Place<'tcx>)) {
+        match *self {
+            Self::Call(place) => f(place),
+            Self::InlineAsm(operands) => {
+                for op in operands {
+                    match *op {
+                        mir::InlineAsmOperand::Out { place: Some(place), .. }
+                        | mir::InlineAsmOperand::InOut { out_place: Some(place), .. } => f(place),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

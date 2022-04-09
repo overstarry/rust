@@ -5,7 +5,7 @@ use rustc_span::Symbol;
 use rustc_target::abi::call::FnAbi;
 
 use crate::abi::FnAbiGccExt;
-use crate::context::{CodegenCx, unit_name};
+use crate::context::CodegenCx;
 use crate::intrinsic::llvm;
 
 impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
@@ -17,20 +17,18 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
                 global.set_tls_model(self.tls_model);
             }
             if let Some(link_section) = link_section {
-                global.set_link_section(&link_section.as_str());
+                global.set_link_section(link_section.as_str());
             }
             global
         }
         else {
-            self.declare_global(name, ty, is_tls, link_section)
+            self.declare_global(name, ty, GlobalKind::Exported, is_tls, link_section)
         }
     }
 
     pub fn declare_unnamed_global(&self, ty: Type<'gcc>) -> LValue<'gcc> {
-        let index = self.global_gen_sym_counter.get();
-        self.global_gen_sym_counter.set(index + 1);
-        let name = format!("global_{}_{}", index, unit_name(&self.codegen_unit));
-        self.context.new_global(None, GlobalKind::Exported, ty, &name)
+        let name = self.generate_local_symbol_name("global");
+        self.context.new_global(None, GlobalKind::Internal, ty, &name)
     }
 
     pub fn declare_global_with_linkage(&self, name: &str, ty: Type<'gcc>, linkage: GlobalKind) -> LValue<'gcc> {
@@ -47,13 +45,13 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         unsafe { std::mem::transmute(func) }
     }*/
 
-    pub fn declare_global(&self, name: &str, ty: Type<'gcc>, is_tls: bool, link_section: Option<Symbol>) -> LValue<'gcc> {
-        let global = self.context.new_global(None, GlobalKind::Exported, ty, name);
+    pub fn declare_global(&self, name: &str, ty: Type<'gcc>, global_kind: GlobalKind, is_tls: bool, link_section: Option<Symbol>) -> LValue<'gcc> {
+        let global = self.context.new_global(None, global_kind, ty, name);
         if is_tls {
             global.set_tls_model(self.tls_model);
         }
         if let Some(link_section) = link_section {
-            global.set_link_section(&link_section.as_str());
+            global.set_link_section(link_section.as_str());
         }
         let global_address = global.get_address(None);
         self.globals.borrow_mut().insert(name.to_string(), global_address);
@@ -82,8 +80,9 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
     }
 
     pub fn declare_fn(&self, name: &str, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> RValue<'gcc> {
-        let (return_type, params, variadic) = fn_abi.gcc_type(self);
+        let (return_type, params, variadic, on_stack_param_indices) = fn_abi.gcc_type(self);
         let func = declare_raw_fn(self, name, () /*fn_abi.llvm_cconv()*/, return_type, &params, variadic);
+        self.on_stack_function_params.borrow_mut().insert(func, on_stack_param_indices);
         // FIXME(antoyo): this is a wrong cast. That requires changing the compiler API.
         unsafe { std::mem::transmute(func) }
     }

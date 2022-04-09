@@ -64,7 +64,12 @@ impl MultiItemModifier for Expander {
                 match &mut resolutions[..] {
                     [] => {}
                     [(_, first_item, _), others @ ..] => {
-                        *first_item = cfg_eval(sess, features, item.clone());
+                        *first_item = cfg_eval(
+                            sess,
+                            features,
+                            item.clone(),
+                            ecx.current_expansion.lint_node_id,
+                        );
                         for (_, item, _) in others {
                             *item = first_item.clone();
                         }
@@ -121,7 +126,7 @@ fn report_bad_target(sess: &Session, item: &Annotatable, span: Span) -> bool {
 
 fn report_unexpected_literal(sess: &Session, lit: &ast::Lit) {
     let help_msg = match lit.token.kind {
-        token::Str if rustc_lexer::is_ident(&lit.token.symbol.as_str()) => {
+        token::Str if rustc_lexer::is_ident(lit.token.symbol.as_str()) => {
             format!("try using `#[derive({})]`", lit.token.symbol)
         }
         _ => "for example, write `#[derive(Debug)]` for `Debug`".to_string(),

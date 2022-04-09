@@ -28,6 +28,7 @@ declare_clippy_lint! {
     ///     Y = 0,
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub ENUM_CLIKE_UNPORTABLE_VARIANT,
     correctness,
     "C-like enums that are `repr(isize/usize)` and have values that don't fit into an `i32`"
@@ -54,7 +55,7 @@ impl<'tcx> LateLintPass<'tcx> for UnportableVariant {
                     if let Some(Constant::Int(val)) = constant.and_then(miri_to_const) {
                         if let ty::Adt(adt, _) = ty.kind() {
                             if adt.is_enum() {
-                                ty = adt.repr.discr_type().to_ty(cx.tcx);
+                                ty = adt.repr().discr_type().to_ty(cx.tcx);
                             }
                         }
                         match ty.kind() {

@@ -31,8 +31,8 @@ crate struct Module<'hir> {
     crate foreigns: Vec<(&'hir hir::ForeignItem<'hir>, Option<Symbol>)>,
 }
 
-impl Module<'hir> {
-    crate fn new(name: Symbol, id: hir::HirId, where_inner: Span) -> Module<'hir> {
+impl Module<'_> {
+    crate fn new(name: Symbol, id: hir::HirId, where_inner: Span) -> Self {
         Module { name, id, where_inner, mods: Vec::new(), items: Vec::new(), foreigns: Vec::new() }
     }
 
@@ -42,13 +42,9 @@ impl Module<'hir> {
 }
 
 // FIXME: Should this be replaced with tcx.def_path_str?
-fn def_id_to_path(tcx: TyCtxt<'_>, did: DefId) -> Vec<String> {
-    let crate_name = tcx.crate_name(did.krate).to_string();
-    let relative = tcx.def_path(did).data.into_iter().filter_map(|elem| {
-        // extern blocks have an empty name
-        let s = elem.data.to_string();
-        if !s.is_empty() { Some(s) } else { None }
-    });
+fn def_id_to_path(tcx: TyCtxt<'_>, did: DefId) -> Vec<Symbol> {
+    let crate_name = tcx.crate_name(did.krate);
+    let relative = tcx.def_path(did).data.into_iter().filter_map(|elem| elem.data.get_opt_name());
     std::iter::once(crate_name).chain(relative).collect()
 }
 
@@ -71,7 +67,7 @@ crate struct RustdocVisitor<'a, 'tcx> {
     inlining: bool,
     /// Are the current module and all of its parents public?
     inside_public_path: bool,
-    exact_paths: FxHashMap<DefId, Vec<String>>,
+    exact_paths: FxHashMap<DefId, Vec<Symbol>>,
 }
 
 impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
@@ -112,13 +108,12 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
         // is declared but also a reexport of itself producing two exports of the same
         // macro in the same module.
         let mut inserted = FxHashSet::default();
-        for export in self.cx.tcx.module_exports(CRATE_DEF_ID).unwrap_or(&[]) {
+        for export in self.cx.tcx.module_reexports(CRATE_DEF_ID).unwrap_or(&[]) {
             if let Res::Def(DefKind::Macro(_), def_id) = export.res {
                 if let Some(local_def_id) = def_id.as_local() {
                     if self.cx.tcx.has_attr(def_id, sym::macro_export) {
                         if inserted.insert(def_id) {
-                            let hir_id = self.cx.tcx.hir().local_def_id_to_hir_id(local_def_id);
-                            let item = self.cx.tcx.hir().expect_item(hir_id);
+                            let item = self.cx.tcx.hir().expect_item(local_def_id);
                             top_level_module.items.push((item, None));
                         }
                     }
@@ -146,6 +141,7 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
                     })
                     .collect::<Vec<_>>()
             })
+            .chain([Cfg::Cfg(sym::test, None)].into_iter())
             .collect();
 
         self.cx.cache.exact_paths = self.exact_paths;
@@ -192,9 +188,7 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
         debug!("maybe_inline_local res: {:?}", res);
 
         let tcx = self.cx.tcx;
-        let res_did = if let Some(did) = res.opt_def_id() {
-            did
-        } else {
+        let Some(res_did) = res.opt_def_id() else {
             return false;
         };
 
@@ -331,8 +325,8 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
 
                 om.items.push((item, renamed))
             }
-            hir::ItemKind::Macro(ref macro_def) => {
-                // `#[macro_export] macro_rules!` items are handled seperately in `visit()`,
+            hir::ItemKind::Macro(ref macro_def, _) => {
+                // `#[macro_export] macro_rules!` items are handled separately in `visit()`,
                 // above, since they need to be documented at the module top level. Accordingly,
                 // we only want to handle macros if one of three conditions holds:
                 //

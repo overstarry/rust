@@ -73,7 +73,7 @@ impl<T: Sized> Unique<T> {
     pub const fn dangling() -> Self {
         // SAFETY: mem::align_of() returns a valid, non-null pointer. The
         // conditions to call new_unchecked() are thus respected.
-        unsafe { Unique::new_unchecked(mem::align_of::<T>() as *mut T) }
+        unsafe { Unique::new_unchecked(crate::ptr::invalid_mut::<T>(mem::align_of::<T>())) }
     }
 }
 
@@ -92,7 +92,7 @@ impl<T: ?Sized> Unique<T> {
 
     /// Creates a new `Unique` if `ptr` is non-null.
     #[inline]
-    pub fn new(ptr: *mut T) -> Option<Self> {
+    pub const fn new(ptr: *mut T) -> Option<Self> {
         if !ptr.is_null() {
             // SAFETY: The pointer has already been checked and is not null.
             Some(unsafe { Unique { pointer: ptr as _, _marker: PhantomData } })
@@ -115,7 +115,7 @@ impl<T: ?Sized> Unique<T> {
     /// (unbound) lifetime is needed, use `&*my_ptr.as_ptr()`.
     #[must_use]
     #[inline]
-    pub unsafe fn as_ref(&self) -> &T {
+    pub const unsafe fn as_ref(&self) -> &T {
         // SAFETY: the caller must guarantee that `self` meets all the
         // requirements for a reference.
         unsafe { &*self.as_ptr() }
@@ -128,7 +128,7 @@ impl<T: ?Sized> Unique<T> {
     /// (unbound) lifetime is needed, use `&mut *my_ptr.as_ptr()`.
     #[must_use]
     #[inline]
-    pub unsafe fn as_mut(&mut self) -> &mut T {
+    pub const unsafe fn as_mut(&mut self) -> &mut T {
         // SAFETY: the caller must guarantee that `self` meets all the
         // requirements for a mutable reference.
         unsafe { &mut *self.as_ptr() }
@@ -146,7 +146,8 @@ impl<T: ?Sized> Unique<T> {
 }
 
 #[unstable(feature = "ptr_internals", issue = "none")]
-impl<T: ?Sized> Clone for Unique<T> {
+#[rustc_const_unstable(feature = "const_clone", issue = "91805")]
+impl<T: ?Sized> const Clone for Unique<T> {
     #[inline]
     fn clone(&self) -> Self {
         *self
@@ -178,6 +179,9 @@ impl<T: ?Sized> fmt::Pointer for Unique<T> {
 
 #[unstable(feature = "ptr_internals", issue = "none")]
 impl<T: ?Sized> const From<&mut T> for Unique<T> {
+    /// Converts a `&mut T` to a `Unique<T>`.
+    ///
+    /// This conversion is infallible since references cannot be null.
     #[inline]
     fn from(reference: &mut T) -> Self {
         // SAFETY: A mutable reference cannot be null

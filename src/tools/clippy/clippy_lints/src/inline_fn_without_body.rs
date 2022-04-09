@@ -1,7 +1,7 @@
 //! checks for `#[inline]` on trait methods without bodies
 
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::sugg::DiagnosticBuilderExt;
+use clippy_utils::sugg::DiagnosticExt;
 use rustc_ast::ast::Attribute;
 use rustc_errors::Applicability;
 use rustc_hir::{TraitFn, TraitItem, TraitItemKind};
@@ -24,6 +24,7 @@ declare_clippy_lint! {
     ///     fn name(&self) -> &'static str;
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub INLINE_FN_WITHOUT_BODY,
     correctness,
     "use of `#[inline]` on trait methods without bodies"

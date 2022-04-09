@@ -7,7 +7,7 @@ use crate::errors::{
 };
 use crate::require_same_types;
 
-use rustc_errors::{pluralize, struct_span_err};
+use rustc_errors::struct_span_err;
 use rustc_hir as hir;
 use rustc_middle::traits::{ObligationCause, ObligationCauseCode};
 use rustc_middle::ty::subst::Subst;
@@ -43,7 +43,6 @@ fn equate_intrinsic_type<'tcx>(
                 span,
                 found,
                 expected,
-                expected_pluralize: pluralize!(expected),
                 descr,
             });
             false
@@ -297,6 +296,11 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
             sym::const_allocate => {
                 (0, vec![tcx.types.usize, tcx.types.usize], tcx.mk_mut_ptr(tcx.types.u8))
             }
+            sym::const_deallocate => (
+                0,
+                vec![tcx.mk_mut_ptr(tcx.types.u8), tcx.types.usize, tcx.types.usize],
+                tcx.mk_unit(),
+            ),
 
             sym::ptr_offset_from => {
                 (1, vec![tcx.mk_imm_ptr(param(0)), tcx.mk_imm_ptr(param(0))], tcx.types.isize)
@@ -453,7 +457,7 @@ pub fn check_platform_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>)
         sym::simd_scatter => (3, vec![param(0), param(1), param(2)], tcx.mk_unit()),
         sym::simd_insert => (2, vec![param(0), tcx.types.u32, param(1)], param(0)),
         sym::simd_extract => (2, vec![param(0), tcx.types.u32], param(1)),
-        sym::simd_cast => (2, vec![param(0)], param(1)),
+        sym::simd_cast | sym::simd_as => (2, vec![param(0)], param(1)),
         sym::simd_bitmask => (2, vec![param(0)], param(1)),
         sym::simd_select | sym::simd_select_bitmask => {
             (2, vec![param(0), param(1), param(1)], param(1))

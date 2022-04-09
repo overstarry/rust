@@ -168,6 +168,14 @@ impl Constant {
             None
         }
     }
+
+    #[must_use]
+    pub fn peel_refs(mut self) -> Self {
+        while let Constant::Ref(r) = self {
+            self = *r;
+        }
+        self
+    }
 }
 
 /// Parses a `LitKind` to a `Constant`.
@@ -215,7 +223,7 @@ pub fn constant_simple<'tcx>(
     constant(lcx, typeck_results, e).and_then(|(cst, res)| if res { None } else { Some(cst) })
 }
 
-pub fn constant_full_int(
+pub fn constant_full_int<'tcx>(
     lcx: &LateContext<'tcx>,
     typeck_results: &ty::TypeckResults<'tcx>,
     e: &Expr<'_>,
@@ -319,21 +327,20 @@ impl<'a, 'tcx> ConstEvalLateContext<'a, 'tcx> {
                     if let ExprKind::Path(qpath) = &callee.kind;
                     let res = self.typeck_results.qpath_res(qpath, callee.hir_id);
                     if let Some(def_id) = res.opt_def_id();
-                    let def_path: Vec<_> = self.lcx.get_def_path(def_id).into_iter().map(Symbol::as_str).collect();
-                    let def_path: Vec<&str> = def_path.iter().take(4).map(|s| &**s).collect();
+                    let def_path = self.lcx.get_def_path(def_id);
+                    let def_path: Vec<&str> = def_path.iter().take(4).map(Symbol::as_str).collect();
                     if let ["core", "num", int_impl, "max_value"] = *def_path;
                     then {
-                       let value = match int_impl {
-                           "<impl i8>" => i8::MAX as u128,
-                           "<impl i16>" => i16::MAX as u128,
-                           "<impl i32>" => i32::MAX as u128,
-                           "<impl i64>" => i64::MAX as u128,
-                           "<impl i128>" => i128::MAX as u128,
-                           _ => return None,
-                       };
-                       Some(Constant::Int(value))
-                    }
-                    else {
+                        let value = match int_impl {
+                            "<impl i8>" => i8::MAX as u128,
+                            "<impl i16>" => i16::MAX as u128,
+                            "<impl i32>" => i32::MAX as u128,
+                            "<impl i64>" => i64::MAX as u128,
+                            "<impl i128>" => i128::MAX as u128,
+                            _ => return None,
+                        };
+                        Some(Constant::Int(value))
+                    } else {
                         None
                     }
                 }
@@ -560,11 +567,11 @@ impl<'a, 'tcx> ConstEvalLateContext<'a, 'tcx> {
     }
 }
 
-pub fn miri_to_const(result: &ty::Const<'_>) -> Option<Constant> {
+pub fn miri_to_const(result: ty::Const<'_>) -> Option<Constant> {
     use rustc_middle::mir::interpret::ConstValue;
-    match result.val {
+    match result.val() {
         ty::ConstKind::Value(ConstValue::Scalar(Scalar::Int(int))) => {
-            match result.ty.kind() {
+            match result.ty().kind() {
                 ty::Bool => Some(Constant::Bool(int == ScalarInt::TRUE)),
                 ty::Uint(_) | ty::Int(_) => Some(Constant::Int(int.assert_bits(int.size()))),
                 ty::Float(FloatTy::F32) => Some(Constant::F32(f32::from_bits(
@@ -583,10 +590,11 @@ pub fn miri_to_const(result: &ty::Const<'_>) -> Option<Constant> {
                 _ => None,
             }
         },
-        ty::ConstKind::Value(ConstValue::Slice { data, start, end }) => match result.ty.kind() {
+        ty::ConstKind::Value(ConstValue::Slice { data, start, end }) => match result.ty().kind() {
             ty::Ref(_, tam, _) => match tam.kind() {
                 ty::Str => String::from_utf8(
-                    data.inspect_with_uninit_and_ptr_outside_interpreter(start..end)
+                    data.inner()
+                        .inspect_with_uninit_and_ptr_outside_interpreter(start..end)
                         .to_owned(),
                 )
                 .ok()
@@ -595,10 +603,11 @@ pub fn miri_to_const(result: &ty::Const<'_>) -> Option<Constant> {
             },
             _ => None,
         },
-        ty::ConstKind::Value(ConstValue::ByRef { alloc, offset: _ }) => match result.ty.kind() {
+        ty::ConstKind::Value(ConstValue::ByRef { alloc, offset: _ }) => match result.ty().kind() {
             ty::Array(sub_type, len) => match sub_type.kind() {
-                ty::Float(FloatTy::F32) => match miri_to_const(len) {
+                ty::Float(FloatTy::F32) => match miri_to_const(*len) {
                     Some(Constant::Int(len)) => alloc
+                        .inner()
                         .inspect_with_uninit_and_ptr_outside_interpreter(0..(4 * len as usize))
                         .to_owned()
                         .chunks(4)
@@ -611,8 +620,9 @@ pub fn miri_to_const(result: &ty::Const<'_>) -> Option<Constant> {
                         .map(Constant::Vec),
                     _ => None,
                 },
-                ty::Float(FloatTy::F64) => match miri_to_const(len) {
+                ty::Float(FloatTy::F64) => match miri_to_const(*len) {
                     Some(Constant::Int(len)) => alloc
+                        .inner()
                         .inspect_with_uninit_and_ptr_outside_interpreter(0..(8 * len as usize))
                         .to_owned()
                         .chunks(8)

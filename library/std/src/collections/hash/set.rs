@@ -66,7 +66,7 @@ use super::map::{map_try_reserve_error, RandomState};
 ///
 /// // Iterate over everything.
 /// for book in &books {
-///     println!("{}", book);
+///     println!("{book}");
 /// }
 /// ```
 ///
@@ -91,7 +91,7 @@ use super::map::{map_try_reserve_error, RandomState};
 ///
 /// // Use derived implementation to print the vikings.
 /// for x in &vikings {
-///     println!("{:?}", x);
+///     println!("{x:?}");
 /// }
 /// ```
 ///
@@ -181,10 +181,11 @@ impl<T, S> HashSet<T, S> {
     ///
     /// // Will print in an arbitrary order.
     /// for x in set.iter() {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     /// ```
     #[inline]
+    #[rustc_lint_query_instability]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn iter(&self) -> Iter<'_, T> {
         Iter { base: self.base.iter() }
@@ -226,24 +227,30 @@ impl<T, S> HashSet<T, S> {
         self.base.is_empty()
     }
 
-    /// Clears the set, returning all elements in an iterator.
+    /// Clears the set, returning all elements as an iterator. Keeps the
+    /// allocated memory for reuse.
+    ///
+    /// If the returned iterator is dropped before being fully consumed, it
+    /// drops the remaining elements. The returned iterator keeps a mutable
+    /// borrow on the vector to optimize its implementation.
     ///
     /// # Examples
     ///
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let mut set: HashSet<_> = [1, 2, 3].iter().cloned().collect();
+    /// let mut set = HashSet::from([1, 2, 3]);
     /// assert!(!set.is_empty());
     ///
     /// // print 1, 2, 3 in an arbitrary order
     /// for i in set.drain() {
-    ///     println!("{}", i);
+    ///     println!("{i}");
     /// }
     ///
     /// assert!(set.is_empty());
     /// ```
     #[inline]
+    #[rustc_lint_query_instability]
     #[stable(feature = "drain", since = "1.6.0")]
     pub fn drain(&mut self) -> Drain<'_, T> {
         Drain { base: self.base.drain() }
@@ -282,12 +289,36 @@ impl<T, S> HashSet<T, S> {
     /// assert_eq!(odds, vec![1, 3, 5, 7]);
     /// ```
     #[inline]
+    #[rustc_lint_query_instability]
     #[unstable(feature = "hash_drain_filter", issue = "59618")]
     pub fn drain_filter<F>(&mut self, pred: F) -> DrainFilter<'_, T, F>
     where
         F: FnMut(&T) -> bool,
     {
         DrainFilter { base: self.base.drain_filter(pred) }
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all elements `e` for which `f(&e)` returns `false`.
+    /// The elements are visited in unsorted (and unspecified) order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashSet;
+    ///
+    /// let mut set = HashSet::from([1, 2, 3, 4, 5, 6]);
+    /// set.retain(|&k| k % 2 == 0);
+    /// assert_eq!(set.len(), 3);
+    /// ```
+    #[rustc_lint_query_instability]
+    #[stable(feature = "retain_hash_collection", since = "1.18.0")]
+    pub fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        self.base.retain(f)
     }
 
     /// Clears the set, removing all values.
@@ -489,12 +520,12 @@ where
     ///
     /// ```
     /// use std::collections::HashSet;
-    /// let a: HashSet<_> = [1, 2, 3].iter().cloned().collect();
-    /// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+    /// let a = HashSet::from([1, 2, 3]);
+    /// let b = HashSet::from([4, 2, 3, 4]);
     ///
     /// // Can be seen as `a - b`.
     /// for x in a.difference(&b) {
-    ///     println!("{}", x); // Print 1
+    ///     println!("{x}"); // Print 1
     /// }
     ///
     /// let diff: HashSet<_> = a.difference(&b).collect();
@@ -506,6 +537,7 @@ where
     /// assert_eq!(diff, [4].iter().collect());
     /// ```
     #[inline]
+    #[rustc_lint_query_instability]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn difference<'a>(&'a self, other: &'a HashSet<T, S>) -> Difference<'a, T, S> {
         Difference { iter: self.iter(), other }
@@ -518,12 +550,12 @@ where
     ///
     /// ```
     /// use std::collections::HashSet;
-    /// let a: HashSet<_> = [1, 2, 3].iter().cloned().collect();
-    /// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+    /// let a = HashSet::from([1, 2, 3]);
+    /// let b = HashSet::from([4, 2, 3, 4]);
     ///
     /// // Print 1, 4 in arbitrary order.
     /// for x in a.symmetric_difference(&b) {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     ///
     /// let diff1: HashSet<_> = a.symmetric_difference(&b).collect();
@@ -533,6 +565,7 @@ where
     /// assert_eq!(diff1, [1, 4].iter().collect());
     /// ```
     #[inline]
+    #[rustc_lint_query_instability]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn symmetric_difference<'a>(
         &'a self,
@@ -548,18 +581,19 @@ where
     ///
     /// ```
     /// use std::collections::HashSet;
-    /// let a: HashSet<_> = [1, 2, 3].iter().cloned().collect();
-    /// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+    /// let a = HashSet::from([1, 2, 3]);
+    /// let b = HashSet::from([4, 2, 3, 4]);
     ///
     /// // Print 2, 3 in arbitrary order.
     /// for x in a.intersection(&b) {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     ///
     /// let intersection: HashSet<_> = a.intersection(&b).collect();
     /// assert_eq!(intersection, [2, 3].iter().collect());
     /// ```
     #[inline]
+    #[rustc_lint_query_instability]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn intersection<'a>(&'a self, other: &'a HashSet<T, S>) -> Intersection<'a, T, S> {
         if self.len() <= other.len() {
@@ -576,18 +610,19 @@ where
     ///
     /// ```
     /// use std::collections::HashSet;
-    /// let a: HashSet<_> = [1, 2, 3].iter().cloned().collect();
-    /// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+    /// let a = HashSet::from([1, 2, 3]);
+    /// let b = HashSet::from([4, 2, 3, 4]);
     ///
     /// // Print 1, 2, 3, 4 in arbitrary order.
     /// for x in a.union(&b) {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     ///
     /// let union: HashSet<_> = a.union(&b).collect();
     /// assert_eq!(union, [1, 2, 3, 4].iter().collect());
     /// ```
     #[inline]
+    #[rustc_lint_query_instability]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn union<'a>(&'a self, other: &'a HashSet<T, S>) -> Union<'a, T, S> {
         if self.len() >= other.len() {
@@ -608,7 +643,7 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let set: HashSet<_> = [1, 2, 3].iter().cloned().collect();
+    /// let set = HashSet::from([1, 2, 3]);
     /// assert_eq!(set.contains(&1), true);
     /// assert_eq!(set.contains(&4), false);
     /// ```
@@ -633,7 +668,7 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let set: HashSet<_> = [1, 2, 3].iter().cloned().collect();
+    /// let set = HashSet::from([1, 2, 3]);
     /// assert_eq!(set.get(&2), Some(&2));
     /// assert_eq!(set.get(&4), None);
     /// ```
@@ -657,7 +692,7 @@ where
     ///
     /// use std::collections::HashSet;
     ///
-    /// let mut set: HashSet<_> = [1, 2, 3].iter().cloned().collect();
+    /// let mut set = HashSet::from([1, 2, 3]);
     /// assert_eq!(set.len(), 3);
     /// assert_eq!(set.get_or_insert(2), &2);
     /// assert_eq!(set.get_or_insert(100), &100);
@@ -744,7 +779,7 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let a: HashSet<_> = [1, 2, 3].iter().cloned().collect();
+    /// let a = HashSet::from([1, 2, 3]);
     /// let mut b = HashSet::new();
     ///
     /// assert_eq!(a.is_disjoint(&b), true);
@@ -770,7 +805,7 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let sup: HashSet<_> = [1, 2, 3].iter().cloned().collect();
+    /// let sup = HashSet::from([1, 2, 3]);
     /// let mut set = HashSet::new();
     ///
     /// assert_eq!(set.is_subset(&sup), true);
@@ -792,7 +827,7 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let sub: HashSet<_> = [1, 2].iter().cloned().collect();
+    /// let sub = HashSet::from([1, 2]);
     /// let mut set = HashSet::new();
     ///
     /// assert_eq!(set.is_superset(&sub), false);
@@ -893,7 +928,7 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let mut set: HashSet<_> = [1, 2, 3].iter().cloned().collect();
+    /// let mut set = HashSet::from([1, 2, 3]);
     /// assert_eq!(set.take(&2), Some(2));
     /// assert_eq!(set.take(&2), None);
     /// ```
@@ -905,29 +940,6 @@ where
         Q: Hash + Eq,
     {
         self.base.take(value)
-    }
-
-    /// Retains only the elements specified by the predicate.
-    ///
-    /// In other words, remove all elements `e` such that `f(&e)` returns `false`.
-    /// The elements are visited in unsorted (and unspecified) order.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::collections::HashSet;
-    ///
-    /// let xs = [1, 2, 3, 4, 5, 6];
-    /// let mut set: HashSet<i32> = xs.iter().cloned().collect();
-    /// set.retain(|&k| k % 2 == 0);
-    /// assert_eq!(set.len(), 3);
-    /// ```
-    #[stable(feature = "retain_hash_collection", since = "1.18.0")]
-    pub fn retain<F>(&mut self, f: F)
-    where
-        F: FnMut(&T) -> bool,
-    {
-        self.base.retain(f)
     }
 }
 
@@ -1022,7 +1034,7 @@ where
     /// assert_eq!(set1, set2);
     /// ```
     fn from(arr: [T; N]) -> Self {
-        crate::array::IntoIter::new(arr).collect()
+        Self::from_iter(arr)
     }
 }
 
@@ -1097,8 +1109,8 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
-    /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
+    /// let a = HashSet::from([1, 2, 3]);
+    /// let b = HashSet::from([3, 4, 5]);
     ///
     /// let set = &a | &b;
     ///
@@ -1130,8 +1142,8 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
-    /// let b: HashSet<_> = vec![2, 3, 4].into_iter().collect();
+    /// let a = HashSet::from([1, 2, 3]);
+    /// let b = HashSet::from([2, 3, 4]);
     ///
     /// let set = &a & &b;
     ///
@@ -1163,8 +1175,8 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
-    /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
+    /// let a = HashSet::from([1, 2, 3]);
+    /// let b = HashSet::from([3, 4, 5]);
     ///
     /// let set = &a ^ &b;
     ///
@@ -1196,8 +1208,8 @@ where
     /// ```
     /// use std::collections::HashSet;
     ///
-    /// let a: HashSet<_> = vec![1, 2, 3].into_iter().collect();
-    /// let b: HashSet<_> = vec![3, 4, 5].into_iter().collect();
+    /// let a = HashSet::from([1, 2, 3]);
+    /// let b = HashSet::from([3, 4, 5]);
     ///
     /// let set = &a - &b;
     ///
@@ -1226,7 +1238,7 @@ where
 /// ```
 /// use std::collections::HashSet;
 ///
-/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+/// let a = HashSet::from([1, 2, 3]);
 ///
 /// let mut iter = a.iter();
 /// ```
@@ -1248,7 +1260,7 @@ pub struct Iter<'a, K: 'a> {
 /// ```
 /// use std::collections::HashSet;
 ///
-/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+/// let a = HashSet::from([1, 2, 3]);
 ///
 /// let mut iter = a.into_iter();
 /// ```
@@ -1269,7 +1281,7 @@ pub struct IntoIter<K> {
 /// ```
 /// use std::collections::HashSet;
 ///
-/// let mut a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+/// let mut a = HashSet::from([1, 2, 3]);
 ///
 /// let mut drain = a.drain();
 /// ```
@@ -1291,7 +1303,7 @@ pub struct Drain<'a, K: 'a> {
 ///
 /// use std::collections::HashSet;
 ///
-/// let mut a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
+/// let mut a = HashSet::from([1, 2, 3]);
 ///
 /// let mut drain_filtered = a.drain_filter(|v| v % 2 == 0);
 /// ```
@@ -1315,8 +1327,8 @@ where
 /// ```
 /// use std::collections::HashSet;
 ///
-/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
-/// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+/// let a = HashSet::from([1, 2, 3]);
+/// let b = HashSet::from([4, 2, 3, 4]);
 ///
 /// let mut intersection = a.intersection(&b);
 /// ```
@@ -1342,8 +1354,8 @@ pub struct Intersection<'a, T: 'a, S: 'a> {
 /// ```
 /// use std::collections::HashSet;
 ///
-/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
-/// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+/// let a = HashSet::from([1, 2, 3]);
+/// let b = HashSet::from([4, 2, 3, 4]);
 ///
 /// let mut difference = a.difference(&b);
 /// ```
@@ -1369,8 +1381,8 @@ pub struct Difference<'a, T: 'a, S: 'a> {
 /// ```
 /// use std::collections::HashSet;
 ///
-/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
-/// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+/// let a = HashSet::from([1, 2, 3]);
+/// let b = HashSet::from([4, 2, 3, 4]);
 ///
 /// let mut intersection = a.symmetric_difference(&b);
 /// ```
@@ -1393,8 +1405,8 @@ pub struct SymmetricDifference<'a, T: 'a, S: 'a> {
 /// ```
 /// use std::collections::HashSet;
 ///
-/// let a: HashSet<u32> = vec![1, 2, 3].into_iter().collect();
-/// let b: HashSet<_> = [4, 2, 3, 4].iter().cloned().collect();
+/// let a = HashSet::from([1, 2, 3]);
+/// let b = HashSet::from([4, 2, 3, 4]);
 ///
 /// let mut union_iter = a.union(&b);
 /// ```
@@ -1411,6 +1423,7 @@ impl<'a, T, S> IntoIterator for &'a HashSet<T, S> {
     type IntoIter = Iter<'a, T>;
 
     #[inline]
+    #[rustc_lint_query_instability]
     fn into_iter(self) -> Iter<'a, T> {
         self.iter()
     }
@@ -1438,10 +1451,11 @@ impl<T, S> IntoIterator for HashSet<T, S> {
     ///
     /// // Will print in an arbitrary order.
     /// for x in &v {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     /// ```
     #[inline]
+    #[rustc_lint_query_instability]
     fn into_iter(self) -> IntoIter<T> {
         IntoIter { base: self.base.into_iter() }
     }

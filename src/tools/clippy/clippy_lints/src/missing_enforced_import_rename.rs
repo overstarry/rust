@@ -33,6 +33,7 @@ declare_clippy_lint! {
     /// ```rust,ignore
     /// use serde_json::Value as JsonValue;
     /// ```
+    #[clippy::version = "1.55.0"]
     pub MISSING_ENFORCED_IMPORT_RENAMES,
     restriction,
     "enforce import renames"
@@ -57,7 +58,7 @@ impl_lint_pass!(ImportRename => [MISSING_ENFORCED_IMPORT_RENAMES]);
 impl LateLintPass<'_> for ImportRename {
     fn check_crate(&mut self, cx: &LateContext<'_>) {
         for Rename { path, rename } in &self.conf_renames {
-            if let Res::Def(_, id) = clippy_utils::path_to_res(cx, &path.split("::").collect::<Vec<_>>()) {
+            if let Res::Def(_, id) = clippy_utils::def_path_res(cx, &path.split("::").collect::<Vec<_>>()) {
                 self.renames.insert(id, Symbol::intern(rename));
             }
         }
@@ -74,7 +75,7 @@ impl LateLintPass<'_> for ImportRename {
             if let Some(import) = match snip.split_once(" as ") {
                 None => Some(snip.as_str()),
                 Some((import, rename)) => {
-                    if rename.trim() == &*name.as_str() {
+                    if rename.trim() == name.as_str() {
                         None
                     } else {
                         Some(import.trim())

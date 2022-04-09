@@ -17,7 +17,6 @@ use rustc_middle::hir::place::ProjectionKind;
 use rustc_middle::mir::FakeReadCause;
 use rustc_middle::ty::{self, adjustment, AdtKind, Ty, TyCtxt};
 use rustc_target::abi::VariantIdx;
-use std::iter;
 
 use crate::mem_categorization as mc;
 
@@ -48,9 +47,26 @@ pub trait Delegate<'tcx> {
         bk: ty::BorrowKind,
     );
 
+    /// The value found at `place` is being copied.
+    /// `diag_expr_id` is the id used for diagnostics (see `consume` for more details).
+    fn copy(&mut self, place_with_id: &PlaceWithHirId<'tcx>, diag_expr_id: hir::HirId) {
+        // In most cases, copying data from `x` is equivalent to doing `*&x`, so by default
+        // we treat a copy of `x` as a borrow of `x`.
+        self.borrow(place_with_id, diag_expr_id, ty::BorrowKind::ImmBorrow)
+    }
+
     /// The path at `assignee_place` is being assigned to.
     /// `diag_expr_id` is the id used for diagnostics (see `consume` for more details).
     fn mutate(&mut self, assignee_place: &PlaceWithHirId<'tcx>, diag_expr_id: hir::HirId);
+
+    /// The path at `binding_place` is a binding that is being initialized.
+    ///
+    /// This covers cases such as `let x = 42;`
+    fn bind(&mut self, binding_place: &PlaceWithHirId<'tcx>, diag_expr_id: hir::HirId) {
+        // Bindings can normally be treated as a regular assignment, so by default we
+        // forward this to the mutate callback.
+        self.mutate(binding_place, diag_expr_id)
+    }
 
     /// The `place` should be a fake read because of specified `cause`.
     fn fake_read(&mut self, place: Place<'tcx>, cause: FakeReadCause, diag_expr_id: hir::HirId);
@@ -229,8 +245,8 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                 }
             }
 
-            hir::ExprKind::Let(pat, ref expr, _) => {
-                self.walk_local(expr, pat, |t| t.borrow_expr(expr, ty::ImmBorrow));
+            hir::ExprKind::Let(hir::Let { pat, init, .. }) => {
+                self.walk_local(init, pat, |t| t.borrow_expr(init, ty::ImmBorrow));
             }
 
             hir::ExprKind::Match(ref discr, arms, _) => {
@@ -360,17 +376,6 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                 }
             }
 
-            hir::ExprKind::LlvmInlineAsm(ia) => {
-                for (o, output) in iter::zip(&ia.inner.outputs, ia.outputs_exprs) {
-                    if o.is_indirect {
-                        self.consume_expr(output);
-                    } else {
-                        self.mutate_expr(output);
-                    }
-                }
-                self.consume_exprs(ia.inputs_exprs);
-            }
-
             hir::ExprKind::Continue(..)
             | hir::ExprKind::Lit(..)
             | hir::ExprKind::ConstBlock(..)
@@ -482,7 +487,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
         }
     }
 
-    fn walk_struct_expr(
+    fn walk_struct_expr<'hir>(
         &mut self,
         fields: &[hir::ExprField<'_>],
         opt_with: &Option<&'hir hir::Expr<'_>>,
@@ -526,7 +531,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                 // struct; however, when EUV is run during typeck, it
                 // may not. This will generate an error earlier in typeck,
                 // so we can just ignore it.
-                if !self.tcx().sess.has_errors() {
+                if !self.tcx().sess.has_errors().is_some() {
                     span_bug!(with_expr.span, "with expression doesn't evaluate to a struct");
                 }
             }
@@ -660,11 +665,9 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                     let pat_ty = return_if_err!(mc.node_ty(pat.hir_id));
                     debug!("walk_pat: pat_ty={:?}", pat_ty);
 
-                    // Each match binding is effectively an assignment to the
-                    // binding being produced.
                     let def = Res::Local(canonical_id);
                     if let Ok(ref binding_place) = mc.cat_res(pat.hir_id, pat.span, pat_ty, def) {
-                        delegate.mutate(binding_place, binding_place.hir_id);
+                        delegate.bind(binding_place, binding_place.hir_id);
                     }
 
                     // It is also a borrow or copy/move of the value being matched.
@@ -705,24 +708,23 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
     /// - When reporting the Place back to the Delegate, ensure that the UpvarId uses the enclosing
     /// closure as the DefId.
     fn walk_captures(&mut self, closure_expr: &hir::Expr<'_>) {
-        fn upvar_is_local_variable(
+        fn upvar_is_local_variable<'tcx>(
             upvars: Option<&'tcx FxIndexMap<hir::HirId, hir::Upvar>>,
-            upvar_id: &hir::HirId,
+            upvar_id: hir::HirId,
             body_owner_is_closure: bool,
         ) -> bool {
-            upvars.map(|upvars| !upvars.contains_key(upvar_id)).unwrap_or(body_owner_is_closure)
+            upvars.map(|upvars| !upvars.contains_key(&upvar_id)).unwrap_or(body_owner_is_closure)
         }
 
         debug!("walk_captures({:?})", closure_expr);
 
-        let closure_def_id = self.tcx().hir().local_def_id(closure_expr.hir_id).to_def_id();
-        let upvars = self.tcx().upvars_mentioned(self.body_owner);
+        let tcx = self.tcx();
+        let closure_def_id = tcx.hir().local_def_id(closure_expr.hir_id).to_def_id();
+        let upvars = tcx.upvars_mentioned(self.body_owner);
 
         // For purposes of this function, generator and closures are equivalent.
-        let body_owner_is_closure = matches!(
-            self.tcx().type_of(self.body_owner.to_def_id()).kind(),
-            ty::Closure(..) | ty::Generator(..)
-        );
+        let body_owner_is_closure =
+            matches!(tcx.hir().body_owner_kind(self.body_owner), hir::BodyOwnerKind::Closure,);
 
         // If we have a nested closure, we want to include the fake reads present in the nested closure.
         if let Some(fake_reads) = self.mc.typeck_results.closure_fake_reads.get(&closure_def_id) {
@@ -731,7 +733,7 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                     PlaceBase::Upvar(upvar_id) => {
                         if upvar_is_local_variable(
                             upvars,
-                            &upvar_id.var_path.hir_id,
+                            upvar_id.var_path.hir_id,
                             body_owner_is_closure,
                         ) {
                             // The nested closure might be fake reading the current (enclosing) closure's local variables.
@@ -795,14 +797,14 @@ impl<'a, 'tcx> ExprUseVisitor<'a, 'tcx> {
                     );
 
                     match capture_info.capture_kind {
-                        ty::UpvarCapture::ByValue(_) => {
+                        ty::UpvarCapture::ByValue => {
                             self.delegate_consume(&place_with_id, place_with_id.hir_id);
                         }
                         ty::UpvarCapture::ByRef(upvar_borrow) => {
                             self.delegate.borrow(
                                 &place_with_id,
                                 place_with_id.hir_id,
-                                upvar_borrow.kind,
+                                upvar_borrow,
                             );
                         }
                     }
@@ -840,13 +842,11 @@ fn delegate_consume<'a, 'tcx>(
 
     match mode {
         ConsumeMode::Move => delegate.consume(place_with_id, diag_expr_id),
-        ConsumeMode::Copy => {
-            delegate.borrow(place_with_id, diag_expr_id, ty::BorrowKind::ImmBorrow)
-        }
+        ConsumeMode::Copy => delegate.copy(place_with_id, diag_expr_id),
     }
 }
 
-fn is_multivariant_adt(ty: Ty<'tcx>) -> bool {
+fn is_multivariant_adt(ty: Ty<'_>) -> bool {
     if let ty::Adt(def, _) = ty.kind() {
         // Note that if a non-exhaustive SingleVariant is defined in another crate, we need
         // to assume that more cases will be added to the variant in the future. This mean
@@ -859,7 +859,7 @@ fn is_multivariant_adt(ty: Ty<'tcx>) -> bool {
             }
             AdtKind::Enum => def.is_variant_list_non_exhaustive(),
         };
-        def.variants.len() > 1 || (!def.did.is_local() && is_non_exhaustive)
+        def.variants().len() > 1 || (!def.did().is_local() && is_non_exhaustive)
     } else {
         false
     }

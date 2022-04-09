@@ -2,7 +2,7 @@ use crate::interface::{Compiler, Result};
 use crate::proc_macro_decls;
 use crate::util;
 
-use rustc_ast::mut_visit::MutVisitor;
+use ast::CRATE_NODE_ID;
 use rustc_ast::{self as ast, visit};
 use rustc_borrowck as mir_borrowck;
 use rustc_codegen_ssa::back::link::emit_metadata;
@@ -10,17 +10,17 @@ use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::parallel;
 use rustc_data_structures::sync::{Lrc, OnceCell, WorkerLocal};
 use rustc_data_structures::temp_dir::MaybeTempDir;
-use rustc_errors::{ErrorReported, PResult};
-use rustc_expand::base::ExtCtxt;
+use rustc_errors::{Applicability, ErrorGuaranteed, MultiSpan, PResult};
+use rustc_expand::base::{ExtCtxt, LintStoreExpand, ResolverExpand};
 use rustc_hir::def_id::{StableCrateId, LOCAL_CRATE};
 use rustc_hir::Crate;
-use rustc_lint::LintStore;
+use rustc_lint::{EarlyCheckNode, LintStore};
 use rustc_metadata::creader::CStore;
 use rustc_metadata::{encode_metadata, EncodedMetadata};
 use rustc_middle::arena::Arena;
 use rustc_middle::dep_graph::DepGraph;
 use rustc_middle::ty::query::{ExternProviders, Providers};
-use rustc_middle::ty::{self, GlobalCtxt, ResolverOutputs, TyCtxt};
+use rustc_middle::ty::{self, GlobalCtxt, RegisteredTools, ResolverOutputs, TyCtxt};
 use rustc_mir_build as mir_build;
 use rustc_parse::{parse_crate_from_file, parse_crate_from_source_str, validate_attr};
 use rustc_passes::{self, hir_stats, layout_test};
@@ -28,14 +28,14 @@ use rustc_plugin_impl as plugin;
 use rustc_query_impl::{OnDiskCache, Queries as TcxQueries};
 use rustc_resolve::{Resolver, ResolverArenas};
 use rustc_serialize::json;
-use rustc_session::config::{CrateType, Input, OutputFilenames, OutputType, PpMode, PpSourceMode};
+use rustc_session::config::{CrateType, Input, OutputFilenames, OutputType};
 use rustc_session::cstore::{MetadataLoader, MetadataLoaderDyn};
 use rustc_session::lint;
 use rustc_session::output::{filename_for_input, filename_for_metadata};
 use rustc_session::search_paths::PathKind;
 use rustc_session::{Limit, Session};
-use rustc_span::symbol::{sym, Ident, Symbol};
-use rustc_span::{FileName, MultiSpan};
+use rustc_span::symbol::{sym, Symbol};
+use rustc_span::FileName;
 use rustc_trait_selection::traits;
 use rustc_typeck as typeck;
 use tempfile::Builder as TempFileBuilder;
@@ -188,7 +188,7 @@ pub fn register_plugins<'a>(
         )
     });
 
-    let (krate, features) = rustc_expand::config::features(sess, krate);
+    let (krate, features) = rustc_expand::config::features(sess, krate, CRATE_NODE_ID);
     // these need to be set "early" so that expansion sees `quote` if enabled.
     sess.init_features(features);
 
@@ -233,24 +233,41 @@ pub fn register_plugins<'a>(
     Ok((krate, lint_store))
 }
 
-fn pre_expansion_lint(
+fn pre_expansion_lint<'a>(
     sess: &Session,
     lint_store: &LintStore,
-    krate: &ast::Crate,
-    crate_attrs: &[ast::Attribute],
-    crate_name: &str,
+    registered_tools: &RegisteredTools,
+    check_node: impl EarlyCheckNode<'a>,
+    node_name: &str,
 ) {
-    sess.prof.generic_activity_with_arg("pre_AST_expansion_lint_checks", crate_name).run(|| {
-        rustc_lint::check_ast_crate(
+    sess.prof.generic_activity_with_arg("pre_AST_expansion_lint_checks", node_name).run(|| {
+        rustc_lint::check_ast_node(
             sess,
-            lint_store,
-            krate,
-            crate_attrs,
             true,
+            lint_store,
+            registered_tools,
             None,
             rustc_lint::BuiltinCombinedPreExpansionLintPass::new(),
+            check_node,
         );
     });
+}
+
+// Cannot implement directly for `LintStore` due to trait coherence.
+struct LintStoreExpandImpl<'a>(&'a LintStore);
+
+impl LintStoreExpand for LintStoreExpandImpl<'_> {
+    fn pre_expansion_lint(
+        &self,
+        sess: &Session,
+        registered_tools: &RegisteredTools,
+        node_id: ast::NodeId,
+        attrs: &[ast::Attribute],
+        items: &[rustc_ast::ptr::P<ast::Item>],
+        name: &str,
+    ) {
+        pre_expansion_lint(sess, self.0, registered_tools, (node_id, attrs, items), name);
+    }
 }
 
 /// Runs the "early phases" of the compiler: initial `cfg` processing, loading compiler plugins,
@@ -265,12 +282,11 @@ pub fn configure_and_expand(
     resolver: &mut Resolver<'_>,
 ) -> Result<ast::Crate> {
     tracing::trace!("configure_and_expand");
-    pre_expansion_lint(sess, lint_store, &krate, &krate.attrs, crate_name);
+    pre_expansion_lint(sess, lint_store, resolver.registered_tools(), &krate, crate_name);
     rustc_builtin_macros::register_builtin_macros(resolver);
 
     krate = sess.time("crate_injection", || {
-        let alt_std_name = sess.opts.alt_std_name.as_ref().map(|s| Symbol::intern(s));
-        rustc_builtin_macros::standard_library_imports::inject(krate, resolver, sess, alt_std_name)
+        rustc_builtin_macros::standard_library_imports::inject(krate, resolver, sess)
     });
 
     util::check_attr_crate_type(sess, &krate.attrs, &mut resolver.lint_buffer());
@@ -321,13 +337,8 @@ pub fn configure_and_expand(
             ..rustc_expand::expand::ExpansionConfig::default(crate_name.to_string())
         };
 
-        let crate_attrs = krate.attrs.clone();
-        let extern_mod_loaded = |ident: Ident, attrs, items, span| {
-            let krate = ast::Crate { attrs, items, span };
-            pre_expansion_lint(sess, lint_store, &krate, &crate_attrs, &ident.name.as_str());
-            (krate.attrs, krate.items)
-        };
-        let mut ecx = ExtCtxt::new(sess, cfg, resolver, Some(&extern_mod_loaded));
+        let lint_store = LintStoreExpandImpl(lint_store);
+        let mut ecx = ExtCtxt::new(sess, cfg, resolver, Some(&lint_store));
 
         // Expand macros now!
         let krate = sess.time("expand_crate", || ecx.monotonic_expander().expand_crate(krate));
@@ -362,7 +373,7 @@ pub fn configure_and_expand(
         if recursion_limit_hit {
             // If we hit a recursion limit, exit early to avoid later passes getting overwhelmed
             // with a large AST
-            Err(ErrorReported)
+            Err(ErrorGuaranteed::unchecked_claim_error_was_emitted())
         } else {
             Ok(krate)
         }
@@ -372,17 +383,22 @@ pub fn configure_and_expand(
         rustc_builtin_macros::test_harness::inject(sess, resolver, &mut krate)
     });
 
-    if let Some(PpMode::Source(PpSourceMode::EveryBodyLoops)) = sess.opts.pretty {
-        tracing::debug!("replacing bodies with loop {{}}");
-        util::ReplaceBodyWithLoop::new(resolver).visit_crate(&mut krate);
-    }
-
     let has_proc_macro_decls = sess.time("AST_validation", || {
         rustc_ast_passes::ast_validation::check_crate(sess, &krate, resolver.lint_buffer())
     });
 
     let crate_types = sess.crate_types();
+    let is_executable_crate = crate_types.contains(&CrateType::Executable);
     let is_proc_macro_crate = crate_types.contains(&CrateType::ProcMacro);
+
+    if crate_types.len() > 1 {
+        if is_executable_crate {
+            sess.err("cannot mix `bin` crate type with others");
+        }
+        if is_proc_macro_crate {
+            sess.err("cannot mix `proc-macro` crate type with others");
+        }
+    }
 
     // For backwards compatibility, we don't try to run proc macro injection
     // if rustdoc is run on a proc macro crate without '--crate-type proc-macro' being
@@ -397,10 +413,9 @@ pub fn configure_and_expand(
         );
 
         msg.warn("The generated documentation may be incorrect");
-        msg.emit()
+        msg.emit();
     } else {
         krate = sess.time("maybe_create_a_macro_crate", || {
-            let num_crate_types = crate_types.len();
             let is_test_crate = sess.opts.test;
             rustc_builtin_macros::proc_macro_harness::inject(
                 sess,
@@ -409,7 +424,6 @@ pub fn configure_and_expand(
                 is_proc_macro_crate,
                 has_proc_macro_decls,
                 is_test_crate,
-                num_crate_types,
                 sess.diagnostic(),
             )
         });
@@ -437,18 +451,12 @@ pub fn configure_and_expand(
     });
 
     // Add all buffered lints from the `ParseSess` to the `Session`.
-    // The ReplaceBodyWithLoop pass may have deleted some AST nodes, potentially
-    // causing a delay_span_bug later if a buffered lint refers to such a deleted
-    // AST node (issue #87308). Since everybody_loops is for pretty-printing only,
-    // anyway, we simply skip all buffered lints here.
-    if !matches!(sess.opts.pretty, Some(PpMode::Source(PpSourceMode::EveryBodyLoops))) {
-        sess.parse_sess.buffered_lints.with_lock(|buffered_lints| {
-            info!("{} parse sess buffered_lints", buffered_lints.len());
-            for early_lint in buffered_lints.drain(..) {
-                resolver.lint_buffer().add_early_lint(early_lint);
-            }
-        });
-    }
+    sess.parse_sess.buffered_lints.with_lock(|buffered_lints| {
+        info!("{} parse sess buffered_lints", buffered_lints.len());
+        for early_lint in buffered_lints.drain(..) {
+            resolver.lint_buffer().add_early_lint(early_lint);
+        }
+    });
 
     // Gate identifiers containing invalid Unicode codepoints that were recovered during lexing.
     sess.parse_sess.bad_unicode_identifiers.with_lock(|identifiers| {
@@ -456,11 +464,40 @@ pub fn configure_and_expand(
         identifiers.sort_by_key(|&(key, _)| key);
         for (ident, mut spans) in identifiers.into_iter() {
             spans.sort();
-            sess.diagnostic().span_err(
-                MultiSpan::from(spans),
-                &format!("identifiers cannot contain emoji: `{}`", ident),
-            );
+            if ident == sym::ferris {
+                let first_span = spans[0];
+                sess.diagnostic()
+                    .struct_span_err(
+                        MultiSpan::from(spans),
+                        "Ferris cannot be used as an identifier",
+                    )
+                    .span_suggestion(
+                        first_span,
+                        "try using their name instead",
+                        "ferris".to_string(),
+                        Applicability::MaybeIncorrect,
+                    )
+                    .emit();
+            } else {
+                sess.diagnostic().span_err(
+                    MultiSpan::from(spans),
+                    &format!("identifiers cannot contain emoji: `{}`", ident),
+                );
+            }
         }
+    });
+
+    sess.time("early_lint_checks", || {
+        let lint_buffer = Some(std::mem::take(resolver.lint_buffer()));
+        rustc_lint::check_ast_node(
+            sess,
+            false,
+            lint_store,
+            resolver.registered_tools(),
+            lint_buffer,
+            rustc_lint::BuiltinCombinedEarlyLintPass::new(),
+            &krate,
+        )
     });
 
     Ok(krate)
@@ -468,7 +505,6 @@ pub fn configure_and_expand(
 
 pub fn lower_to_hir<'res, 'tcx>(
     sess: &'tcx Session,
-    lint_store: &LintStore,
     resolver: &'res mut Resolver<'_>,
     krate: Rc<ast::Crate>,
     arena: &'tcx rustc_ast_lowering::Arena<'tcx>,
@@ -481,18 +517,6 @@ pub fn lower_to_hir<'res, 'tcx>(
         rustc_parse::nt_to_tokenstream,
         arena,
     );
-
-    sess.time("early_lint_checks", || {
-        rustc_lint::check_ast_crate(
-            sess,
-            lint_store,
-            &krate,
-            &krate.attrs,
-            false,
-            Some(std::mem::take(resolver.lint_buffer())),
-            rustc_lint::BuiltinCombinedEarlyLintPass::new(),
-        )
-    });
 
     // Drop AST to free memory
     sess.time("drop_ast", || std::mem::drop(krate));
@@ -568,7 +592,7 @@ fn output_conflicts_with_dir(output_paths: &[PathBuf]) -> Option<PathBuf> {
 fn escape_dep_filename(filename: &str) -> String {
     // Apparently clang and gcc *only* escape spaces:
     // https://llvm.org/klaus/clang/commit/9d50634cfc268ecc9a7250226dd5ca0e945240d4
-    filename.replace(" ", "\\ ")
+    filename.replace(' ', "\\ ")
 }
 
 // Makefile comments only need escaping newlines and `\`.
@@ -615,7 +639,7 @@ fn write_out_deps(
         // (e.g. accessed in proc macros).
         let file_depinfo = sess.parse_sess.file_depinfo.borrow();
         let extra_tracked_files = file_depinfo.iter().map(|path_sym| {
-            let path = PathBuf::from(&*path_sym.as_str());
+            let path = PathBuf::from(path_sym.as_str());
             let file = FileName::from(path);
             escape_dep_filename(&file.prefer_local().to_string())
         });
@@ -629,13 +653,13 @@ fn write_out_deps(
             boxed_resolver.borrow_mut().access(|resolver| {
                 for cnum in resolver.cstore().crates_untracked() {
                     let source = resolver.cstore().crate_source_untracked(cnum);
-                    if let Some((path, _)) = source.dylib {
+                    if let Some((path, _)) = &source.dylib {
                         files.push(escape_dep_filename(&path.display().to_string()));
                     }
-                    if let Some((path, _)) = source.rlib {
+                    if let Some((path, _)) = &source.rlib {
                         files.push(escape_dep_filename(&path.display().to_string()));
                     }
-                    if let Some((path, _)) = source.rmeta {
+                    if let Some((path, _)) = &source.rmeta {
                         files.push(escape_dep_filename(&path.display().to_string()));
                     }
                 }
@@ -717,29 +741,30 @@ pub fn prepare_outputs(
     if let Some(ref input_path) = compiler.input_path {
         if sess.opts.will_create_output_file() {
             if output_contains_path(&output_paths, input_path) {
-                sess.err(&format!(
+                let reported = sess.err(&format!(
                     "the input file \"{}\" would be overwritten by the generated \
                         executable",
                     input_path.display()
                 ));
-                return Err(ErrorReported);
+                return Err(reported);
             }
             if let Some(dir_path) = output_conflicts_with_dir(&output_paths) {
-                sess.err(&format!(
+                let reported = sess.err(&format!(
                     "the generated executable for the input file \"{}\" conflicts with the \
                         existing directory \"{}\"",
                     input_path.display(),
                     dir_path.display()
                 ));
-                return Err(ErrorReported);
+                return Err(reported);
             }
         }
     }
 
     if let Some(ref dir) = compiler.temps_dir {
         if fs::create_dir_all(dir).is_err() {
-            sess.err("failed to find or create the directory specified by `--temps-dir`");
-            return Err(ErrorReported);
+            let reported =
+                sess.err("failed to find or create the directory specified by `--temps-dir`");
+            return Err(reported);
         }
     }
 
@@ -751,8 +776,9 @@ pub fn prepare_outputs(
     if !only_dep_info {
         if let Some(ref dir) = compiler.output_dir {
             if fs::create_dir_all(dir).is_err() {
-                sess.err("failed to find or create the directory specified by `--out-dir`");
-                return Err(ErrorReported);
+                let reported =
+                    sess.err("failed to find or create the directory specified by `--out-dir`");
+                return Err(reported);
             }
         }
     }
@@ -825,9 +851,8 @@ pub fn create_global_ctxt<'tcx>(
     dep_graph.assert_ignored();
 
     let sess = &compiler.session();
-    let krate = resolver
-        .borrow_mut()
-        .access(|resolver| lower_to_hir(sess, &lint_store, resolver, krate, hir_arena));
+    let krate =
+        resolver.borrow_mut().access(|resolver| lower_to_hir(sess, resolver, krate, hir_arena));
     let resolver_outputs = BoxedResolver::to_resolver_outputs(resolver);
 
     let query_result_on_disk_cache = rustc_incremental::load_query_result_cache(sess);
@@ -897,11 +922,17 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
                 });
             },
             {
-                // We force these querie to run,
+                sess.time("unused_lib_feature_checking", || {
+                    rustc_passes::stability::check_unused_or_stable_features(tcx)
+                });
+            },
+            {
+                // We force these queries to run,
                 // since they might not otherwise get called.
                 // This marks the corresponding crate-level attributes
                 // as used, and ensures that their values are valid.
                 tcx.ensure().limits(());
+                tcx.ensure().stability_index(());
             }
         );
     });
@@ -956,8 +987,8 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
     // lot of annoying errors in the ui tests (basically,
     // lint warnings and so on -- kindck used to do this abort, but
     // kindck is gone now). -nmatsakis
-    if sess.has_errors() {
-        return Err(ErrorReported);
+    if let Some(reported) = sess.has_errors() {
+        return Err(reported);
     }
 
     sess.time("misc_checking_3", || {
@@ -970,12 +1001,8 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) -> Result<()> {
                         tcx.ensure().check_private_in_public(());
                     },
                     {
-                        sess.time("death_checking", || rustc_passes::dead::check_crate(tcx));
-                    },
-                    {
-                        sess.time("unused_lib_feature_checking", || {
-                            rustc_passes::stability::check_unused_or_stable_features(tcx)
-                        });
+                        tcx.hir()
+                            .par_for_each_module(|module| tcx.ensure().check_mod_deathness(module));
                     },
                     {
                         sess.time("lint_checking", || {
@@ -1033,8 +1060,8 @@ fn encode_and_write_metadata(
 
     let need_metadata_file = tcx.sess.opts.output_types.contains_key(&OutputType::Metadata);
     if need_metadata_file {
-        let crate_name = &tcx.crate_name(LOCAL_CRATE).as_str();
-        let out_filename = filename_for_metadata(tcx.sess, crate_name, outputs);
+        let crate_name = tcx.crate_name(LOCAL_CRATE);
+        let out_filename = filename_for_metadata(tcx.sess, crate_name.as_str(), outputs);
         // To avoid races with another rustc process scanning the output directory,
         // we need to write the file somewhere else and atomically move it to its
         // final destination, with an `fs::rename` call. In order for the rename to

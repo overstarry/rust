@@ -49,7 +49,7 @@ pub enum Component<'tcx> {
 
 /// Push onto `out` all the things that must outlive `'a` for the condition
 /// `ty0: 'a` to hold. Note that `ty0` must be a **fully resolved type**.
-pub fn push_outlives_components(
+pub fn push_outlives_components<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty0: Ty<'tcx>,
     out: &mut SmallVec<[Component<'tcx>; 4]>,
@@ -59,7 +59,7 @@ pub fn push_outlives_components(
     debug!("components({:?}) = {:?}", ty0, out);
 }
 
-fn compute_components(
+fn compute_components<'tcx>(
     tcx: TyCtxt<'tcx>,
     ty: Ty<'tcx>,
     out: &mut SmallVec<[Component<'tcx>; 4]>,
@@ -125,7 +125,7 @@ fn compute_components(
             // regionck more ways to prove that it holds. However,
             // regionck is not (at least currently) prepared to deal with
             // higher-ranked regions that may appear in the
-            // trait-ref. Therefore, if we see any higher-ranke regions,
+            // trait-ref. Therefore, if we see any higher-ranked regions,
             // we simply fallback to the most restrictive rule, which
             // requires that `Pi: 'a` for all `i`.
             ty::Projection(ref data) => {
@@ -190,13 +190,13 @@ fn compute_components(
         }
 }
 
-fn compute_components_recursive(
+fn compute_components_recursive<'tcx>(
     tcx: TyCtxt<'tcx>,
     parent: GenericArg<'tcx>,
     out: &mut SmallVec<[Component<'tcx>; 4]>,
     visited: &mut SsoHashSet<GenericArg<'tcx>>,
 ) {
-    for child in parent.walk_shallow(tcx, visited) {
+    for child in parent.walk_shallow(visited) {
         match child.unpack() {
             GenericArgKind::Type(ty) => {
                 compute_components(tcx, ty, out, visited);

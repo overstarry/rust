@@ -65,6 +65,7 @@ declare_clippy_lint! {
     /// // Better
     /// fn foo(v: u32) {}
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub TRIVIALLY_COPY_PASS_BY_REF,
     pedantic,
     "functions taking small copyable arguments by reference"
@@ -98,6 +99,7 @@ declare_clippy_lint! {
     /// // Good
     /// fn foo(v: &TooLarge) {}
     /// ```
+    #[clippy::version = "1.49.0"]
     pub LARGE_TYPES_PASSED_BY_VALUE,
     pedantic,
     "functions taking large arguments by value"
@@ -165,8 +167,8 @@ impl<'tcx> PassByRefOrValue {
 
                     if_chain! {
                         if !output_lts.contains(input_lt);
-                        if is_copy(cx, ty);
-                        if let Some(size) = cx.layout_of(ty).ok().map(|l| l.size.bytes());
+                        if is_copy(cx, *ty);
+                        if let Some(size) = cx.layout_of(*ty).ok().map(|l| l.size.bytes());
                         if size <= self.ref_min_size;
                         if let hir::TyKind::Rptr(_, MutTy { ty: decl_ty, .. }) = input.kind;
                         then {

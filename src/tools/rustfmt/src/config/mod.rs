@@ -106,6 +106,8 @@ create_config! {
     // Misc.
     remove_nested_parens: bool, true, true, "Remove nested parens";
     combine_control_expr: bool, true, false, "Combine control expressions with function calls";
+    short_array_element_width_threshold: usize, 10, true,
+        "Width threshold for an array element to be considered short";
     overflow_delimited_expr: bool, false, false,
         "Allow trailing bracket/brace delimited expressions to overflow";
     struct_field_align_threshold: usize, 0, false,
@@ -138,7 +140,7 @@ create_config! {
     inline_attribute_width: usize, 0, false,
         "Write an item and its attribute on the same line \
         if their combined width is below a threshold";
-    format_generated_files: bool, false, false, "Format generated files";
+    format_generated_files: bool, true, false, "Format generated files";
 
     // Options that can change the source code beyond whitespace/blocks (somewhat linty things)
     merge_derives: bool, true, true, "Merge multiple `#[derive(...)]` into a single one";
@@ -364,7 +366,9 @@ fn get_toml_path(dir: &Path) -> Result<Option<PathBuf>, Error> {
             // find the project file yet, and continue searching.
             Err(e) => {
                 if e.kind() != ErrorKind::NotFound {
-                    return Err(e);
+                    let ctx = format!("Failed to get metadata for config file {:?}", &config_file);
+                    let err = anyhow::Error::new(e).context(ctx);
+                    return Err(Error::new(ErrorKind::Other, err));
                 }
             }
             _ => {}
@@ -404,6 +408,8 @@ fn config_path(options: &dyn CliOptions) -> Result<Option<PathBuf>, Error> {
 mod test {
     use super::*;
     use std::str;
+
+    use rustfmt_config_proc_macro::{nightly_only_test, stable_only_test};
 
     #[allow(dead_code)]
     mod mock {
@@ -525,21 +531,17 @@ mod test {
         assert!(config.license_template.is_none());
     }
 
+    #[nightly_only_test]
     #[test]
     fn test_valid_license_template_path() {
-        if !crate::is_nightly_channel!() {
-            return;
-        }
         let toml = r#"license_template_path = "tests/license-template/lt.txt""#;
         let config = Config::from_toml(toml, Path::new("")).unwrap();
         assert!(config.license_template.is_some());
     }
 
+    #[nightly_only_test]
     #[test]
     fn test_override_existing_license_with_no_license() {
-        if !crate::is_nightly_channel!() {
-            return;
-        }
         let toml = r#"license_template_path = "tests/license-template/lt.txt""#;
         let mut config = Config::from_toml(toml, Path::new("")).unwrap();
         assert!(config.license_template.is_some());
@@ -591,6 +593,7 @@ spaces_around_ranges = false
 binop_separator = "Front"
 remove_nested_parens = true
 combine_control_expr = true
+short_array_element_width_threshold = 10
 overflow_delimited_expr = false
 struct_field_align_threshold = 0
 enum_discrim_align_threshold = 0
@@ -608,7 +611,7 @@ blank_lines_lower_bound = 0
 edition = "2015"
 version = "One"
 inline_attribute_width = 0
-format_generated_files = false
+format_generated_files = true
 merge_derives = true
 use_try_shorthand = false
 use_field_init_shorthand = false
@@ -634,48 +637,42 @@ make_backup = false
         assert_eq!(&toml, &default_config);
     }
 
-    // FIXME(#2183): these tests cannot be run in parallel because they use env vars.
-    // #[test]
-    // fn test_as_not_nightly_channel() {
-    //     let mut config = Config::default();
-    //     assert_eq!(config.was_set().unstable_features(), false);
-    //     config.set().unstable_features(true);
-    //     assert_eq!(config.was_set().unstable_features(), false);
-    // }
+    #[stable_only_test]
+    #[test]
+    fn test_as_not_nightly_channel() {
+        let mut config = Config::default();
+        assert_eq!(config.was_set().unstable_features(), false);
+        config.set().unstable_features(true);
+        assert_eq!(config.was_set().unstable_features(), false);
+    }
 
-    // #[test]
-    // fn test_as_nightly_channel() {
-    //     let v = ::std::env::var("CFG_RELEASE_CHANNEL").unwrap_or(String::from(""));
-    //     ::std::env::set_var("CFG_RELEASE_CHANNEL", "nightly");
-    //     let mut config = Config::default();
-    //     config.set().unstable_features(true);
-    //     assert_eq!(config.was_set().unstable_features(), false);
-    //     config.set().unstable_features(true);
-    //     assert_eq!(config.unstable_features(), true);
-    //     ::std::env::set_var("CFG_RELEASE_CHANNEL", v);
-    // }
+    #[nightly_only_test]
+    #[test]
+    fn test_as_nightly_channel() {
+        let mut config = Config::default();
+        config.set().unstable_features(true);
+        // When we don't set the config from toml or command line options it
+        // doesn't get marked as set by the user.
+        assert_eq!(config.was_set().unstable_features(), false);
+        config.set().unstable_features(true);
+        assert_eq!(config.unstable_features(), true);
+    }
 
-    // #[test]
-    // fn test_unstable_from_toml() {
-    //     let mut config = Config::from_toml("unstable_features = true").unwrap();
-    //     assert_eq!(config.was_set().unstable_features(), false);
-    //     let v = ::std::env::var("CFG_RELEASE_CHANNEL").unwrap_or(String::from(""));
-    //     ::std::env::set_var("CFG_RELEASE_CHANNEL", "nightly");
-    //     config = Config::from_toml("unstable_features = true").unwrap();
-    //     assert_eq!(config.was_set().unstable_features(), true);
-    //     assert_eq!(config.unstable_features(), true);
-    //     ::std::env::set_var("CFG_RELEASE_CHANNEL", v);
-    // }
+    #[nightly_only_test]
+    #[test]
+    fn test_unstable_from_toml() {
+        let config = Config::from_toml("unstable_features = true", Path::new("")).unwrap();
+        assert_eq!(config.was_set().unstable_features(), true);
+        assert_eq!(config.unstable_features(), true);
+    }
 
     #[cfg(test)]
     mod deprecated_option_merge_imports {
         use super::*;
 
+        #[nightly_only_test]
         #[test]
         fn test_old_option_set() {
-            if !crate::is_nightly_channel!() {
-                return;
-            }
             let toml = r#"
                 unstable_features = true
                 merge_imports = true
@@ -684,11 +681,9 @@ make_backup = false
             assert_eq!(config.imports_granularity(), ImportGranularity::Crate);
         }
 
+        #[nightly_only_test]
         #[test]
         fn test_both_set() {
-            if !crate::is_nightly_channel!() {
-                return;
-            }
             let toml = r#"
                 unstable_features = true
                 merge_imports = true
@@ -698,11 +693,9 @@ make_backup = false
             assert_eq!(config.imports_granularity(), ImportGranularity::Preserve);
         }
 
+        #[nightly_only_test]
         #[test]
         fn test_new_overridden() {
-            if !crate::is_nightly_channel!() {
-                return;
-            }
             let toml = r#"
                 unstable_features = true
                 merge_imports = true
@@ -712,11 +705,9 @@ make_backup = false
             assert_eq!(config.imports_granularity(), ImportGranularity::Preserve);
         }
 
+        #[nightly_only_test]
         #[test]
         fn test_old_overridden() {
-            if !crate::is_nightly_channel!() {
-                return;
-            }
             let toml = r#"
                 unstable_features = true
                 imports_granularity = "Module"

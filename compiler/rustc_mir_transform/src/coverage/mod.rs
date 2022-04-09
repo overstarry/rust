@@ -49,6 +49,10 @@ impl Error {
 pub struct InstrumentCoverage;
 
 impl<'tcx> MirPass<'tcx> for InstrumentCoverage {
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.instrument_coverage()
+    }
+
     fn run_pass(&self, tcx: TyCtxt<'tcx>, mir_body: &mut mir::Body<'tcx>) {
         let mir_source = mir_body.source;
 
@@ -62,8 +66,8 @@ impl<'tcx> MirPass<'tcx> for InstrumentCoverage {
             return;
         }
 
-        let hir_id = tcx.hir().local_def_id_to_hir_id(mir_source.def_id().expect_local());
-        let is_fn_like = tcx.hir().get(hir_id).fn_kind().is_some();
+        let is_fn_like =
+            tcx.hir().get_by_def_id(mir_source.def_id().expect_local()).fn_kind().is_some();
 
         // Only instrument functions, methods, and closures (not constants since they are evaluated
         // at compile time by Miri).
@@ -439,7 +443,7 @@ impl<'a, 'tcx> Instrumentor<'a, 'tcx> {
 }
 
 fn inject_edge_counter_basic_block(
-    mir_body: &mut mir::Body<'tcx>,
+    mir_body: &mut mir::Body<'_>,
     from_bb: BasicBlock,
     to_bb: BasicBlock,
 ) -> BasicBlock {
@@ -462,7 +466,7 @@ fn inject_edge_counter_basic_block(
 }
 
 fn inject_statement(
-    mir_body: &mut mir::Body<'tcx>,
+    mir_body: &mut mir::Body<'_>,
     counter_kind: CoverageKind,
     bb: BasicBlock,
     some_code_region: Option<CodeRegion>,
@@ -484,7 +488,7 @@ fn inject_statement(
 }
 
 // Non-code expressions are injected into the coverage map, without generating executable code.
-fn inject_intermediate_expression(mir_body: &mut mir::Body<'tcx>, expression: CoverageKind) {
+fn inject_intermediate_expression(mir_body: &mut mir::Body<'_>, expression: CoverageKind) {
     debug_assert!(matches!(expression, CoverageKind::Expression { .. }));
     debug!("  injecting non-code expression {:?}", expression);
     let inject_in_bb = mir::START_BLOCK;
@@ -575,7 +579,7 @@ fn hash_mir_source<'tcx>(tcx: TyCtxt<'tcx>, hir_body: &'tcx rustc_hir::Body<'tcx
     let mut hcx = tcx.create_no_span_stable_hashing_context();
     let mut stable_hasher = StableHasher::new();
     let owner = hir_body.id().hir_id.owner;
-    let bodies = &tcx.hir_owner_nodes(owner).as_ref().unwrap().bodies;
+    let bodies = &tcx.hir_owner_nodes(owner).unwrap().bodies;
     hcx.with_hir_bodies(false, owner, bodies, |hcx| {
         hir_body.value.hash_stable(hcx, &mut stable_hasher)
     });

@@ -14,17 +14,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use build_helper::{output, t};
-
-use crate::builder::{Builder, RunConfig, ShouldRun, Step};
+use crate::builder::{Builder, Kind, RunConfig, ShouldRun, Step};
 use crate::cache::{Interned, INTERNER};
 use crate::compile;
 use crate::config::TargetSelection;
 use crate::tarball::{GeneratedTarball, OverlayKind, Tarball};
 use crate::tool::{self, Tool};
-use crate::util::{exe, is_dylib, timeit};
+use crate::util::{exe, is_dylib, output, t, timeit};
 use crate::{Compiler, DependencyType, Mode, LLVM_TOOLS};
-use time::{self, Timespec};
 
 pub fn pkgname(builder: &Builder<'_>, component: &str) -> String {
     format!("{}-{}", component, builder.rust_package_vers())
@@ -398,12 +395,12 @@ impl Step for Rustc {
             // component for now.
             maybe_install_llvm_runtime(builder, host, image);
 
-            let src_dir = builder.sysroot_libdir(compiler, host).parent().unwrap().join("bin");
             let dst_dir = image.join("lib/rustlib").join(&*host.triple).join("bin");
             t!(fs::create_dir_all(&dst_dir));
 
             // Copy over lld if it's there
             if builder.config.lld_enabled {
+                let src_dir = builder.sysroot_libdir(compiler, host).parent().unwrap().join("bin");
                 let rust_lld = exe("rust-lld", compiler.host);
                 builder.copy(&src_dir.join(&rust_lld), &dst_dir.join(&rust_lld));
                 // for `-Z gcc-ld=lld`
@@ -417,42 +414,20 @@ impl Step for Rustc {
                 }
             }
 
-            // Copy over llvm-dwp if it's there
-            let exe = exe("rust-llvm-dwp", compiler.host);
-            builder.copy(&src_dir.join(&exe), &dst_dir.join(&exe));
-
             // Man pages
             t!(fs::create_dir_all(image.join("share/man/man1")));
             let man_src = builder.src.join("src/doc/man");
             let man_dst = image.join("share/man/man1");
 
-            // Reproducible builds: If SOURCE_DATE_EPOCH is set, use that as the time.
-            let time = env::var("SOURCE_DATE_EPOCH")
-                .map(|timestamp| {
-                    let epoch = timestamp
-                        .parse()
-                        .map_err(|err| format!("could not parse SOURCE_DATE_EPOCH: {}", err))
-                        .unwrap();
-
-                    time::at(Timespec::new(epoch, 0))
-                })
-                .unwrap_or_else(|_| time::now());
-
-            let month_year = t!(time::strftime("%B %Y", &time));
             // don't use our `bootstrap::util::{copy, cp_r}`, because those try
             // to hardlink, and we don't want to edit the source templates
             for file_entry in builder.read_dir(&man_src) {
                 let page_src = file_entry.path();
                 let page_dst = man_dst.join(file_entry.file_name());
+                let src_text = t!(std::fs::read_to_string(&page_src));
+                let new_text = src_text.replace("<INSERT VERSION HERE>", &builder.version);
+                t!(std::fs::write(&page_dst, &new_text));
                 t!(fs::copy(&page_src, &page_dst));
-                // template in month/year and version number
-                builder.replace_in_file(
-                    &page_dst,
-                    &[
-                        ("<INSERT DATE HERE>", &month_year),
-                        ("<INSERT VERSION HERE>", &builder.version),
-                    ],
-                );
             }
 
             // Debugger scripts
@@ -658,14 +633,6 @@ impl Step for RustcDev {
             &[],
             &tarball.image_dir().join("lib/rustlib/rustc-src/rust"),
         );
-        // This particular crate is used as a build dependency of the above.
-        copy_src_dirs(
-            builder,
-            &builder.src,
-            &["src/build_helper"],
-            &[],
-            &tarball.image_dir().join("lib/rustlib/rustc-src/rust"),
-        );
         for file in src_files {
             tarball.add_file(builder.src.join(file), "lib/rustlib/rustc-src/rust", 0o644);
         }
@@ -757,6 +724,8 @@ fn copy_src_dirs(
             "llvm-project\\llvm",
             "llvm-project/compiler-rt",
             "llvm-project\\compiler-rt",
+            "llvm-project/cmake",
+            "llvm-project\\cmake",
         ];
         if spath.contains("llvm-project")
             && !spath.ends_with("llvm-project")
@@ -852,6 +821,11 @@ impl Step for Src {
                 // not needed and contains symlinks which rustup currently
                 // chokes on when unpacking.
                 "library/backtrace/crates",
+                // these are 30MB combined and aren't necessary for building
+                // the standard library.
+                "library/stdarch/crates/Cargo.toml",
+                "library/stdarch/crates/stdarch-verify",
+                "library/stdarch/crates/intrinsic-test",
             ],
             &dst_src,
         );
@@ -922,6 +896,7 @@ impl Step for PlainSourceTarball {
             cmd.arg("vendor")
                 .arg("--sync")
                 .arg(builder.src.join("./src/tools/rust-analyzer/Cargo.toml"))
+                .arg("--sync")
                 .arg(builder.src.join("./compiler/rustc_codegen_cranelift/Cargo.toml"))
                 .current_dir(&plain_dst_src);
             builder.run(&mut cmd);
@@ -1372,7 +1347,7 @@ impl Step for Extended {
         let mut built_tools = HashSet::new();
         macro_rules! add_component {
             ($name:expr => $step:expr) => {
-                if let Some(tarball) = builder.ensure_if_default($step) {
+                if let Some(tarball) = builder.ensure_if_default($step, Kind::Dist) {
                     tarballs.push(tarball);
                     built_tools.insert($name);
                 }
@@ -1487,11 +1462,10 @@ impl Step for Extended {
             };
             prepare("rustc");
             prepare("cargo");
-            prepare("rust-docs");
             prepare("rust-std");
             prepare("rust-analysis");
             prepare("clippy");
-            for tool in &["rust-demangler", "rls", "rust-analyzer", "miri"] {
+            for tool in &["rust-docs", "rust-demangler", "rls", "rust-analyzer", "miri"] {
                 if built_tools.contains(tool) {
                     prepare(tool);
                 }
@@ -1564,7 +1538,9 @@ impl Step for Extended {
             builder.install(&etc.join("gfx/rust-logo.ico"), &exe, 0o644);
 
             // Generate msi installer
-            let wix = PathBuf::from(env::var_os("WIX").unwrap());
+            let wix_path = env::var_os("WIX")
+                .expect("`WIX` environment variable must be set for generating MSI installer(s).");
+            let wix = PathBuf::from(wix_path);
             let heat = wix.join("bin/heat.exe");
             let candle = wix.join("bin/candle.exe");
             let light = wix.join("bin/light.exe");
@@ -1897,12 +1873,6 @@ fn add_env(builder: &Builder<'_>, cmd: &mut Command, target: TargetSelection) {
     } else {
         cmd.env("CFG_MINGW", "0").env("CFG_ABI", "MSVC");
     }
-
-    if target.contains("x86_64") {
-        cmd.env("CFG_PLATFORM", "x64");
-    } else {
-        cmd.env("CFG_PLATFORM", "x86");
-    }
 }
 
 /// Maybe add LLVM object files to the given destination lib-dir. Allows either static or dynamic linking.
@@ -2082,9 +2052,17 @@ impl Step for RustDev {
             "llvm-bcanalyzer",
             "llvm-cov",
             "llvm-dwp",
+            "llvm-nm",
         ] {
             tarball.add_file(src_bindir.join(exe(bin, target)), "bin", 0o755);
         }
+
+        // We don't build LLD on some platforms, so only add it if it exists
+        let lld_path = builder.lld_out(target).join("bin").join(exe("lld", target));
+        if lld_path.exists() {
+            tarball.add_file(lld_path, "bin", 0o755);
+        }
+
         tarball.add_file(&builder.llvm_filecheck(target), "bin", 0o755);
 
         // Copy the include directory as well; needed mostly to build
@@ -2105,7 +2083,7 @@ impl Step for RustDev {
     }
 }
 
-/// Tarball containing a prebuilt version of the build-manifest tool, intented to be used by the
+/// Tarball containing a prebuilt version of the build-manifest tool, intended to be used by the
 /// release process to avoid cloning the monorepo and building stuff.
 ///
 /// Should not be considered stable by end users.

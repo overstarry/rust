@@ -13,11 +13,10 @@ struct Collector {
     modules: Vec<ForeignModule>,
 }
 
-impl ItemLikeVisitor<'tcx> for Collector {
+impl<'tcx> ItemLikeVisitor<'tcx> for Collector {
     fn visit_item(&mut self, it: &'tcx hir::Item<'tcx>) {
-        let items = match it.kind {
-            hir::ItemKind::ForeignMod { items, .. } => items,
-            _ => return,
+        let hir::ItemKind::ForeignMod { items, .. } = it.kind else {
+            return;
         };
 
         let foreign_items = items.iter().map(|it| it.id.def_id.to_def_id()).collect();

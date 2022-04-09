@@ -12,12 +12,11 @@ impl<'a, 'tcx> RequiredConstsVisitor<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for RequiredConstsVisitor<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for RequiredConstsVisitor<'_, 'tcx> {
     fn visit_constant(&mut self, constant: &Constant<'tcx>, _: Location) {
-        if let Some(ct) = constant.literal.const_for_ty() {
-            if let ConstKind::Unevaluated(_) = ct.val {
-                self.required_consts.push(*constant);
-            }
+        let literal = constant.literal;
+        if let Some(ct) = literal.const_for_ty() && let ConstKind::Unevaluated(_) = ct.val() {
+            self.required_consts.push(*constant);
         }
     }
 }

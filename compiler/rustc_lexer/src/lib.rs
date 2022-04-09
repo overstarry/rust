@@ -161,15 +161,15 @@ pub enum LiteralKind {
     /// "b"abc"", "b"abc"
     ByteStr { terminated: bool },
     /// "r"abc"", "r#"abc"#", "r####"ab"###"c"####", "r#"a"
-    RawStr { n_hashes: u16, err: Option<RawStrError> },
+    RawStr { n_hashes: u8, err: Option<RawStrError> },
     /// "br"abc"", "br#"abc"#", "br####"ab"###"c"####", "br#"a"
-    RawByteStr { n_hashes: u16, err: Option<RawStrError> },
+    RawByteStr { n_hashes: u8, err: Option<RawStrError> },
 }
 
 /// Error produced validating a raw string. Represents cases like:
 /// - `r##~"abcde"##`: `InvalidStarter`
 /// - `r###"abcde"##`: `NoTerminator { expected: 3, found: 2, possible_terminator_offset: Some(11)`
-/// - Too many `#`s (>65535): `TooManyDelimiters`
+/// - Too many `#`s (>255): `TooManyDelimiters`
 // perf note: It doesn't matter that this makes `Token` 36 bytes bigger. See #77629
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RawStrError {
@@ -178,7 +178,7 @@ pub enum RawStrError {
     /// The string was never terminated. `possible_terminator_offset` is the number of characters after `r` or `br` where they
     /// may have intended to terminate it.
     NoTerminator { expected: usize, found: usize, possible_terminator_offset: Option<usize> },
-    /// More than 65535 `#`s exist.
+    /// More than 255 `#`s exist.
     TooManyDelimiters { found: usize },
 }
 
@@ -227,14 +227,15 @@ pub fn first_token(input: &str) -> Token {
 }
 
 /// Creates an iterator that produces tokens from the input string.
-pub fn tokenize(mut input: &str) -> impl Iterator<Item = Token> + '_ {
+pub fn tokenize(input: &str) -> impl Iterator<Item = Token> + '_ {
+    let mut cursor = Cursor::new(input);
     std::iter::from_fn(move || {
-        if input.is_empty() {
-            return None;
+        if cursor.is_eof() {
+            None
+        } else {
+            cursor.reset_len_consumed();
+            Some(cursor.advance_token())
         }
-        let token = first_token(input);
-        input = &input[token.len..];
-        Some(token)
     })
 }
 
@@ -697,12 +698,12 @@ impl Cursor<'_> {
     }
 
     /// Eats the double-quoted string and returns `n_hashes` and an error if encountered.
-    fn raw_double_quoted_string(&mut self, prefix_len: usize) -> (u16, Option<RawStrError>) {
+    fn raw_double_quoted_string(&mut self, prefix_len: usize) -> (u8, Option<RawStrError>) {
         // Wrap the actual function to handle the error with too many hashes.
         // This way, it eats the whole raw string.
         let (n_hashes, err) = self.raw_string_unvalidated(prefix_len);
-        // Only up to 65535 `#`s are allowed in raw strings
-        match u16::try_from(n_hashes) {
+        // Only up to 255 `#`s are allowed in raw strings
+        match u8::try_from(n_hashes) {
             Ok(num) => (num, err),
             // We lie about the number of hashes here :P
             Err(_) => (0, Some(RawStrError::TooManyDelimiters { found: n_hashes })),
@@ -831,12 +832,5 @@ impl Cursor<'_> {
         self.bump();
 
         self.eat_while(is_id_continue);
-    }
-
-    /// Eats symbols while predicate returns true or until the end of file is reached.
-    fn eat_while(&mut self, mut predicate: impl FnMut(char) -> bool) {
-        while predicate(self.first()) && !self.is_eof() {
-            self.bump();
-        }
     }
 }

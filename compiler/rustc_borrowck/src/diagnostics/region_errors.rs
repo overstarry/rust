@@ -1,12 +1,13 @@
 //! Error reporting machinery for lifetime errors.
 
-use rustc_errors::{Applicability, DiagnosticBuilder};
+use rustc_errors::{Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed};
 use rustc_infer::infer::{
     error_reporting::nice_region_error::NiceRegionError,
     error_reporting::unexpected_hidden_region_diagnostic, NllRegionVariableOrigin,
 };
+use rustc_middle::hir::place::PlaceBase;
 use rustc_middle::mir::{ConstraintCategory, ReturnConstraint};
-use rustc_middle::ty::subst::Subst;
+use rustc_middle::ty::subst::{InternalSubsts, Subst};
 use rustc_middle::ty::{self, RegionVid, Ty};
 use rustc_span::symbol::{kw, sym};
 use rustc_span::{BytePos, Span};
@@ -139,14 +140,11 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
 
     /// Returns `true` if a closure is inferred to be an `FnMut` closure.
     fn is_closure_fn_mut(&self, fr: RegionVid) -> bool {
-        if let Some(ty::ReFree(free_region)) = self.to_error_region(fr) {
-            if let ty::BoundRegionKind::BrEnv = free_region.bound_region {
-                if let DefiningTy::Closure(_, substs) =
-                    self.regioncx.universal_regions().defining_ty
-                {
-                    return substs.as_closure().kind() == ty::ClosureKind::FnMut;
-                }
-            }
+        if let Some(ty::ReFree(free_region)) = self.to_error_region(fr).as_deref()
+            && let ty::BoundRegionKind::BrEnv = free_region.bound_region
+            && let DefiningTy::Closure(_, substs) = self.regioncx.universal_regions().defining_ty
+        {
+            return substs.as_closure().kind() == ty::ClosureKind::FnMut;
         }
 
         false
@@ -168,45 +166,38 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                     let type_test_span = type_test.locations.span(&self.body);
 
                     if let Some(lower_bound_region) = lower_bound_region {
-                        self.infcx
-                            .construct_generic_bound_failure(
-                                type_test_span,
-                                None,
-                                type_test.generic_kind,
-                                lower_bound_region,
-                            )
-                            .buffer(&mut self.errors_buffer);
+                        self.buffer_error(self.infcx.construct_generic_bound_failure(
+                            type_test_span,
+                            None,
+                            type_test.generic_kind,
+                            lower_bound_region,
+                        ));
                     } else {
                         // FIXME. We should handle this case better. It
                         // indicates that we have e.g., some region variable
                         // whose value is like `'a+'b` where `'a` and `'b` are
-                        // distinct unrelated univesal regions that are not
+                        // distinct unrelated universal regions that are not
                         // known to outlive one another. It'd be nice to have
                         // some examples where this arises to decide how best
                         // to report it; we could probably handle it by
                         // iterating over the universal regions and reporting
                         // an error that multiple bounds are required.
-                        self.infcx
-                            .tcx
-                            .sess
-                            .struct_span_err(
-                                type_test_span,
-                                &format!("`{}` does not live long enough", type_test.generic_kind),
-                            )
-                            .buffer(&mut self.errors_buffer);
+                        self.buffer_error(self.infcx.tcx.sess.struct_span_err(
+                            type_test_span,
+                            &format!("`{}` does not live long enough", type_test.generic_kind),
+                        ));
                     }
                 }
 
                 RegionErrorKind::UnexpectedHiddenRegion { span, hidden_ty, member_region } => {
                     let named_ty = self.regioncx.name_regions(self.infcx.tcx, hidden_ty);
                     let named_region = self.regioncx.name_regions(self.infcx.tcx, member_region);
-                    unexpected_hidden_region_diagnostic(
+                    self.buffer_error(unexpected_hidden_region_diagnostic(
                         self.infcx.tcx,
                         span,
                         named_ty,
                         named_region,
-                    )
-                    .buffer(&mut self.errors_buffer);
+                    ));
                 }
 
                 RegionErrorKind::BoundUniversalRegionError {
@@ -285,7 +276,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
         if let (Some(f), Some(o)) = (self.to_error_region(fr), self.to_error_region(outlived_fr)) {
             let nice = NiceRegionError::new_from_span(self.infcx, cause.span, o, f);
             if let Some(diag) = nice.try_report_from_nll() {
-                diag.buffer(&mut self.errors_buffer);
+                self.buffer_error(diag);
                 return;
             }
         }
@@ -334,18 +325,59 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
 
         match variance_info {
             ty::VarianceDiagInfo::None => {}
-            ty::VarianceDiagInfo::Mut { kind, ty } => {
-                let kind_name = match kind {
-                    ty::VarianceDiagMutKind::Ref => "reference",
-                    ty::VarianceDiagMutKind::RawPtr => "pointer",
+            ty::VarianceDiagInfo::Invariant { ty, param_index } => {
+                let (desc, note) = match ty.kind() {
+                    ty::RawPtr(ty_mut) => {
+                        assert_eq!(ty_mut.mutbl, rustc_hir::Mutability::Mut);
+                        (
+                            format!("a mutable pointer to `{}`", ty_mut.ty),
+                            "mutable pointers are invariant over their type parameter".to_string(),
+                        )
+                    }
+                    ty::Ref(_, inner_ty, mutbl) => {
+                        assert_eq!(*mutbl, rustc_hir::Mutability::Mut);
+                        (
+                            format!("a mutable reference to `{}`", inner_ty),
+                            "mutable references are invariant over their type parameter"
+                                .to_string(),
+                        )
+                    }
+                    ty::Adt(adt, substs) => {
+                        let generic_arg = substs[param_index as usize];
+                        let identity_substs =
+                            InternalSubsts::identity_for_item(self.infcx.tcx, adt.did());
+                        let base_ty = self.infcx.tcx.mk_adt(*adt, identity_substs);
+                        let base_generic_arg = identity_substs[param_index as usize];
+                        let adt_desc = adt.descr();
+
+                        let desc = format!(
+                            "the type `{ty}`, which makes the generic argument `{generic_arg}` invariant"
+                        );
+                        let note = format!(
+                            "the {adt_desc} `{base_ty}` is invariant over the parameter `{base_generic_arg}`"
+                        );
+                        (desc, note)
+                    }
+                    ty::FnDef(def_id, _) => {
+                        let name = self.infcx.tcx.item_name(*def_id);
+                        let identity_substs =
+                            InternalSubsts::identity_for_item(self.infcx.tcx, *def_id);
+                        let desc = format!("a function pointer to `{name}`");
+                        let note = format!(
+                            "the function `{name}` is invariant over the parameter `{}`",
+                            identity_substs[param_index as usize]
+                        );
+                        (desc, note)
+                    }
+                    _ => panic!("Unexpected type {:?}", ty),
                 };
-                diag.note(&format!("requirement occurs because of a mutable {kind_name} to {ty}",));
-                diag.note(&format!("mutable {kind_name}s are invariant over their type parameter"));
+                diag.note(&format!("requirement occurs because of {desc}",));
+                diag.note(&note);
                 diag.help("see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance");
             }
         }
 
-        diag.buffer(&mut self.errors_buffer);
+        self.buffer_error(diag);
     }
 
     /// Report a specialized error when `FnMut` closures return a reference to a captured variable.
@@ -368,7 +400,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
         &self,
         errci: &ErrorConstraintInfo,
         kind: ReturnConstraint,
-    ) -> DiagnosticBuilder<'tcx> {
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         let ErrorConstraintInfo { outlived_fr, span, .. } = errci;
 
         let mut diag = self
@@ -389,7 +421,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                 "returns a closure that contains a reference to a captured variable, which then \
                  escapes the closure body"
             }
-            ty::Adt(def, _) if self.infcx.tcx.is_diagnostic_item(sym::gen_future, def.did) => {
+            ty::Adt(def, _) if self.infcx.tcx.is_diagnostic_item(sym::gen_future, def.did()) => {
                 "returns an `async` block that contains a reference to a captured variable, which then \
                  escapes the closure body"
             }
@@ -398,17 +430,26 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
 
         diag.span_label(*span, message);
 
-        // FIXME(project-rfc-2229#48): This should store a captured_place not a hir id
-        if let ReturnConstraint::ClosureUpvar(upvar) = kind {
+        if let ReturnConstraint::ClosureUpvar(upvar_field) = kind {
             let def_id = match self.regioncx.universal_regions().defining_ty {
                 DefiningTy::Closure(def_id, _) => def_id,
                 ty => bug!("unexpected DefiningTy {:?}", ty),
             };
 
-            let upvar_def_span = self.infcx.tcx.hir().span(upvar);
-            let upvar_span = self.infcx.tcx.upvars_mentioned(def_id).unwrap()[&upvar].span;
-            diag.span_label(upvar_def_span, "variable defined here");
-            diag.span_label(upvar_span, "variable captured here");
+            let captured_place = &self.upvars[upvar_field.index()].place;
+            let defined_hir = match captured_place.place.base {
+                PlaceBase::Local(hirid) => Some(hirid),
+                PlaceBase::Upvar(upvar) => Some(upvar.var_path.hir_id),
+                _ => None,
+            };
+
+            if defined_hir.is_some() {
+                let upvars_map = self.infcx.tcx.upvars_mentioned(def_id).unwrap();
+                let upvar_def_span = self.infcx.tcx.hir().span(defined_hir.unwrap());
+                let upvar_span = upvars_map.get(&defined_hir.unwrap()).unwrap().span;
+                diag.span_label(upvar_def_span, "variable defined here");
+                diag.span_label(upvar_span, "variable captured here");
+            }
         }
 
         if let Some(fr_span) = self.give_region_a_name(*outlived_fr).unwrap().span() {
@@ -436,7 +477,10 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
     /// LL |     ref_obj(x)
     ///    |     ^^^^^^^^^^ `x` escapes the function body here
     /// ```
-    fn report_escaping_data_error(&self, errci: &ErrorConstraintInfo) -> DiagnosticBuilder<'tcx> {
+    fn report_escaping_data_error(
+        &self,
+        errci: &ErrorConstraintInfo,
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         let ErrorConstraintInfo { span, category, .. } = errci;
 
         let fr_name_and_span = self.regioncx.get_var_name_and_span_for_region(
@@ -537,7 +581,10 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
     ///    |     ^^^^^^^^^^^^^^ function was supposed to return data with lifetime `'a` but it
     ///    |                    is returning data with lifetime `'b`
     /// ```
-    fn report_general_error(&self, errci: &ErrorConstraintInfo) -> DiagnosticBuilder<'tcx> {
+    fn report_general_error(
+        &self,
+        errci: &ErrorConstraintInfo,
+    ) -> DiagnosticBuilder<'tcx, ErrorGuaranteed> {
         let ErrorConstraintInfo {
             fr,
             fr_is_local,
@@ -599,14 +646,14 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
     /// ```
     fn add_static_impl_trait_suggestion(
         &self,
-        diag: &mut DiagnosticBuilder<'tcx>,
+        diag: &mut Diagnostic,
         fr: RegionVid,
         // We need to pass `fr_name` - computing it again will label it twice.
         fr_name: RegionName,
         outlived_fr: RegionVid,
     ) {
-        if let (Some(f), Some(ty::RegionKind::ReStatic)) =
-            (self.to_error_region(fr), self.to_error_region(outlived_fr))
+        if let (Some(f), Some(ty::ReStatic)) =
+            (self.to_error_region(fr), self.to_error_region(outlived_fr).as_deref())
         {
             if let Some(&ty::Opaque(did, substs)) = self
                 .infcx
@@ -629,7 +676,7 @@ impl<'a, 'tcx> MirBorrowckCtxt<'a, 'tcx> {
                             bound.kind().skip_binder()
                         {
                             let r = r.subst(self.infcx.tcx, substs);
-                            if let ty::RegionKind::ReStatic = r {
+                            if r.is_static() {
                                 found = true;
                                 break;
                             } else {

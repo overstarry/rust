@@ -4,7 +4,7 @@ use rustc_data_structures::profiling::SelfProfiler;
 use rustc_hir::def_id::{CrateNum, DefId, DefIndex, LocalDefId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc_hir::definitions::DefPathData;
 use rustc_middle::ty::{TyCtxt, WithOptConstParam};
-use rustc_query_system::query::{QueryCache, QueryCacheStore};
+use rustc_query_system::query::QueryCache;
 use std::fmt::Debug;
 use std::io::Write;
 
@@ -61,8 +61,8 @@ impl<'p, 'c, 'tcx> QueryKeyStringBuilder<'p, 'c, 'tcx> {
 
         match def_key.disambiguated_data.data {
             DefPathData::CrateRoot => {
-                crate_name = self.tcx.crate_name(def_id.krate).as_str();
-                name = &*crate_name;
+                crate_name = self.tcx.crate_name(def_id.krate);
+                name = crate_name.as_str();
                 dis = "";
                 end_index = 3;
             }
@@ -229,7 +229,7 @@ where
 fn alloc_self_profile_query_strings_for_query_cache<'tcx, C>(
     tcx: TyCtxt<'tcx>,
     query_name: &'static str,
-    query_cache: &QueryCacheStore<C>,
+    query_cache: &C,
     string_cache: &mut QueryKeyStringCache,
 ) where
     C: QueryCache,
@@ -251,7 +251,7 @@ fn alloc_self_profile_query_strings_for_query_cache<'tcx, C>(
             // locked while doing so. Instead we copy out the
             // `(query_key, dep_node_index)` pairs and release the lock again.
             let mut query_keys_and_indices = Vec::new();
-            query_cache.iter_results(&mut |k, _, i| query_keys_and_indices.push((k.clone(), i)));
+            query_cache.iter(&mut |k, _, i| query_keys_and_indices.push((k.clone(), i)));
 
             // Now actually allocate the strings. If allocating the strings
             // generates new entries in the query cache, we'll miss them but
@@ -276,7 +276,7 @@ fn alloc_self_profile_query_strings_for_query_cache<'tcx, C>(
             let event_id = event_id_builder.from_label(query_name).to_string_id();
 
             let mut query_invocation_ids = Vec::new();
-            query_cache.iter_results(&mut |_, _, i| {
+            query_cache.iter(&mut |_, _, i| {
                 query_invocation_ids.push(i.into());
             });
 
@@ -295,7 +295,7 @@ fn alloc_self_profile_query_strings_for_query_cache<'tcx, C>(
 /// If we are recording only summary data, the ids will point to
 /// just the query names. If we are recording query keys too, we
 /// allocate the corresponding strings here.
-pub fn alloc_self_profile_query_strings(tcx: TyCtxt<'tcx>) {
+pub fn alloc_self_profile_query_strings(tcx: TyCtxt<'_>) {
     if !tcx.prof.enabled() {
         return;
     }

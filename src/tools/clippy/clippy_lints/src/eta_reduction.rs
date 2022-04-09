@@ -1,17 +1,20 @@
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::higher::VecArgs;
 use clippy_utils::source::snippet_opt;
-use clippy_utils::usage::UsedAfterExprVisitor;
-use clippy_utils::{get_enclosing_loop_or_closure, higher, path_to_local_id};
+use clippy_utils::ty::is_type_diagnostic_item;
+use clippy_utils::usage::local_used_after_expr;
+use clippy_utils::{get_enclosing_loop_or_closure, higher, path_to_local, path_to_local_id};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{Expr, ExprKind, Param, PatKind, Unsafety};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, AutoBorrow};
+use rustc_middle::ty::binding::BindingMode;
 use rustc_middle::ty::subst::Subst;
 use rustc_middle::ty::{self, ClosureKind, Ty, TypeFoldable};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_span::symbol::sym;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -39,6 +42,7 @@ declare_clippy_lint! {
     /// ```
     /// where `foo(_)` is a plain function that takes the exact argument type of
     /// `x`.
+    #[clippy::version = "pre 1.29.0"]
     pub REDUNDANT_CLOSURE,
     style,
     "redundant closures, i.e., `|a| foo(a)` (which can be written as just `foo`)"
@@ -60,6 +64,7 @@ declare_clippy_lint! {
     /// ```rust,ignore
     /// Some('a').map(char::to_uppercase);
     /// ```
+    #[clippy::version = "1.35.0"]
     pub REDUNDANT_CLOSURE_FOR_METHOD_CALLS,
     pedantic,
     "redundant closures for method calls"
@@ -111,6 +116,9 @@ impl<'tcx> LateLintPass<'tcx> for EtaReduction {
             // A type param function ref like `T::f` is not 'static, however
             // it is if cast like `T::f as fn()`. This seems like a rustc bug.
             if !substs.types().any(|t| matches!(t.kind(), ty::Param(_)));
+            let callee_ty_unadjusted = cx.typeck_results().expr_ty(callee).peel_refs();
+            if !is_type_diagnostic_item(cx, callee_ty_unadjusted, sym::Arc);
+            if !is_type_diagnostic_item(cx, callee_ty_unadjusted, sym::Rc);
             then {
                 span_lint_and_then(cx, REDUNDANT_CLOSURE, expr.span, "redundant closure", |diag| {
                     if let Some(mut snippet) = snippet_opt(cx, callee.span) {
@@ -118,7 +126,7 @@ impl<'tcx> LateLintPass<'tcx> for EtaReduction {
                             if let ty::Closure(_, substs) = callee_ty.peel_refs().kind();
                             if substs.as_closure().kind() == ClosureKind::FnMut;
                             if get_enclosing_loop_or_closure(cx.tcx, expr).is_some()
-                                || UsedAfterExprVisitor::is_found(cx, callee);
+                                || path_to_local(callee).map_or(false, |l| local_used_after_expr(cx, l, callee));
 
                             then {
                                 // Mutable closure is used after current expr; we cannot consume it.
@@ -137,7 +145,7 @@ impl<'tcx> LateLintPass<'tcx> for EtaReduction {
         );
 
         if_chain!(
-            if let ExprKind::MethodCall(path, _, args, _) = body.value.kind;
+            if let ExprKind::MethodCall(path, args, _) = body.value.kind;
             if check_inputs(cx, body.params, args);
             let method_def_id = cx.typeck_results().type_dependent_def_id(body.value.hir_id).unwrap();
             let substs = cx.typeck_results().node_substs(body.value.hir_id);
@@ -162,11 +170,17 @@ fn check_inputs(cx: &LateContext<'_>, params: &[Param<'_>], call_args: &[Expr<'_
     if params.len() != call_args.len() {
         return false;
     }
+    let binding_modes = cx.typeck_results().pat_binding_modes();
     std::iter::zip(params, call_args).all(|(param, arg)| {
         match param.pat.kind {
             PatKind::Binding(_, id, ..) if path_to_local_id(arg, id) => {},
             _ => return false,
         }
+        // checks that parameters are not bound as `ref` or `ref mut`
+        if let Some(BindingMode::BindByReference(_)) = binding_modes.get(param.pat.hir_id) {
+            return false;
+        }
+
         match *cx.typeck_results().expr_adjustments(arg) {
             [] => true,
             [
@@ -210,7 +224,7 @@ fn get_ufcs_type_name(cx: &LateContext<'_>, method_def_id: DefId) -> String {
         ty::ImplContainer(def_id) => {
             let ty = cx.tcx.type_of(def_id);
             match ty.kind() {
-                ty::Adt(adt, _) => cx.tcx.def_path_str(adt.did),
+                ty::Adt(adt, _) => cx.tcx.def_path_str(adt.did()),
                 _ => ty.to_string(),
             }
         },

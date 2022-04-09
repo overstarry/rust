@@ -4,7 +4,9 @@ use rustc_middle::ty::TyCtxt;
 use std::ops::RangeInclusive;
 
 use super::visitor::{ResultsVisitable, ResultsVisitor};
-use super::{Analysis, Effect, EffectIndex, GenKillAnalysis, GenKillSet, SwitchIntTarget};
+use super::{
+    Analysis, CallReturnPlaces, Effect, EffectIndex, GenKillAnalysis, GenKillSet, SwitchIntTarget,
+};
 
 pub trait Direction {
     fn is_forward() -> bool;
@@ -16,7 +18,7 @@ pub trait Direction {
     /// Applies all effects between the given `EffectIndex`s.
     ///
     /// `effects.start()` must precede or equal `effects.end()` in this direction.
-    fn apply_effects_in_range<A>(
+    fn apply_effects_in_range<'tcx, A>(
         analysis: &A,
         state: &mut A::Domain,
         block: BasicBlock,
@@ -25,7 +27,7 @@ pub trait Direction {
     ) where
         A: Analysis<'tcx>;
 
-    fn apply_effects_in_block<A>(
+    fn apply_effects_in_block<'tcx, A>(
         analysis: &A,
         state: &mut A::Domain,
         block: BasicBlock,
@@ -33,7 +35,7 @@ pub trait Direction {
     ) where
         A: Analysis<'tcx>;
 
-    fn gen_kill_effects_in_block<A>(
+    fn gen_kill_effects_in_block<'tcx, A>(
         analysis: &A,
         trans: &mut GenKillSet<A::Idx>,
         block: BasicBlock,
@@ -41,7 +43,7 @@ pub trait Direction {
     ) where
         A: GenKillAnalysis<'tcx>;
 
-    fn visit_results_in_block<F, R>(
+    fn visit_results_in_block<'mir, 'tcx, F, R>(
         state: &mut F,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
@@ -50,7 +52,7 @@ pub trait Direction {
     ) where
         R: ResultsVisitable<'tcx, FlowState = F>;
 
-    fn join_state_into_successors_of<A>(
+    fn join_state_into_successors_of<'tcx, A>(
         analysis: &A,
         tcx: TyCtxt<'tcx>,
         body: &mir::Body<'tcx>,
@@ -70,7 +72,7 @@ impl Direction for Backward {
         false
     }
 
-    fn apply_effects_in_block<A>(
+    fn apply_effects_in_block<'tcx, A>(
         analysis: &A,
         state: &mut A::Domain,
         block: BasicBlock,
@@ -90,7 +92,7 @@ impl Direction for Backward {
         }
     }
 
-    fn gen_kill_effects_in_block<A>(
+    fn gen_kill_effects_in_block<'tcx, A>(
         analysis: &A,
         trans: &mut GenKillSet<A::Idx>,
         block: BasicBlock,
@@ -110,7 +112,7 @@ impl Direction for Backward {
         }
     }
 
-    fn apply_effects_in_range<A>(
+    fn apply_effects_in_range<'tcx, A>(
         analysis: &A,
         state: &mut A::Domain,
         block: BasicBlock,
@@ -187,7 +189,7 @@ impl Direction for Backward {
         analysis.apply_statement_effect(state, statement, location);
     }
 
-    fn visit_results_in_block<F, R>(
+    fn visit_results_in_block<'mir, 'tcx, F, R>(
         state: &mut F,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
@@ -219,7 +221,7 @@ impl Direction for Backward {
         vis.visit_block_start(state, block_data, block);
     }
 
-    fn join_state_into_successors_of<A>(
+    fn join_state_into_successors_of<'tcx, A>(
         analysis: &A,
         _tcx: TyCtxt<'tcx>,
         body: &mir::Body<'tcx>,
@@ -235,14 +237,27 @@ impl Direction for Backward {
                 // Apply terminator-specific edge effects.
                 //
                 // FIXME(ecstaticmorse): Avoid cloning the exit state unconditionally.
-                mir::TerminatorKind::Call {
-                    destination: Some((return_place, dest)),
-                    ref func,
-                    ref args,
-                    ..
+                mir::TerminatorKind::Call { destination: Some((return_place, dest)), .. }
+                    if dest == bb =>
+                {
+                    let mut tmp = exit_state.clone();
+                    analysis.apply_call_return_effect(
+                        &mut tmp,
+                        pred,
+                        CallReturnPlaces::Call(return_place),
+                    );
+                    propagate(pred, &tmp);
+                }
+
+                mir::TerminatorKind::InlineAsm {
+                    destination: Some(dest), ref operands, ..
                 } if dest == bb => {
                     let mut tmp = exit_state.clone();
-                    analysis.apply_call_return_effect(&mut tmp, pred, func, args, return_place);
+                    analysis.apply_call_return_effect(
+                        &mut tmp,
+                        pred,
+                        CallReturnPlaces::InlineAsm(operands),
+                    );
                     propagate(pred, &tmp);
                 }
 
@@ -252,12 +267,30 @@ impl Direction for Backward {
                     propagate(pred, &tmp);
                 }
 
+                mir::TerminatorKind::SwitchInt { targets: _, ref discr, switch_ty: _ } => {
+                    let mut applier = BackwardSwitchIntEdgeEffectsApplier {
+                        pred,
+                        exit_state,
+                        values: &body.switch_sources()[bb][pred],
+                        bb,
+                        propagate: &mut propagate,
+                        effects_applied: false,
+                    };
+
+                    analysis.apply_switch_int_edge_effects(pred, discr, &mut applier);
+
+                    if !applier.effects_applied {
+                        propagate(pred, exit_state)
+                    }
+                }
+
                 // Ignore dead unwinds.
                 mir::TerminatorKind::Call { cleanup: Some(unwind), .. }
                 | mir::TerminatorKind::Assert { cleanup: Some(unwind), .. }
                 | mir::TerminatorKind::Drop { unwind: Some(unwind), .. }
                 | mir::TerminatorKind::DropAndReplace { unwind: Some(unwind), .. }
                 | mir::TerminatorKind::FalseUnwind { unwind: Some(unwind), .. }
+                | mir::TerminatorKind::InlineAsm { cleanup: Some(unwind), .. }
                     if unwind == bb =>
                 {
                     if dead_unwinds.map_or(true, |dead| !dead.contains(bb)) {
@@ -271,6 +304,37 @@ impl Direction for Backward {
     }
 }
 
+struct BackwardSwitchIntEdgeEffectsApplier<'a, D, F> {
+    pred: BasicBlock,
+    exit_state: &'a mut D,
+    values: &'a [Option<u128>],
+    bb: BasicBlock,
+    propagate: &'a mut F,
+
+    effects_applied: bool,
+}
+
+impl<D, F> super::SwitchIntEdgeEffects<D> for BackwardSwitchIntEdgeEffectsApplier<'_, D, F>
+where
+    D: Clone,
+    F: FnMut(BasicBlock, &D),
+{
+    fn apply(&mut self, mut apply_edge_effect: impl FnMut(&mut D, SwitchIntTarget)) {
+        assert!(!self.effects_applied);
+
+        let targets = self.values.iter().map(|&value| SwitchIntTarget { value, target: self.bb });
+
+        let mut tmp = None;
+        for target in targets {
+            let tmp = opt_clone_from_or_clone(&mut tmp, self.exit_state);
+            apply_edge_effect(tmp, target);
+            (self.propagate)(self.pred, tmp);
+        }
+
+        self.effects_applied = true;
+    }
+}
+
 /// Dataflow that runs from the entry of a block (the first statement), to its exit (terminator).
 pub struct Forward;
 
@@ -279,7 +343,7 @@ impl Direction for Forward {
         true
     }
 
-    fn apply_effects_in_block<A>(
+    fn apply_effects_in_block<'tcx, A>(
         analysis: &A,
         state: &mut A::Domain,
         block: BasicBlock,
@@ -299,7 +363,7 @@ impl Direction for Forward {
         analysis.apply_terminator_effect(state, terminator, location);
     }
 
-    fn gen_kill_effects_in_block<A>(
+    fn gen_kill_effects_in_block<'tcx, A>(
         analysis: &A,
         trans: &mut GenKillSet<A::Idx>,
         block: BasicBlock,
@@ -319,7 +383,7 @@ impl Direction for Forward {
         analysis.terminator_effect(trans, terminator, location);
     }
 
-    fn apply_effects_in_range<A>(
+    fn apply_effects_in_range<'tcx, A>(
         analysis: &A,
         state: &mut A::Domain,
         block: BasicBlock,
@@ -392,7 +456,7 @@ impl Direction for Forward {
         }
     }
 
-    fn visit_results_in_block<F, R>(
+    fn visit_results_in_block<'mir, 'tcx, F, R>(
         state: &mut F,
         block: BasicBlock,
         block_data: &'mir mir::BasicBlockData<'tcx>,
@@ -423,7 +487,7 @@ impl Direction for Forward {
         vis.visit_block_end(state, block_data, block);
     }
 
-    fn join_state_into_successors_of<A>(
+    fn join_state_into_successors_of<'tcx, A>(
         analysis: &A,
         _tcx: TyCtxt<'tcx>,
         _body: &mir::Body<'tcx>,
@@ -467,7 +531,7 @@ impl Direction for Forward {
                 propagate(target, exit_state);
             }
 
-            Call { cleanup, destination, ref func, ref args, from_hir_call: _, fn_span: _ } => {
+            Call { cleanup, destination, func: _, args: _, from_hir_call: _, fn_span: _ } => {
                 if let Some(unwind) = cleanup {
                     if dead_unwinds.map_or(true, |dead| !dead.contains(bb)) {
                         propagate(unwind, exit_state);
@@ -477,19 +541,43 @@ impl Direction for Forward {
                 if let Some((dest_place, target)) = destination {
                     // N.B.: This must be done *last*, otherwise the unwind path will see the call
                     // return effect.
-                    analysis.apply_call_return_effect(exit_state, bb, func, args, dest_place);
+                    analysis.apply_call_return_effect(
+                        exit_state,
+                        bb,
+                        CallReturnPlaces::Call(dest_place),
+                    );
                     propagate(target, exit_state);
                 }
             }
 
-            InlineAsm { template: _, operands: _, options: _, line_spans: _, destination } => {
+            InlineAsm {
+                template: _,
+                ref operands,
+                options: _,
+                line_spans: _,
+                destination,
+                cleanup,
+            } => {
+                if let Some(unwind) = cleanup {
+                    if dead_unwinds.map_or(true, |dead| !dead.contains(bb)) {
+                        propagate(unwind, exit_state);
+                    }
+                }
+
                 if let Some(target) = destination {
+                    // N.B.: This must be done *last*, otherwise the unwind path will see the call
+                    // return effect.
+                    analysis.apply_call_return_effect(
+                        exit_state,
+                        bb,
+                        CallReturnPlaces::InlineAsm(operands),
+                    );
                     propagate(target, exit_state);
                 }
             }
 
             SwitchInt { ref targets, ref discr, switch_ty: _ } => {
-                let mut applier = SwitchIntEdgeEffectApplier {
+                let mut applier = ForwardSwitchIntEdgeEffectsApplier {
                     exit_state,
                     targets,
                     propagate,
@@ -498,8 +586,11 @@ impl Direction for Forward {
 
                 analysis.apply_switch_int_edge_effects(bb, discr, &mut applier);
 
-                let SwitchIntEdgeEffectApplier {
-                    exit_state, mut propagate, effects_applied, ..
+                let ForwardSwitchIntEdgeEffectsApplier {
+                    exit_state,
+                    mut propagate,
+                    effects_applied,
+                    ..
                 } = applier;
 
                 if !effects_applied {
@@ -512,7 +603,7 @@ impl Direction for Forward {
     }
 }
 
-struct SwitchIntEdgeEffectApplier<'a, D, F> {
+struct ForwardSwitchIntEdgeEffectsApplier<'a, D, F> {
     exit_state: &'a mut D,
     targets: &'a SwitchTargets,
     propagate: F,
@@ -520,7 +611,7 @@ struct SwitchIntEdgeEffectApplier<'a, D, F> {
     effects_applied: bool,
 }
 
-impl<D, F> super::SwitchIntEdgeEffects<D> for SwitchIntEdgeEffectApplier<'_, D, F>
+impl<D, F> super::SwitchIntEdgeEffects<D> for ForwardSwitchIntEdgeEffectsApplier<'_, D, F>
 where
     D: Clone,
     F: FnMut(BasicBlock, &D),
@@ -552,7 +643,7 @@ where
 //
 // FIXME: Figure out how to express this using `Option::clone_from`, or maybe lift it into the
 // standard library?
-fn opt_clone_from_or_clone<T: Clone>(opt: &'a mut Option<T>, val: &T) -> &'a mut T {
+fn opt_clone_from_or_clone<'a, T: Clone>(opt: &'a mut Option<T>, val: &T) -> &'a mut T {
     if opt.is_some() {
         let ret = opt.as_mut().unwrap();
         ret.clone_from(val);

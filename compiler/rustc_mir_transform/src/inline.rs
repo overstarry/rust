@@ -1,15 +1,15 @@
 //! Inlining pass for MIR functions
 
 use rustc_attr::InlineAttr;
-use rustc_hir as hir;
 use rustc_index::bit_set::BitSet;
 use rustc_index::vec::Idx;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::visit::*;
 use rustc_middle::mir::*;
+use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::subst::Subst;
 use rustc_middle::ty::{self, ConstKind, Instance, InstanceDef, ParamEnv, Ty, TyCtxt};
-use rustc_span::{hygiene::ExpnKind, ExpnData, Span};
+use rustc_span::{hygiene::ExpnKind, ExpnData, LocalExpnId, Span};
 use rustc_target::spec::abi::Abi;
 
 use super::simplify::{remove_dead_blocks, CfgSimplifier};
@@ -37,21 +37,16 @@ struct CallSite<'tcx> {
     source_info: SourceInfo,
 }
 
-/// Returns true if MIR inlining is enabled in the current compilation session.
-crate fn is_enabled(tcx: TyCtxt<'_>) -> bool {
-    if let Some(enabled) = tcx.sess.opts.debugging_opts.inline_mir {
-        return enabled;
-    }
-
-    tcx.sess.mir_opt_level() >= 3
-}
-
 impl<'tcx> MirPass<'tcx> for Inline {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if !is_enabled(tcx) {
-            return;
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        if let Some(enabled) = sess.opts.debugging_opts.inline_mir {
+            return enabled;
         }
 
+        sess.opts.mir_opt_level() >= 3
+    }
+
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         let span = trace_span!("inline", body = %tcx.def_path_str(body.source.def_id()));
         let _guard = span.enter();
         if inline(tcx, body) {
@@ -62,23 +57,36 @@ impl<'tcx> MirPass<'tcx> for Inline {
     }
 }
 
-fn inline(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
-    let def_id = body.source.def_id();
-    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
+fn inline<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> bool {
+    let def_id = body.source.def_id().expect_local();
 
     // Only do inlining into fn bodies.
-    if !tcx.hir().body_owner_kind(hir_id).is_fn_or_closure() {
+    if !tcx.hir().body_owner_kind(def_id).is_fn_or_closure() {
         return false;
     }
     if body.source.promoted.is_some() {
         return false;
     }
+    // Avoid inlining into generators, since their `optimized_mir` is used for layout computation,
+    // which can create a cycle, even when no attempt is made to inline the function in the other
+    // direction.
+    if body.generator.is_some() {
+        return false;
+    }
+
+    let param_env = tcx.param_env_reveal_all_normalized(def_id);
+    let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
+    let param_env = rustc_trait_selection::traits::normalize_param_env_or_error(
+        tcx,
+        def_id.to_def_id(),
+        param_env,
+        ObligationCause::misc(body.span, hir_id),
+    );
 
     let mut this = Inliner {
         tcx,
-        param_env: tcx.param_env_reveal_all_normalized(body.source.def_id()),
-        codegen_fn_attrs: tcx.codegen_fn_attrs(body.source.def_id()),
-        hir_id,
+        param_env,
+        codegen_fn_attrs: tcx.codegen_fn_attrs(def_id),
         history: Vec::new(),
         changed: false,
     };
@@ -92,15 +100,13 @@ struct Inliner<'tcx> {
     param_env: ParamEnv<'tcx>,
     /// Caller codegen attributes.
     codegen_fn_attrs: &'tcx CodegenFnAttrs,
-    /// Caller HirID.
-    hir_id: hir::HirId,
     /// Stack of inlined Instances.
     history: Vec<ty::Instance<'tcx>>,
     /// Indicates that the caller body has been modified.
     changed: bool,
 }
 
-impl Inliner<'tcx> {
+impl<'tcx> Inliner<'tcx> {
     fn process_blocks(&mut self, caller_body: &mut Body<'tcx>, blocks: Range<BasicBlock>) {
         for bb in blocks {
             let bb_data = &caller_body[bb];
@@ -108,9 +114,8 @@ impl Inliner<'tcx> {
                 continue;
             }
 
-            let callsite = match self.resolve_callsite(caller_body, bb, bb_data) {
-                None => continue,
-                Some(it) => it,
+            let Some(callsite) = self.resolve_callsite(caller_body, bb, bb_data) else {
+                continue;
             };
 
             let span = trace_span!("process_blocks", %callsite.callee, ?bb);
@@ -170,7 +175,9 @@ impl Inliner<'tcx> {
         caller_body: &Body<'tcx>,
         callee: &Instance<'tcx>,
     ) -> Result<(), &'static str> {
-        if callee.def_id() == caller_body.source.def_id() {
+        let caller_def_id = caller_body.source.def_id();
+        let callee_def_id = callee.def_id();
+        if callee_def_id == caller_def_id {
             return Err("self-recursion");
         }
 
@@ -179,7 +186,7 @@ impl Inliner<'tcx> {
                 // If there is no MIR available (either because it was not in metadata or
                 // because it has no MIR because it's an extern function), then the inliner
                 // won't cause cycles on this.
-                if !self.tcx.is_mir_available(callee.def_id()) {
+                if !self.tcx.is_mir_available(callee_def_id) {
                     return Err("item MIR unavailable");
                 }
             }
@@ -199,36 +206,26 @@ impl Inliner<'tcx> {
             | InstanceDef::CloneShim(..) => return Ok(()),
         }
 
-        if self.tcx.is_constructor(callee.def_id()) {
+        if self.tcx.is_constructor(callee_def_id) {
             trace!("constructors always have MIR");
             // Constructor functions cannot cause a query cycle.
             return Ok(());
         }
 
-        if let Some(callee_def_id) = callee.def_id().as_local() {
-            let callee_hir_id = self.tcx.hir().local_def_id_to_hir_id(callee_def_id);
-            // Avoid inlining into generators,
-            // since their `optimized_mir` is used for layout computation, which can
-            // create a cycle, even when no attempt is made to inline the function
-            // in the other direction.
-            if caller_body.generator.is_some() {
-                return Err("local generator (query cycle avoidance)");
-            }
-
+        if callee_def_id.is_local() {
             // Avoid a cycle here by only using `instance_mir` only if we have
-            // a lower `HirId` than the callee. This ensures that the callee will
-            // not inline us. This trick only works without incremental compilation.
-            // So don't do it if that is enabled.
-            if !self.tcx.dep_graph.is_fully_enabled() && self.hir_id < callee_hir_id {
+            // a lower `DefPathHash` than the callee. This ensures that the callee will
+            // not inline us. This trick even works with incremental compilation,
+            // since `DefPathHash` is stable.
+            if self.tcx.def_path_hash(caller_def_id).local_hash()
+                < self.tcx.def_path_hash(callee_def_id).local_hash()
+            {
                 return Ok(());
             }
 
             // If we know for sure that the function we're calling will itself try to
             // call us, then we avoid inlining that function.
-            if self
-                .tcx
-                .mir_callgraph_reachable((*callee, caller_body.source.def_id().expect_local()))
-            {
+            if self.tcx.mir_callgraph_reachable((*callee, caller_def_id.expect_local())) {
                 return Err("caller might be reachable from callee (query cycle avoidance)");
             }
 
@@ -441,6 +438,13 @@ impl Inliner<'tcx> {
                     }
                 }
                 TerminatorKind::Resume => cost += RESUME_PENALTY,
+                TerminatorKind::InlineAsm { cleanup, .. } => {
+                    cost += INSTR_COST;
+
+                    if cleanup.is_some() {
+                        cost += LANDINGPAD_PENALTY;
+                    }
+                }
                 _ => cost += INSTR_COST,
             }
 
@@ -534,6 +538,16 @@ impl Inliner<'tcx> {
                 // Copy the arguments if needed.
                 let args: Vec<_> = self.make_call_args(args, &callsite, caller_body, &callee_body);
 
+                let mut expn_data = ExpnData::default(
+                    ExpnKind::Inlined,
+                    callsite.source_info.span,
+                    self.tcx.sess.edition(),
+                    None,
+                    None,
+                );
+                expn_data.def_site = callee_body.span;
+                let expn_data =
+                    LocalExpnId::fresh(expn_data, self.tcx.create_stable_hashing_context());
                 let mut integrator = Integrator {
                     args: &args,
                     new_locals: Local::new(caller_body.local_decls.len())..,
@@ -544,8 +558,7 @@ impl Inliner<'tcx> {
                     cleanup_block: cleanup,
                     in_cleanup_block: false,
                     tcx: self.tcx,
-                    callsite_span: callsite.source_info.span,
-                    body_span: callee_body.span,
+                    expn_data,
                     always_live_locals: BitSet::new_filled(callee_body.local_decls.len()),
                 };
 
@@ -624,7 +637,7 @@ impl Inliner<'tcx> {
                 caller_body.required_consts.extend(
                     callee_body.required_consts.iter().copied().filter(|&ct| {
                         match ct.literal.const_for_ty() {
-                            Some(ct) => matches!(ct.val, ConstKind::Unevaluated(_)),
+                            Some(ct) => matches!(ct.val(), ConstKind::Unevaluated(_)),
                             None => true,
                         }
                     }),
@@ -680,11 +693,10 @@ impl Inliner<'tcx> {
             // The `closure_ref` in our example above.
             let closure_ref_arg = iter::once(self_);
 
-            // The `tmp0`, `tmp1`, and `tmp2` in our example abonve.
+            // The `tmp0`, `tmp1`, and `tmp2` in our example above.
             let tuple_tmp_args = tuple_tys.iter().enumerate().map(|(i, ty)| {
                 // This is e.g., `tuple_tmp.0` in our example above.
-                let tuple_field =
-                    Operand::Move(tcx.mk_place_field(tuple, Field::new(i), ty.expect_ty()));
+                let tuple_field = Operand::Move(tcx.mk_place_field(tuple, Field::new(i), ty));
 
                 // Spill to a local to make e.g., `tmp0`.
                 self.create_temp_if_necessary(tuple_field, callsite, caller_body)
@@ -707,12 +719,11 @@ impl Inliner<'tcx> {
         caller_body: &mut Body<'tcx>,
     ) -> Local {
         // Reuse the operand if it is a moved temporary.
-        if let Operand::Move(place) = &arg {
-            if let Some(local) = place.as_local() {
-                if caller_body.local_kind(local) == LocalKind::Temp {
-                    return local;
-                }
-            }
+        if let Operand::Move(place) = &arg
+            && let Some(local) = place.as_local()
+            && caller_body.local_kind(local) == LocalKind::Temp
+        {
+            return local;
         }
 
         // Otherwise, create a temporary for the argument.
@@ -779,12 +790,11 @@ struct Integrator<'a, 'tcx> {
     cleanup_block: Option<BasicBlock>,
     in_cleanup_block: bool,
     tcx: TyCtxt<'tcx>,
-    callsite_span: Span,
-    body_span: Span,
+    expn_data: LocalExpnId,
     always_live_locals: BitSet<Local>,
 }
 
-impl<'a, 'tcx> Integrator<'a, 'tcx> {
+impl Integrator<'_, '_> {
     fn map_local(&self, local: Local) -> Local {
         let new = if local == RETURN_PLACE {
             self.destination.local
@@ -813,7 +823,7 @@ impl<'a, 'tcx> Integrator<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
+impl<'tcx> MutVisitor<'tcx> for Integrator<'_, 'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -827,12 +837,8 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
     }
 
     fn visit_span(&mut self, span: &mut Span) {
-        let mut expn_data =
-            ExpnData::default(ExpnKind::Inlined, *span, self.tcx.sess.edition(), None, None);
-        expn_data.def_site = self.body_span;
         // Make sure that all spans track the fact that they were inlined.
-        *span =
-            self.callsite_span.fresh_expansion(expn_data, self.tcx.create_stable_hashing_context());
+        *span = span.fresh_expansion(self.expn_data);
     }
 
     fn visit_place(&mut self, place: &mut Place<'tcx>, context: PlaceContext, location: Location) {
@@ -954,9 +960,13 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
             {
                 bug!("False unwinds should have been removed before inlining")
             }
-            TerminatorKind::InlineAsm { ref mut destination, .. } => {
+            TerminatorKind::InlineAsm { ref mut destination, ref mut cleanup, .. } => {
                 if let Some(ref mut tgt) = *destination {
                     *tgt = self.map_block(*tgt);
+                } else if !self.in_cleanup_block {
+                    // Unless this inline asm is in a cleanup block, add an unwind edge to
+                    // the original call's cleanup block
+                    *cleanup = self.cleanup_block;
                 }
             }
         }

@@ -80,7 +80,7 @@ use crate::outlives::outlives_bounds::InferCtxtExt as _;
 use rustc_data_structures::stable_set::FxHashSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
+use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::PatKind;
 use rustc_infer::infer::outlives::env::OutlivesEnvironment;
 use rustc_infer::infer::{self, InferCtxt, RegionObligation, RegionckMode};
@@ -106,7 +106,7 @@ macro_rules! ignore_err {
 pub(crate) trait OutlivesEnvironmentExt<'tcx> {
     fn add_implied_bounds(
         &mut self,
-        infcx: &InferCtxt<'a, 'tcx>,
+        infcx: &InferCtxt<'_, 'tcx>,
         fn_sig_tys: FxHashSet<Ty<'tcx>>,
         body_id: hir::HirId,
         span: Span,
@@ -130,7 +130,7 @@ impl<'tcx> OutlivesEnvironmentExt<'tcx> for OutlivesEnvironment<'tcx> {
     /// add those assumptions into the outlives-environment.
     ///
     /// Tests: `src/test/ui/regions/regions-free-region-ordering-*.rs`
-    fn add_implied_bounds(
+    fn add_implied_bounds<'a>(
         &mut self,
         infcx: &InferCtxt<'a, 'tcx>,
         fn_sig_tys: FxHashSet<Ty<'tcx>>,
@@ -171,8 +171,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     /// Region checking during the WF phase for items. `wf_tys` are the
     /// types from which we should derive implied bounds, if any.
+    #[instrument(level = "debug", skip(self))]
     pub fn regionck_item(&self, item_id: hir::HirId, span: Span, wf_tys: FxHashSet<Ty<'tcx>>) {
-        debug!("regionck_item(item.id={:?}, wf_tys={:?})", item_id, wf_tys);
         let subject = self.tcx.hir().local_def_id(item_id);
         let mut rcx = RegionCtxt::new(self, item_id, Subject(subject), self.param_env);
         rcx.outlives_environment.add_implied_bounds(self, wf_tys, item_id, span);
@@ -405,12 +405,6 @@ impl<'a, 'tcx> Visitor<'tcx> for RegionCtxt<'a, 'tcx> {
     // addressed by deferring the construction of the region
     // hierarchy, and in particular the relationships between free
     // regions, until regionck, as described in #3238.
-
-    type Map = intravisit::ErasedMap<'tcx>;
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
-    }
 
     fn visit_fn(
         &mut self,
@@ -695,7 +689,7 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
         let rptr_ty = self.resolve_node_type(id);
         if let ty::Ref(r, _, _) = rptr_ty.kind() {
             debug!("rptr_ty={}", rptr_ty);
-            self.link_region(span, r, ty::BorrowKind::from_mutbl(mutbl), cmt_borrowed);
+            self.link_region(span, *r, ty::BorrowKind::from_mutbl(mutbl), cmt_borrowed);
         }
     }
 
@@ -859,15 +853,15 @@ impl<'a, 'tcx> RegionCtxt<'a, 'tcx> {
                     self.sub_regions(
                         infer::ReborrowUpvar(span, upvar_id),
                         borrow_region,
-                        upvar_borrow.region,
+                        captured_place.region.unwrap(),
                     );
-                    if let ty::ImmBorrow = upvar_borrow.kind {
+                    if let ty::ImmBorrow = upvar_borrow {
                         debug!("link_upvar_region: capture by shared ref");
                     } else {
                         all_captures_are_imm_borrow = false;
                     }
                 }
-                ty::UpvarCapture::ByValue(_) => {
+                ty::UpvarCapture::ByValue => {
                     all_captures_are_imm_borrow = false;
                 }
             }

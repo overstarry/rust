@@ -77,18 +77,16 @@ function createDirEntry(elem, parent, fullPath, currentFile, hasFoundFile) {
 }
 
 function toggleSidebar() {
-    var sidebar = document.getElementById("source-sidebar");
-    var child = this.children[0].children[0];
+    var sidebar = document.querySelector("nav.sidebar");
+    var child = this.children[0];
     if (child.innerText === ">") {
-        sidebar.style.left = "";
-        this.style.left = "";
+        sidebar.classList.add("expanded");
         child.innerText = "<";
-        updateLocalStorage("rustdoc-source-sidebar-show", "true");
+        updateLocalStorage("source-sidebar-show", "true");
     } else {
-        sidebar.style.left = "-300px";
-        this.style.left = "0";
+        sidebar.classList.remove("expanded");
         child.innerText = ">";
-        updateLocalStorage("rustdoc-source-sidebar-show", "false");
+        updateLocalStorage("source-sidebar-show", "false");
     }
 }
 
@@ -97,20 +95,15 @@ function createSidebarToggle() {
     sidebarToggle.id = "sidebar-toggle";
     sidebarToggle.onclick = toggleSidebar;
 
-    var inner1 = document.createElement("div");
-    inner1.style.position = "relative";
+    var inner = document.createElement("div");
 
-    var inner2 = document.createElement("div");
-    inner2.style.paddingTop = "3px";
-    if (getCurrentValue("rustdoc-source-sidebar-show") === "true") {
-        inner2.innerText = "<";
+    if (getCurrentValue("source-sidebar-show") === "true") {
+        inner.innerText = "<";
     } else {
-        inner2.innerText = ">";
-        sidebarToggle.style.left = "0";
+        inner.innerText = ">";
     }
 
-    inner1.appendChild(inner2);
-    sidebarToggle.appendChild(inner1);
+    sidebarToggle.appendChild(inner);
     return sidebarToggle;
 }
 
@@ -120,15 +113,17 @@ function createSourceSidebar() {
     if (!window.rootPath.endsWith("/")) {
         window.rootPath += "/";
     }
-    var main = document.getElementById("main");
+    var container = document.querySelector("nav.sidebar");
 
     var sidebarToggle = createSidebarToggle();
-    main.insertBefore(sidebarToggle, main.firstChild);
+    container.insertBefore(sidebarToggle, container.firstChild);
 
     var sidebar = document.createElement("div");
     sidebar.id = "source-sidebar";
-    if (getCurrentValue("rustdoc-source-sidebar-show") !== "true") {
-        sidebar.style.left = "-300px";
+    if (getCurrentValue("source-sidebar-show") !== "true") {
+        container.classList.remove("expanded");
+    } else {
+        container.classList.add("expanded");
     }
 
     var currentFile = getCurrentFilePath();
@@ -144,7 +139,7 @@ function createSourceSidebar() {
                                       currentFile, hasFoundFile);
     });
 
-    main.insertBefore(sidebar, main.firstChild);
+    container.appendChild(sidebar);
     // Focus on the current file in the source files sidebar.
     var selected_elem = sidebar.getElementsByClassName("selected")[0];
     if (typeof selected_elem !== "undefined") {
@@ -154,7 +149,7 @@ function createSourceSidebar() {
 
 var lineNumbersRegex = /^#?(\d+)(?:-(\d+))?$/;
 
-function highlightSourceLines(scrollTo, match) {
+function highlightSourceLines(match) {
     if (typeof match === "undefined") {
         match = window.location.hash.match(lineNumbersRegex);
     }
@@ -175,11 +170,9 @@ function highlightSourceLines(scrollTo, match) {
     if (!elem) {
         return;
     }
-    if (scrollTo) {
-        var x = document.getElementById(from);
-        if (x) {
-            x.scrollIntoView();
-        }
+    var x = document.getElementById(from);
+    if (x) {
+        x.scrollIntoView();
     }
     onEachLazy(document.getElementsByClassName("line-numbers"), function(e) {
         onEachLazy(e.getElementsByTagName("span"), function(i_e) {
@@ -203,7 +196,7 @@ var handleSourceHighlight = (function() {
             y = window.scrollY;
         if (searchState.browserSupportsHistoryApi()) {
             history.replaceState(null, null, "#" + name);
-            highlightSourceLines(true);
+            highlightSourceLines();
         } else {
             location.replace("#" + name);
         }
@@ -235,7 +228,7 @@ var handleSourceHighlight = (function() {
 window.addEventListener("hashchange", function() {
     var match = window.location.hash.match(lineNumbersRegex);
     if (match) {
-        return highlightSourceLines(false, match);
+        return highlightSourceLines(match);
     }
 });
 
@@ -243,7 +236,7 @@ onEachLazy(document.getElementsByClassName("line-numbers"), function(el) {
     el.addEventListener("click", handleSourceHighlight);
 });
 
-highlightSourceLines(true);
+highlightSourceLines();
 
 window.createSourceSidebar = createSourceSidebar;
 })();

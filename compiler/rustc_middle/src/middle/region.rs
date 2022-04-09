@@ -7,13 +7,12 @@
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/borrow_check.html
 
 use crate::ty::TyCtxt;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir as hir;
 use rustc_hir::Node;
-use rustc_query_system::ich::{NodeIdHashingMode, StableHashingContext};
-
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_macros::HashStable;
+use rustc_query_system::ich::{NodeIdHashingMode, StableHashingContext};
 use rustc_span::{Span, DUMMY_SP};
 
 use std::fmt;
@@ -174,9 +173,8 @@ impl Scope {
     /// returned span may not correspond to the span of any `NodeId` in
     /// the AST.
     pub fn span(&self, tcx: TyCtxt<'_>, scope_tree: &ScopeTree) -> Span {
-        let hir_id = match self.hir_id(scope_tree) {
-            Some(hir_id) => hir_id,
-            None => return DUMMY_SP,
+        let Some(hir_id) = self.hir_id(scope_tree) else {
+            return DUMMY_SP;
         };
         let span = tcx.hir().span(hir_id);
         if let ScopeData::Remainder(first_statement_index) = self.data {
@@ -210,25 +208,20 @@ pub struct ScopeTree {
     /// If not empty, this body is the root of this region hierarchy.
     pub root_body: Option<hir::HirId>,
 
-    /// The parent of the root body owner, if the latter is an
-    /// an associated const or method, as impls/traits can also
-    /// have lifetime parameters free in this body.
-    pub root_parent: Option<hir::HirId>,
-
     /// Maps from a scope ID to the enclosing scope id;
     /// this is usually corresponding to the lexical nesting, though
     /// in the case of closures the parent scope is the innermost
     /// conditional expression or repeating block. (Note that the
     /// enclosing scope ID for the block associated with a closure is
     /// the closure itself.)
-    pub parent_map: FxHashMap<Scope, (Scope, ScopeDepth)>,
+    pub parent_map: FxIndexMap<Scope, (Scope, ScopeDepth)>,
 
     /// Maps from a variable or binding ID to the block in which that
     /// variable is declared.
-    var_map: FxHashMap<hir::ItemLocalId, Scope>,
+    var_map: FxIndexMap<hir::ItemLocalId, Scope>,
 
     /// Maps from a `NodeId` to the associated destruction scope (if any).
-    destruction_scopes: FxHashMap<hir::ItemLocalId, Scope>,
+    destruction_scopes: FxIndexMap<hir::ItemLocalId, Scope>,
 
     /// `rvalue_scopes` includes entries for those expressions whose
     /// cleanup scope is larger than the default. The map goes from the
@@ -314,7 +307,7 @@ pub struct ScopeTree {
     /// The reason is that semantically, until the `box` expression returns,
     /// the values are still owned by their containing expressions. So
     /// we'll see that `&x`.
-    pub yield_in_scope: FxHashMap<Scope, YieldData>,
+    pub yield_in_scope: FxHashMap<Scope, Vec<YieldData>>,
 
     /// The number of visit_expr and visit_pat calls done in the body.
     /// Used to sanity check visit_expr/visit_pat call count when
@@ -429,8 +422,8 @@ impl ScopeTree {
 
     /// Checks whether the given scope contains a `yield`. If so,
     /// returns `Some(YieldData)`. If not, returns `None`.
-    pub fn yield_in_scope(&self, scope: Scope) -> Option<YieldData> {
-        self.yield_in_scope.get(&scope).cloned()
+    pub fn yield_in_scope(&self, scope: Scope) -> Option<&Vec<YieldData>> {
+        self.yield_in_scope.get(&scope)
     }
 
     /// Gives the number of expressions visited in a body.
@@ -445,7 +438,6 @@ impl<'a> HashStable<StableHashingContext<'a>> for ScopeTree {
     fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
         let ScopeTree {
             root_body,
-            root_parent,
             ref body_expr_count,
             ref parent_map,
             ref var_map,
@@ -455,8 +447,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for ScopeTree {
         } = *self;
 
         hcx.with_node_id_hashing_mode(NodeIdHashingMode::HashDefPath, |hcx| {
-            root_body.hash_stable(hcx, hasher);
-            root_parent.hash_stable(hcx, hasher);
+            root_body.hash_stable(hcx, hasher)
         });
 
         body_expr_count.hash_stable(hcx, hasher);

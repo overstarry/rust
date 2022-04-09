@@ -1,8 +1,11 @@
 // only-aarch64
 // only-linux
+// needs-asm-support
 // run-pass
 
-#![feature(asm, thread_local, asm_sym)]
+#![feature(thread_local, asm_sym)]
+
+use std::arch::asm;
 
 extern "C" fn f1() -> i32 {
     111

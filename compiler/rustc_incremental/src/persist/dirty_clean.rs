@@ -9,6 +9,13 @@
 //! - `#[rustc_clean(cfg="rev2")]` same as above, except that the
 //!   fingerprints must be the SAME (along with all other fingerprints).
 //!
+//! - `#[rustc_clean(cfg="rev2", loaded_from_disk='typeck")]` asserts that
+//!   the query result for `DepNode::typeck(X)` was actually
+//!   loaded from disk (not just marked green). This can be useful
+//!   to ensure that a test is actually exercising the deserialization
+//!   logic for a particular query result. This can be combined with
+//!   `except`
+//!
 //! Errors are reported if we are in the suitable configuration but
 //! the required condition is not met.
 
@@ -21,13 +28,14 @@ use rustc_hir::itemlikevisit::ItemLikeVisitor;
 use rustc_hir::Node as HirNode;
 use rustc_hir::{ImplItemKind, ItemKind as HirItem, TraitItemKind};
 use rustc_middle::dep_graph::{label_strs, DepNode, DepNodeExt};
-use rustc_middle::hir::map::Map;
+use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
 use std::iter::FromIterator;
 use std::vec::Vec;
 
+const LOADED_FROM_DISK: Symbol = sym::loaded_from_disk;
 const EXCEPT: Symbol = sym::except;
 const CFG: Symbol = sym::cfg;
 
@@ -124,6 +132,7 @@ type Labels = FxHashSet<String>;
 struct Assertion {
     clean: Labels,
     dirty: Labels,
+    loaded_from_disk: Labels,
 }
 
 pub fn check_dirty_clean_annotations(tcx: TyCtxt<'_>) {
@@ -155,7 +164,7 @@ pub struct DirtyCleanVisitor<'tcx> {
     checked_attrs: FxHashSet<ast::AttrId>,
 }
 
-impl DirtyCleanVisitor<'tcx> {
+impl<'tcx> DirtyCleanVisitor<'tcx> {
     /// Possibly "deserialize" the attribute into a clean/dirty assertion
     fn assertion_maybe(&mut self, item_id: LocalDefId, attr: &Attribute) -> Option<Assertion> {
         if !attr.has_name(sym::rustc_clean) {
@@ -174,6 +183,7 @@ impl DirtyCleanVisitor<'tcx> {
     fn assertion_auto(&mut self, item_id: LocalDefId, attr: &Attribute) -> Assertion {
         let (name, mut auto) = self.auto_labels(item_id, attr);
         let except = self.except(attr);
+        let loaded_from_disk = self.loaded_from_disk(attr);
         for e in except.iter() {
             if !auto.remove(e) {
                 let msg = format!(
@@ -183,7 +193,19 @@ impl DirtyCleanVisitor<'tcx> {
                 self.tcx.sess.span_fatal(attr.span, &msg);
             }
         }
-        Assertion { clean: auto, dirty: except }
+        Assertion { clean: auto, dirty: except, loaded_from_disk }
+    }
+
+    /// `loaded_from_disk=` attribute value
+    fn loaded_from_disk(&self, attr: &Attribute) -> Labels {
+        for item in attr.meta_item_list().unwrap_or_else(Vec::new) {
+            if item.has_name(LOADED_FROM_DISK) {
+                let value = expect_associated_value(self.tcx, &item);
+                return self.resolve_labels(&item, value);
+            }
+        }
+        // If `loaded_from_disk=` is not specified, don't assert anything
+        Labels::default()
     }
 
     /// `except=` attribute value
@@ -201,8 +223,7 @@ impl DirtyCleanVisitor<'tcx> {
     /// Return all DepNode labels that should be asserted for this item.
     /// index=0 is the "name" used for error messages
     fn auto_labels(&mut self, item_id: LocalDefId, attr: &Attribute) -> (&'static str, Labels) {
-        let hir_id = self.tcx.hir().local_def_id_to_hir_id(item_id);
-        let node = self.tcx.hir().get(hir_id);
+        let node = self.tcx.hir().get_by_def_id(item_id);
         let (name, labels) = match node {
             HirNode::Item(item) => {
                 match item.kind {
@@ -332,12 +353,23 @@ impl DirtyCleanVisitor<'tcx> {
         }
     }
 
+    fn assert_loaded_from_disk(&self, item_span: Span, dep_node: DepNode) {
+        debug!("assert_loaded_from_disk({:?})", dep_node);
+
+        if !self.tcx.dep_graph.debug_was_loaded_from_disk(dep_node) {
+            let dep_node_str = self.dep_node_str(&dep_node);
+            self.tcx.sess.span_err(
+                item_span,
+                &format!("`{}` should have been loaded from disk but it was not", dep_node_str),
+            );
+        }
+    }
+
     fn check_item(&mut self, item_id: LocalDefId, item_span: Span) {
         let def_path_hash = self.tcx.def_path_hash(item_id.to_def_id());
         for attr in self.tcx.get_attrs(item_id.to_def_id()).iter() {
-            let assertion = match self.assertion_maybe(item_id, attr) {
-                Some(a) => a,
-                None => continue,
+            let Some(assertion) = self.assertion_maybe(item_id, attr) else {
+                continue;
             };
             self.checked_attrs.insert(attr.id);
             for label in assertion.clean {
@@ -348,11 +380,15 @@ impl DirtyCleanVisitor<'tcx> {
                 let dep_node = DepNode::from_label_string(self.tcx, &label, def_path_hash).unwrap();
                 self.assert_dirty(item_span, dep_node);
             }
+            for label in assertion.loaded_from_disk {
+                let dep_node = DepNode::from_label_string(self.tcx, &label, def_path_hash).unwrap();
+                self.assert_loaded_from_disk(item_span, dep_node);
+            }
         }
     }
 }
 
-impl ItemLikeVisitor<'tcx> for DirtyCleanVisitor<'tcx> {
+impl<'tcx> ItemLikeVisitor<'tcx> for DirtyCleanVisitor<'tcx> {
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
         self.check_item(item.def_id, item.span);
     }
@@ -382,7 +418,7 @@ fn check_config(tcx: TyCtxt<'_>, attr: &Attribute) -> bool {
             let value = expect_associated_value(tcx, &item);
             debug!("check_config: searching for cfg {:?}", value);
             cfg = Some(config.contains(&(value, None)));
-        } else if !item.has_name(EXCEPT) {
+        } else if !(item.has_name(EXCEPT) || item.has_name(LOADED_FROM_DISK)) {
             tcx.sess.span_err(attr.span, &format!("unknown item `{}`", item.name_or_empty()));
         }
     }
@@ -415,7 +451,7 @@ pub struct FindAllAttrs<'tcx> {
     found_attrs: Vec<&'tcx Attribute>,
 }
 
-impl FindAllAttrs<'tcx> {
+impl<'tcx> FindAllAttrs<'tcx> {
     fn is_active_attr(&mut self, attr: &Attribute) -> bool {
         if attr.has_name(sym::rustc_clean) && check_config(self.tcx, attr) {
             return true;
@@ -434,11 +470,11 @@ impl FindAllAttrs<'tcx> {
     }
 }
 
-impl intravisit::Visitor<'tcx> for FindAllAttrs<'tcx> {
-    type Map = Map<'tcx>;
+impl<'tcx> intravisit::Visitor<'tcx> for FindAllAttrs<'tcx> {
+    type NestedFilter = nested_filter::All;
 
-    fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
-        intravisit::NestedVisitorMap::All(self.tcx.hir())
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
     }
 
     fn visit_attribute(&mut self, _: hir::HirId, attr: &'tcx Attribute) {

@@ -191,7 +191,7 @@
   187|       |    ;
   188|       |
   189|      1|    let short_used_covered_closure_line_break_no_block_embedded_branch =
-  190|      1|        | _unused_arg: u8 |
+  190|       |        | _unused_arg: u8 |
   191|      1|            println!(
   192|      1|                "not called: {}",
   193|      1|                if is_true { "check" } else { "me" }

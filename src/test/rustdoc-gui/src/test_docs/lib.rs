@@ -1,5 +1,6 @@
 //! The point of this crate is to be able to have enough different "kinds" of
 //! documentation generated so we can test each different features.
+#![doc(html_playground_url="https://play.rust-lang.org/")]
 
 #![crate_name = "test_docs"]
 #![feature(rustdoc_internals)]
@@ -47,6 +48,8 @@ impl AsRef<str> for Foo {
 }
 
 /// Just a normal enum.
+///
+/// # title!
 #[doc(alias = "ThisIsAnAlias")]
 pub enum WhoLetTheDogOut {
     /// Woof!
@@ -257,3 +260,17 @@ impl HeavilyDocumentedUnion {
 macro_rules! heavily_documented_macro {
     () => {};
 }
+
+pub trait EmptyTrait1 {}
+pub trait EmptyTrait2 {}
+pub trait EmptyTrait3 {}
+
+pub struct HasEmptyTraits{}
+
+impl EmptyTrait1 for HasEmptyTraits {}
+impl EmptyTrait2 for HasEmptyTraits {}
+#[doc(cfg(feature = "some-feature"))]
+impl EmptyTrait3 for HasEmptyTraits {}
+
+mod macros;
+pub use macros::*;

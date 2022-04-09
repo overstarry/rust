@@ -1,10 +1,9 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::higher;
-use clippy_utils::{in_macro, SpanlessEq};
+use clippy_utils::{higher, peel_blocks_with_stmt, SpanlessEq};
 use if_chain::if_chain;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
-use rustc_hir::{lang_items::LangItem, BinOpKind, Expr, ExprKind, QPath, StmtKind};
+use rustc_hir::{BinOpKind, Expr, ExprKind, QPath};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 
@@ -30,6 +29,7 @@ declare_clippy_lint! {
     /// // Good
     /// i = i.saturating_sub(1);
     /// ```
+    #[clippy::version = "1.44.0"]
     pub IMPLICIT_SATURATING_SUB,
     pedantic,
     "Perform saturating subtraction instead of implicitly checking lower bound of data type"
@@ -39,7 +39,7 @@ declare_lint_pass!(ImplicitSaturatingSub => [IMPLICIT_SATURATING_SUB]);
 
 impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingSub {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
-        if in_macro(expr.span) {
+        if expr.span.from_expansion() {
             return;
         }
         if_chain! {
@@ -51,13 +51,8 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingSub {
             // Ensure that the binary operator is >, != and <
             if BinOpKind::Ne == cond_op.node || BinOpKind::Gt == cond_op.node || BinOpKind::Lt == cond_op.node;
 
-            // Check if the true condition block has only one statement
-            if let ExprKind::Block(block, _) = then.kind;
-            if block.stmts.len() == 1 && block.expr.is_none();
-
             // Check if assign operation is done
-            if let StmtKind::Semi(e) = block.stmts[0].kind;
-            if let Some(target) = subtracts_one(cx, e);
+            if let Some(target) = subtracts_one(cx, then);
 
             // Extracting out the variable name
             if let ExprKind::Path(QPath::Resolved(_, ares_path)) = target.kind;
@@ -87,21 +82,13 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingSub {
 
                 // Get the variable name
                 let var_name = ares_path.segments[0].ident.name.as_str();
-                const INT_TYPES: [LangItem; 5] = [
-                    LangItem::I8,
-                    LangItem::I16,
-                    LangItem::I32,
-                    LangItem::I64,
-                    LangItem::Isize
-                ];
-
                 match cond_num_val.kind {
                     ExprKind::Lit(ref cond_lit) => {
                         // Check if the constant is zero
                         if let LitKind::Int(0, _) = cond_lit.node {
                             if cx.typeck_results().expr_ty(cond_left).is_signed() {
                             } else {
-                                print_lint_and_sugg(cx, &var_name, expr);
+                                print_lint_and_sugg(cx, var_name, expr);
                             };
                         }
                     },
@@ -110,10 +97,10 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingSub {
                             if name.ident.as_str() == "MIN";
                             if let Some(const_id) = cx.typeck_results().type_dependent_def_id(cond_num_val.hir_id);
                             if let Some(impl_id) = cx.tcx.impl_of_method(const_id);
-                            let mut int_ids = INT_TYPES.iter().filter_map(|&ty| cx.tcx.lang_items().require(ty).ok());
-                            if int_ids.any(|int_id| int_id == impl_id);
+                            if let None = cx.tcx.impl_trait_ref(impl_id); // An inherent impl
+                            if cx.tcx.type_of(impl_id).is_integral();
                             then {
-                                print_lint_and_sugg(cx, &var_name, expr)
+                                print_lint_and_sugg(cx, var_name, expr)
                             }
                         }
                     },
@@ -123,10 +110,10 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingSub {
                             if name.ident.as_str() == "min_value";
                             if let Some(func_id) = cx.typeck_results().type_dependent_def_id(func.hir_id);
                             if let Some(impl_id) = cx.tcx.impl_of_method(func_id);
-                            let mut int_ids = INT_TYPES.iter().filter_map(|&ty| cx.tcx.lang_items().require(ty).ok());
-                            if int_ids.any(|int_id| int_id == impl_id);
+                            if let None = cx.tcx.impl_trait_ref(impl_id); // An inherent impl
+                            if cx.tcx.type_of(impl_id).is_integral();
                             then {
-                                print_lint_and_sugg(cx, &var_name, expr)
+                                print_lint_and_sugg(cx, var_name, expr)
                             }
                         }
                     },
@@ -137,8 +124,8 @@ impl<'tcx> LateLintPass<'tcx> for ImplicitSaturatingSub {
     }
 }
 
-fn subtracts_one<'a>(cx: &LateContext<'_>, expr: &Expr<'a>) -> Option<&'a Expr<'a>> {
-    match expr.kind {
+fn subtracts_one<'a>(cx: &LateContext<'_>, expr: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
+    match peel_blocks_with_stmt(expr).kind {
         ExprKind::AssignOp(ref op1, target, value) => {
             if_chain! {
                 if BinOpKind::Sub == op1.node;

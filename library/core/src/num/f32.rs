@@ -370,7 +370,6 @@ pub mod consts {
     pub const LN_10: f32 = 2.30258509299404568401799145468436421_f32;
 }
 
-#[lang = "f32"]
 #[cfg(not(test))]
 impl f32 {
     /// The radix or base of the internal representation of `f32`.
@@ -628,6 +627,7 @@ impl f32 {
     ///
     /// assert!(abs_difference <= f32::EPSILON);
     /// ```
+    #[must_use = "this returns the result of the operation, without modifying the original"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn recip(self) -> f32 {
@@ -674,7 +674,7 @@ impl f32 {
     /// Returns the maximum of the two numbers.
     ///
     /// Follows the IEEE-754 2008 semantics for maxNum, except for handling of signaling NaNs.
-    /// This matches the behavior of libm’s fmin.
+    /// This matches the behavior of libm’s fmax.
     ///
     /// ```
     /// let x = 1.0f32;
@@ -684,6 +684,7 @@ impl f32 {
     /// ```
     ///
     /// If one of the arguments is NaN, then the other argument is returned.
+    #[must_use = "this returns the result of the comparison, without modifying either input"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn max(self, other: f32) -> f32 {
@@ -703,6 +704,7 @@ impl f32 {
     /// ```
     ///
     /// If one of the arguments is NaN, then the other argument is returned.
+    #[must_use = "this returns the result of the comparison, without modifying either input"]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn min(self, other: f32) -> f32 {
@@ -726,6 +728,7 @@ impl f32 {
     /// If one of the arguments is NaN, then NaN is returned. Otherwise this returns the greater
     /// of the two numbers. For this operation, -0.0 is considered to be less than +0.0.
     /// Note that this follows the semantics specified in IEEE 754-2019.
+    #[must_use = "this returns the result of the comparison, without modifying either input"]
     #[unstable(feature = "float_minimum_maximum", issue = "91079")]
     #[inline]
     pub fn maximum(self, other: f32) -> f32 {
@@ -757,6 +760,7 @@ impl f32 {
     /// If one of the arguments is NaN, then NaN is returned. Otherwise this returns the lesser
     /// of the two numbers. For this operation, -0.0 is considered to be less than +0.0.
     /// Note that this follows the semantics specified in IEEE 754-2019.
+    #[must_use = "this returns the result of the comparison, without modifying either input"]
     #[unstable(feature = "float_minimum_maximum", issue = "91079")]
     #[inline]
     pub fn minimum(self, other: f32) -> f32 {
@@ -1003,31 +1007,38 @@ impl f32 {
         Self::from_bits(u32::from_ne_bytes(bytes))
     }
 
-    /// Returns an ordering between self and other values.
+    /// Return the ordering between `self` and `other`.
+    ///
     /// Unlike the standard partial comparison between floating point numbers,
     /// this comparison always produces an ordering in accordance to
-    /// the totalOrder predicate as defined in IEEE 754 (2008 revision)
-    /// floating point standard. The values are ordered in following order:
-    /// - Negative quiet NaN
-    /// - Negative signaling NaN
-    /// - Negative infinity
-    /// - Negative numbers
-    /// - Negative subnormal numbers
-    /// - Negative zero
-    /// - Positive zero
-    /// - Positive subnormal numbers
-    /// - Positive numbers
-    /// - Positive infinity
-    /// - Positive signaling NaN
-    /// - Positive quiet NaN
+    /// the `totalOrder` predicate as defined in the IEEE 754 (2008 revision)
+    /// floating point standard. The values are ordered in the following sequence:
     ///
-    /// Note that this function does not always agree with the [`PartialOrd`]
-    /// and [`PartialEq`] implementations of `f32`. In particular, they regard
-    /// negative and positive zero as equal, while `total_cmp` doesn't.
+    /// - negative quiet NaN
+    /// - negative signaling NaN
+    /// - negative infinity
+    /// - negative numbers
+    /// - negative subnormal numbers
+    /// - negative zero
+    /// - positive zero
+    /// - positive subnormal numbers
+    /// - positive numbers
+    /// - positive infinity
+    /// - positive signaling NaN
+    /// - positive quiet NaN.
+    ///
+    /// The ordering established by this function does not always agree with the
+    /// [`PartialOrd`] and [`PartialEq`] implementations of `f32`. For example,
+    /// they consider negative and positive zero equal, while `total_cmp`
+    /// doesn't.
+    ///
+    /// The interpretation of the signaling NaN bit follows the definition in
+    /// the IEEE 754 standard, which may not match the interpretation by some of
+    /// the older, non-conformant (e.g. MIPS) hardware implementations.
     ///
     /// # Example
+    ///
     /// ```
-    /// #![feature(total_cmp)]
     /// struct GoodBoy {
     ///     name: String,
     ///     weight: f32,
@@ -1047,7 +1058,7 @@ impl f32 {
     /// #     .zip([-5.0, 0.1, 10.0, 99.0, f32::INFINITY, f32::NAN].iter())
     /// #     .all(|(a, b)| a.to_bits() == b.to_bits()))
     /// ```
-    #[unstable(feature = "total_cmp", issue = "72599")]
+    #[stable(feature = "total_cmp", since = "1.62.0")]
     #[must_use]
     #[inline]
     pub fn total_cmp(&self, other: &Self) -> crate::cmp::Ordering {

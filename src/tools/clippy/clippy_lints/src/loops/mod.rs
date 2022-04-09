@@ -7,6 +7,7 @@ mod for_loops_over_fallibles;
 mod iter_next_loop;
 mod manual_flatten;
 mod manual_memcpy;
+mod missing_spin_loop;
 mod mut_range_bound;
 mod needless_collect;
 mod needless_range_loop;
@@ -47,6 +48,7 @@ declare_clippy_lint! {
     /// # let mut dst = vec![0; 65];
     /// dst[64..(src.len() + 64)].clone_from_slice(&src[..]);
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub MANUAL_MEMCPY,
     perf,
     "manually copying items between slices"
@@ -75,6 +77,7 @@ declare_clippy_lint! {
     ///     println!("{}", i);
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub NEEDLESS_RANGE_LOOP,
     style,
     "for-looping over a range of indices where an iterator over items would do"
@@ -107,6 +110,7 @@ declare_clippy_lint! {
     ///     // ..
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub EXPLICIT_ITER_LOOP,
     pedantic,
     "for-looping over `_.iter()` or `_.iter_mut()` when `&_` or `&mut _` would do"
@@ -135,6 +139,7 @@ declare_clippy_lint! {
     ///     // ..
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub EXPLICIT_INTO_ITER_LOOP,
     pedantic,
     "for-looping over `_.into_iter()` when `_` would do"
@@ -158,6 +163,7 @@ declare_clippy_lint! {
     ///     ..
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub ITER_NEXT_LOOP,
     correctness,
     "for-looping over `_.next()` which is probably not intended"
@@ -201,6 +207,7 @@ declare_clippy_lint! {
     ///     // ..
     /// }
     /// ```
+    #[clippy::version = "1.45.0"]
     pub FOR_LOOPS_OVER_FALLIBLES,
     suspicious,
     "for-looping over an `Option` or a `Result`, which is more clearly expressed as an `if let`"
@@ -233,6 +240,7 @@ declare_clippy_lint! {
     ///     // .. do something with x
     /// };
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub WHILE_LET_LOOP,
     complexity,
     "`loop { if let { ... } else break }`, which can be written as a `while let` loop"
@@ -254,6 +262,7 @@ declare_clippy_lint! {
     /// // should be
     /// let len = iterator.count();
     /// ```
+    #[clippy::version = "1.30.0"]
     pub NEEDLESS_COLLECT,
     perf,
     "collecting an iterator when collect is not needed"
@@ -284,6 +293,7 @@ declare_clippy_lint! {
     /// # fn bar(bar: usize, baz: usize) {}
     /// for (i, item) in v.iter().enumerate() { bar(i, *item); }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub EXPLICIT_COUNTER_LOOP,
     complexity,
     "for-looping with an explicit counter when `_.enumerate()` would do"
@@ -317,6 +327,7 @@ declare_clippy_lint! {
     /// ```no_run
     /// loop {}
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub EMPTY_LOOP,
     suspicious,
     "empty `loop {}`, which should block or sleep"
@@ -336,6 +347,7 @@ declare_clippy_lint! {
     ///     ..
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub WHILE_LET_ON_ITERATOR,
     style,
     "using a `while let` loop instead of a for loop on an iterator"
@@ -364,6 +376,7 @@ declare_clippy_lint! {
     ///     ..
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub FOR_KV_MAP,
     style,
     "looping on a map using `iter` when `keys` or `values` would do"
@@ -385,6 +398,7 @@ declare_clippy_lint! {
     ///     break;
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub NEVER_LOOP,
     correctness,
     "any loop that will always `break` or `return`"
@@ -420,6 +434,7 @@ declare_clippy_lint! {
     ///     println!("{}", i); // prints numbers from 0 to 42, not 0 to 21
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub MUT_RANGE_BOUND,
     suspicious,
     "for loop over a range where one of the bounds is a mutable variable"
@@ -446,6 +461,7 @@ declare_clippy_lint! {
     ///     println!("let me loop forever!");
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub WHILE_IMMUTABLE_CONDITION,
     correctness,
     "variables used within while expression are not mutated in the body"
@@ -480,6 +496,7 @@ declare_clippy_lint! {
     /// let mut vec: Vec<u8> = vec![item1; 20];
     /// vec.resize(20 + 30, item2);
     /// ```
+    #[clippy::version = "1.47.0"]
     pub SAME_ITEM_PUSH,
     style,
     "the same item is pushed inside of a for loop"
@@ -506,6 +523,7 @@ declare_clippy_lint! {
     /// let item = &item1;
     /// println!("{}", item);
     /// ```
+    #[clippy::version = "1.49.0"]
     pub SINGLE_ELEMENT_LOOP,
     complexity,
     "there is no reason to have a single element loop"
@@ -537,9 +555,46 @@ declare_clippy_lint! {
     ///     println!("{}", n);
     /// }
     /// ```
+    #[clippy::version = "1.52.0"]
     pub MANUAL_FLATTEN,
     complexity,
     "for loops over `Option`s or `Result`s with a single expression can be simplified"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Check for empty spin loops
+    ///
+    /// ### Why is this bad?
+    /// The loop body should have something like `thread::park()` or at least
+    /// `std::hint::spin_loop()` to avoid needlessly burning cycles and conserve
+    /// energy. Perhaps even better use an actual lock, if possible.
+    ///
+    /// ### Known problems
+    /// This lint doesn't currently trigger on `while let` or
+    /// `loop { match .. { .. } }` loops, which would be considered idiomatic in
+    /// combination with e.g. `AtomicBool::compare_exchange_weak`.
+    ///
+    /// ### Example
+    ///
+    /// ```ignore
+    /// use core::sync::atomic::{AtomicBool, Ordering};
+    /// let b = AtomicBool::new(true);
+    /// // give a ref to `b` to another thread,wait for it to become false
+    /// while b.load(Ordering::Acquire) {};
+    /// ```
+    /// Use instead:
+    /// ```rust,no_run
+    ///# use core::sync::atomic::{AtomicBool, Ordering};
+    ///# let b = AtomicBool::new(true);
+    /// while b.load(Ordering::Acquire) {
+    ///     std::hint::spin_loop()
+    /// }
+    /// ```
+    #[clippy::version = "1.59.0"]
+    pub MISSING_SPIN_LOOP,
+    perf,
+    "An empty busy waiting loop"
 }
 
 declare_lint_pass!(Loops => [
@@ -561,6 +616,7 @@ declare_lint_pass!(Loops => [
     WHILE_IMMUTABLE_CONDITION,
     SAME_ITEM_PUSH,
     SINGLE_ELEMENT_LOOP,
+    MISSING_SPIN_LOOP,
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Loops {
@@ -610,6 +666,7 @@ impl<'tcx> LateLintPass<'tcx> for Loops {
 
         if let Some(higher::While { condition, body }) = higher::While::hir(expr) {
             while_immutable_condition::check(cx, condition, body);
+            missing_spin_loop::check(cx, condition, body);
         }
 
         needless_collect::check(expr, cx);
@@ -640,8 +697,8 @@ fn check_for_loop<'tcx>(
 fn check_for_loop_arg(cx: &LateContext<'_>, pat: &Pat<'_>, arg: &Expr<'_>) {
     let mut next_loop_linted = false; // whether or not ITER_NEXT_LOOP lint was used
 
-    if let ExprKind::MethodCall(method, _, [self_arg], _) = arg.kind {
-        let method_name = &*method.ident.as_str();
+    if let ExprKind::MethodCall(method, [self_arg], _) = arg.kind {
+        let method_name = method.ident.as_str();
         // check for looping over x.iter() or x.iter_mut(), could use &x or &mut x
         match method_name {
             "iter" | "iter_mut" => explicit_iter_loop::check(cx, self_arg, arg, method_name),

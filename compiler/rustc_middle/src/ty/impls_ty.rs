@@ -4,8 +4,10 @@
 use crate::middle::region;
 use crate::mir;
 use crate::ty;
+use crate::ty::fast_reject::SimplifiedType;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::stable_hasher::HashingControls;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher, ToStableHashKey};
 use rustc_query_system::ich::StableHashingContext;
 use std::cell::RefCell;
@@ -17,12 +19,12 @@ where
 {
     fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
         thread_local! {
-            static CACHE: RefCell<FxHashMap<(usize, usize), Fingerprint>> =
+            static CACHE: RefCell<FxHashMap<(usize, usize, HashingControls), Fingerprint>> =
                 RefCell::new(Default::default());
         }
 
         let hash = CACHE.with(|cache| {
-            let key = (self.as_ptr() as usize, self.len());
+            let key = (self.as_ptr() as usize, self.len(), hcx.hashing_controls());
             if let Some(&hash) = cache.borrow().get(&key) {
                 return hash;
             }
@@ -54,9 +56,51 @@ where
     }
 }
 
+impl<'a> ToStableHashKey<StableHashingContext<'a>> for SimplifiedType {
+    type KeyType = Fingerprint;
+
+    #[inline]
+    fn to_stable_hash_key(&self, hcx: &StableHashingContext<'a>) -> Fingerprint {
+        let mut hasher = StableHasher::new();
+        let mut hcx: StableHashingContext<'a> = hcx.clone();
+        self.hash_stable(&mut hcx, &mut hasher);
+        hasher.finish()
+    }
+}
+
 impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for ty::subst::GenericArg<'tcx> {
     fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
         self.unpack().hash_stable(hcx, hasher);
+    }
+}
+
+impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for ty::subst::GenericArgKind<'tcx> {
+    fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
+        match self {
+            // WARNING: We dedup cache the `HashStable` results for `List`
+            // while ignoring types and freely transmute
+            // between `List<Ty<'tcx>>` and `List<GenericArg<'tcx>>`.
+            // See `fn intern_type_list` for more details.
+            //
+            // We therefore hash types without adding a hash for their discriminant.
+            //
+            // In order to make it very unlikely for the sequence of bytes being hashed for
+            // a `GenericArgKind::Type` to be the same as the sequence of bytes being
+            // hashed for one of the other variants, we hash a `0xFF` byte before hashing
+            // their discriminant (since the discriminant of `TyKind` is unlikely to ever start
+            // with 0xFF).
+            ty::subst::GenericArgKind::Type(ty) => ty.hash_stable(hcx, hasher),
+            ty::subst::GenericArgKind::Const(ct) => {
+                0xFFu8.hash_stable(hcx, hasher);
+                mem::discriminant(self).hash_stable(hcx, hasher);
+                ct.hash_stable(hcx, hasher);
+            }
+            ty::subst::GenericArgKind::Lifetime(lt) => {
+                0xFFu8.hash_stable(hcx, hasher);
+                mem::discriminant(self).hash_stable(hcx, hasher);
+                lt.hash_stable(hcx, hasher);
+            }
+        }
     }
 }
 

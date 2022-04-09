@@ -77,17 +77,14 @@ const LIFECYCLE_DETACHED_OR_JOINED: usize = usize::MAX;
 const LIFECYCLE_EXITED_OR_FINISHED_OR_JOIN_FINALIZE: usize = usize::MAX;
 // there's no single value for `JOINING`
 
-pub const DEFAULT_MIN_STACK_SIZE: usize = 1024 * crate::mem::size_of::<usize>();
+// 64KiB for 32-bit ISAs, 128KiB for 64-bit ISAs.
+pub const DEFAULT_MIN_STACK_SIZE: usize = 0x4000 * crate::mem::size_of::<usize>();
 
 impl Thread {
     /// # Safety
     ///
     /// See `thread::Builder::spawn_unchecked` for safety requirements.
     pub unsafe fn new(stack: usize, p: Box<dyn FnOnce()>) -> io::Result<Thread> {
-        // Inherit the current task's priority
-        let current_task = task::try_current_task_id().map_err(|e| e.as_io_error())?;
-        let priority = task::try_task_priority(current_task).map_err(|e| e.as_io_error())?;
-
         let inner = Box::new(ThreadInner {
             start: UnsafeCell::new(ManuallyDrop::new(p)),
             lifecycle: AtomicUsize::new(LIFECYCLE_INIT),
@@ -126,7 +123,7 @@ impl Thread {
                     // In this case, `inner`'s ownership has been moved to us,
                     // And we are responsible for dropping it. The acquire
                     // ordering is not necessary because the parent thread made
-                    // no memory acccess needing synchronization since the call
+                    // no memory access needing synchronization since the call
                     // to `acre_tsk`.
                     // Safety: See above.
                     let _ = unsafe { Box::from_raw(inner as *const _ as *mut ThreadInner) };
@@ -175,7 +172,8 @@ impl Thread {
                 exinf: inner_ptr as abi::EXINF,
                 // The entry point
                 task: Some(trampoline),
-                itskpri: priority,
+                // Inherit the calling task's base priority
+                itskpri: abi::TPRI_SELF,
                 stksz: stack,
                 // Let the kernel allocate the stack,
                 stk: crate::ptr::null_mut(),
@@ -264,7 +262,7 @@ impl Drop for Thread {
                 // one will ever join it.
                 // The ownership of `self.inner` is moved to the child thread.
                 // However, the release ordering is not necessary because we
-                // made no memory acccess needing synchronization since the call
+                // made no memory access needing synchronization since the call
                 // to `acre_tsk`.
             }
             LIFECYCLE_FINISHED => {

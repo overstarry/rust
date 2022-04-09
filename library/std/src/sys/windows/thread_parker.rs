@@ -22,7 +22,7 @@
 //
 // Unlike WaitOnAddress, NtWaitForKeyedEvent/NtReleaseKeyedEvent operate on a
 // HANDLE (created with NtCreateKeyedEvent). This means that we can be sure
-// a succesfully awoken park() was awoken by unpark() and not a
+// a successfully awoken park() was awoken by unpark() and not a
 // NtReleaseKeyedEvent call from some other code, as these events are not only
 // matched by the key (address of the parker (state)), but also by this HANDLE.
 // We lazily allocate this handle the first time it is needed.
@@ -60,7 +60,7 @@
 use crate::convert::TryFrom;
 use crate::ptr;
 use crate::sync::atomic::{
-    AtomicI8, AtomicUsize,
+    AtomicI8, AtomicPtr,
     Ordering::{Acquire, Relaxed, Release},
 };
 use crate::sys::{c, dur2timeout};
@@ -217,8 +217,8 @@ impl Parker {
 }
 
 fn keyed_event_handle() -> c::HANDLE {
-    const INVALID: usize = !0;
-    static HANDLE: AtomicUsize = AtomicUsize::new(INVALID);
+    const INVALID: c::HANDLE = ptr::invalid_mut(!0);
+    static HANDLE: AtomicPtr<libc::c_void> = AtomicPtr::new(INVALID);
     match HANDLE.load(Relaxed) {
         INVALID => {
             let mut handle = c::INVALID_HANDLE_VALUE;
@@ -230,10 +230,10 @@ fn keyed_event_handle() -> c::HANDLE {
                     0,
                 ) {
                     c::STATUS_SUCCESS => {}
-                    r => panic!("Unable to create keyed event handle: error {}", r),
+                    r => panic!("Unable to create keyed event handle: error {r}"),
                 }
             }
-            match HANDLE.compare_exchange(INVALID, handle as usize, Relaxed, Relaxed) {
+            match HANDLE.compare_exchange(INVALID, handle, Relaxed, Relaxed) {
                 Ok(_) => handle,
                 Err(h) => {
                     // Lost the race to another thread initializing HANDLE before we did.
@@ -241,10 +241,10 @@ fn keyed_event_handle() -> c::HANDLE {
                     unsafe {
                         c::CloseHandle(handle);
                     }
-                    h as c::HANDLE
+                    h
                 }
             }
         }
-        handle => handle as c::HANDLE,
+        handle => handle,
     }
 }

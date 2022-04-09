@@ -13,24 +13,14 @@
 // running tests while providing a base that other test frameworks may
 // build off of.
 
-// N.B., this is also specified in this crate's Cargo.toml, but librustc_ast contains logic specific to
-// this crate, which relies on this attribute (rather than the value of `--crate-name` passed by
-// cargo) to detect this crate.
-
-#![crate_name = "test"]
 #![unstable(feature = "test", issue = "50297")]
 #![doc(test(attr(deny(warnings))))]
-#![feature(libc)]
-#![feature(rustc_private)]
 #![feature(nll)]
-#![feature(available_parallelism)]
 #![feature(bench_black_box)]
 #![feature(internal_output_capture)]
-#![feature(panic_unwind)]
 #![feature(staged_api)]
-#![feature(termination_trait_lib)]
+#![feature(process_exitcode_internals)]
 #![feature(test)]
-#![feature(total_cmp)]
 
 // Public reexports
 pub use self::bench::{black_box, Bencher};
@@ -107,7 +97,7 @@ pub fn test_main(args: &[String], tests: Vec<TestDescAndFn>, options: Option<Opt
     let mut opts = match cli::parse_opts(args) {
         Some(Ok(o)) => o,
         Some(Err(msg)) => {
-            eprintln!("error: {}", msg);
+            eprintln!("error: {msg}");
             process::exit(ERROR_EXIT_CODE);
         }
         None => return,
@@ -117,7 +107,7 @@ pub fn test_main(args: &[String], tests: Vec<TestDescAndFn>, options: Option<Opt
     }
     if opts.list {
         if let Err(e) = console::list_tests_console(&opts, tests) {
-            eprintln!("error: io error when listing tests: {:?}", e);
+            eprintln!("error: io error when listing tests: {e:?}");
             process::exit(ERROR_EXIT_CODE);
         }
     } else {
@@ -125,7 +115,7 @@ pub fn test_main(args: &[String], tests: Vec<TestDescAndFn>, options: Option<Opt
             Ok(true) => {}
             Ok(false) => process::exit(ERROR_EXIT_CODE),
             Err(e) => {
-                eprintln!("error: io error when listing tests: {:?}", e);
+                eprintln!("error: io error when listing tests: {e:?}");
                 process::exit(ERROR_EXIT_CODE);
             }
         }
@@ -161,7 +151,7 @@ pub fn test_main_static_abort(tests: &[&TestDescAndFn]) {
             .filter(|test| test.desc.name.as_slice() == name)
             .map(make_owned_test)
             .next()
-            .unwrap_or_else(|| panic!("couldn't find a test with the provided name '{}'", name));
+            .unwrap_or_else(|| panic!("couldn't find a test with the provided name '{name}'"));
         let TestDescAndFn { desc, testfn } = test;
         let testfn = match testfn {
             StaticTestFn(f) => f,
@@ -191,7 +181,7 @@ fn make_owned_test(test: &&TestDescAndFn) -> TestDescAndFn {
 /// Tests is considered a failure. By default, invokes `report()`
 /// and checks for a `0` result.
 pub fn assert_test_result<T: Termination>(result: T) {
-    let code = result.report();
+    let code = result.report().to_i32();
     assert_eq!(
         code, 0,
         "the test returned a termination value with a non-zero status code ({}) \
@@ -444,8 +434,8 @@ pub fn convert_benchmarks_to_tests(tests: Vec<TestDescAndFn>) -> Vec<TestDescAnd
         .into_iter()
         .map(|x| {
             let testfn = match x.testfn {
-                DynBenchFn(bench) => DynTestFn(Box::new(move || {
-                    bench::run_once(|b| __rust_begin_short_backtrace(|| bench.run(b)))
+                DynBenchFn(benchfn) => DynTestFn(Box::new(move || {
+                    bench::run_once(|b| __rust_begin_short_backtrace(|| benchfn(b)))
                 })),
                 StaticBenchFn(benchfn) => DynTestFn(Box::new(move || {
                     bench::run_once(|b| __rust_begin_short_backtrace(|| benchfn(b)))
@@ -532,7 +522,7 @@ pub fn run_test(
                     Arc::get_mut(&mut runtest).unwrap().get_mut().unwrap().take().unwrap()();
                     None
                 }
-                Err(e) => panic!("failed to spawn thread to run test: {}", e),
+                Err(e) => panic!("failed to spawn thread to run test: {e}"),
             }
         } else {
             runtest();
@@ -544,11 +534,9 @@ pub fn run_test(
         TestRunOpts { strategy, nocapture: opts.nocapture, concurrency, time: opts.time_options };
 
     match testfn {
-        DynBenchFn(bencher) => {
+        DynBenchFn(benchfn) => {
             // Benchmarks aren't expected to panic, so we run them all in-process.
-            crate::bench::benchmark(id, desc, monitor_ch, opts.nocapture, |harness| {
-                bencher.run(harness)
-            });
+            crate::bench::benchmark(id, desc, monitor_ch, opts.nocapture, benchfn);
             None
         }
         StaticBenchFn(benchfn) => {
@@ -688,7 +676,7 @@ fn run_test_in_spawned_subprocess(desc: TestDesc, testfn: Box<dyn FnOnce() + Sen
         // We don't support serializing TrFailedMsg, so just
         // print the message out to stderr.
         if let TrFailedMsg(msg) = &test_result {
-            eprintln!("{}", msg);
+            eprintln!("{msg}");
         }
 
         if let Some(info) = panic_info {

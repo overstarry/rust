@@ -90,9 +90,8 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(never_type)]
 #![feature(nll)]
-#![feature(in_band_lifetimes)]
-#![feature(iter_zip)]
 #![recursion_limit = "256"]
+#![allow(rustc::potential_query_instability)]
 
 #[macro_use]
 extern crate rustc_middle;
@@ -117,7 +116,7 @@ pub mod test;
 /// This function computes the symbol name for the given `instance` and the
 /// given instantiating crate. That is, if you know that instance X is
 /// instantiated in crate Y, this is the symbol name this instance would have.
-pub fn symbol_name_for_instance_in_crate(
+pub fn symbol_name_for_instance_in_crate<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     instantiating_crate: CrateNum,
@@ -132,7 +131,7 @@ pub fn provide(providers: &mut Providers) {
 // The `symbol_name` query provides the symbol name for calling a given
 // instance from the local crate. In particular, it will also look up the
 // correct symbol name of instances from upstream crates.
-fn symbol_name_provider(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty::SymbolName<'tcx> {
+fn symbol_name_provider<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty::SymbolName<'tcx> {
     let symbol_name = compute_symbol_name(tcx, instance, || {
         // This closure determines the instantiating crate for instances that
         // need an instantiating-crate-suffix for their symbol name, in order
@@ -152,14 +151,14 @@ fn symbol_name_provider(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty::Symb
 }
 
 /// This function computes the typeid for the given function ABI.
-pub fn typeid_for_fnabi(tcx: TyCtxt<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> String {
+pub fn typeid_for_fnabi<'tcx>(tcx: TyCtxt<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> String {
     v0::mangle_typeid_for_fnabi(tcx, fn_abi)
 }
 
 /// Computes the symbol name for the given instance. This function will call
 /// `compute_instantiating_crate` if it needs to factor the instantiating crate
 /// into the symbol name.
-fn compute_symbol_name(
+fn compute_symbol_name<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: Instance<'tcx>,
     compute_instantiating_crate: impl FnOnce() -> CrateNum,
@@ -175,8 +174,7 @@ fn compute_symbol_name(
             let stable_crate_id = tcx.sess.local_stable_crate_id();
             return tcx.sess.generate_proc_macro_decls_symbol(stable_crate_id);
         }
-        let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
-        matches!(tcx.hir().get(hir_id), Node::ForeignItem(_))
+        matches!(tcx.hir().get_by_def_id(def_id), Node::ForeignItem(_))
     } else {
         tcx.is_foreign_item(def_id)
     };
@@ -228,7 +226,7 @@ fn compute_symbol_name(
 
         // If we're dealing with an instance of a function that's inlined from
         // another crate but we're marking it as globally shared to our
-        // compliation (aka we're not making an internal copy in each of our
+        // compilation (aka we're not making an internal copy in each of our
         // codegen units) then this symbol may become an exported (but hidden
         // visibility) symbol. This means that multiple crates may do the same
         // and we want to be sure to avoid any symbol conflicts here.
@@ -239,7 +237,7 @@ fn compute_symbol_name(
 
     // Pick the crate responsible for the symbol mangling version, which has to:
     // 1. be stable for each instance, whether it's being defined or imported
-    // 2. obey each crate's own `-Z symbol-mangling-version`, as much as possible
+    // 2. obey each crate's own `-C symbol-mangling-version`, as much as possible
     // We solve these as follows:
     // 1. because symbol names depend on both `def_id` and `instantiating_crate`,
     // both their `CrateNum`s are stable for any given instance, so we can pick
@@ -247,7 +245,7 @@ fn compute_symbol_name(
     // 2. we favor `instantiating_crate` where possible (i.e. when `Some`)
     let mangling_version_crate = instantiating_crate.unwrap_or(def_id.krate);
     let mangling_version = if mangling_version_crate == LOCAL_CRATE {
-        tcx.sess.opts.debugging_opts.get_symbol_mangling_version()
+        tcx.sess.opts.get_symbol_mangling_version()
     } else {
         tcx.symbol_mangling_version(mangling_version_crate)
     };

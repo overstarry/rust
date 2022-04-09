@@ -3,7 +3,7 @@
 //!
 //! To enable coverage, include the rustc command line option:
 //!
-//!   * `-Z instrument-coverage`
+//!   * `-C instrument-coverage`
 //!
 //! MIR Dump Files, with additional `CoverageGraph` graphviz and `CoverageSpan` spanview
 //! ------------------------------------------------------------------------------------
@@ -111,6 +111,7 @@
 use super::graph::{BasicCoverageBlock, BasicCoverageBlockData, CoverageGraph};
 use super::spans::CoverageSpan;
 
+use itertools::Itertools;
 use rustc_middle::mir::create_dump_file;
 use rustc_middle::mir::generic_graphviz::GraphvizWriter;
 use rustc_middle::mir::spanview::{self, SpanViewable};
@@ -148,7 +149,7 @@ impl DebugOptions {
         let mut counter_format = ExpressionFormat::default();
 
         if let Ok(env_debug_options) = std::env::var(RUSTC_COVERAGE_DEBUG_OPTIONS) {
-            for setting_str in env_debug_options.replace(" ", "").replace("-", "_").split(',') {
+            for setting_str in env_debug_options.replace(' ', "").replace('-', "_").split(',') {
                 let (option, value) = match setting_str.split_once('=') {
                     None => (setting_str, None),
                     Some((k, v)) => (k, Some(v)),
@@ -356,14 +357,12 @@ impl DebugCounters {
         if let Some(counters) = &self.some_counters {
             if let Some(DebugCounter { counter_kind, some_block_label }) = counters.get(&operand) {
                 if let CoverageKind::Expression { .. } = counter_kind {
-                    if let Some(block_label) = some_block_label {
-                        if debug_options().counter_format.block {
-                            return format!(
-                                "{}:({})",
-                                block_label,
-                                self.format_counter_kind(counter_kind)
-                            );
-                        }
+                    if let Some(label) = some_block_label && debug_options().counter_format.block {
+                        return format!(
+                            "{}:({})",
+                            label,
+                            self.format_counter_kind(counter_kind)
+                        );
                     }
                     return format!("({})", self.format_counter_kind(counter_kind));
                 }
@@ -629,7 +628,7 @@ impl UsedExpressions {
 }
 
 /// Generates the MIR pass `CoverageSpan`-specific spanview dump file.
-pub(super) fn dump_coverage_spanview(
+pub(super) fn dump_coverage_spanview<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     basic_coverage_blocks: &CoverageGraph,
@@ -651,7 +650,7 @@ pub(super) fn dump_coverage_spanview(
 }
 
 /// Converts the computed `BasicCoverageBlockData`s into `SpanViewable`s.
-fn span_viewables(
+fn span_viewables<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     basic_coverage_blocks: &CoverageGraph,
@@ -670,7 +669,7 @@ fn span_viewables(
 }
 
 /// Generates the MIR pass coverage-specific graphviz dump file.
-pub(super) fn dump_coverage_graphviz(
+pub(super) fn dump_coverage_graphviz<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     pass_name: &str,
@@ -739,7 +738,6 @@ pub(super) fn dump_coverage_graphviz(
                         )
                     }
                 })
-                .collect::<Vec<_>>()
                 .join("\n  ")
         ));
     }
@@ -750,7 +748,7 @@ pub(super) fn dump_coverage_graphviz(
         .expect("Unexpected error writing BasicCoverageBlock graphviz DOT file");
 }
 
-fn bcb_to_string_sections(
+fn bcb_to_string_sections<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     debug_counters: &DebugCounters,
@@ -768,7 +766,6 @@ fn bcb_to_string_sections(
                 .map(|expression| {
                     format!("Intermediate {}", debug_counters.format_counter(expression))
                 })
-                .collect::<Vec<_>>()
                 .join("\n"),
         );
     }
@@ -783,7 +780,6 @@ fn bcb_to_string_sections(
                         covspan.format(tcx, mir_body)
                     )
                 })
-                .collect::<Vec<_>>()
                 .join("\n"),
         );
     }
@@ -793,7 +789,6 @@ fn bcb_to_string_sections(
             dependency_counters
                 .iter()
                 .map(|counter| debug_counters.format_counter(counter))
-                .collect::<Vec<_>>()
                 .join("  \n"),
         ));
     }
@@ -817,7 +812,7 @@ fn bcb_to_string_sections(
 
 /// Returns a simple string representation of a `TerminatorKind` variant, independent of any
 /// values it might hold.
-pub(super) fn term_type(kind: &TerminatorKind<'tcx>) -> &'static str {
+pub(super) fn term_type(kind: &TerminatorKind<'_>) -> &'static str {
     match kind {
         TerminatorKind::Goto { .. } => "Goto",
         TerminatorKind::SwitchInt { .. } => "SwitchInt",

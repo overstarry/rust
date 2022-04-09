@@ -22,6 +22,7 @@ declare_clippy_lint! {
     /// ```ignore
     /// Regex::new("|")
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub INVALID_REGEX,
     correctness,
     "invalid regular expressions"
@@ -46,6 +47,7 @@ declare_clippy_lint! {
     /// ```ignore
     /// Regex::new("^foobar")
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub TRIVIAL_REGEX,
     nursery,
     "trivial regular expressions"
@@ -79,7 +81,7 @@ impl<'tcx> LateLintPass<'tcx> for Regex {
 
 #[allow(clippy::cast_possible_truncation)] // truncation very unlikely here
 #[must_use]
-fn str_span(base: Span, c: regex_syntax::ast::Span, offset: u16) -> Span {
+fn str_span(base: Span, c: regex_syntax::ast::Span, offset: u8) -> Span {
     let offset = u32::from(offset);
     let end = base.lo() + BytePos(u32::try_from(c.end.offset).expect("offset too large") + offset);
     let start = base.lo() + BytePos(u32::try_from(c.start.offset).expect("offset too large") + offset);
@@ -148,7 +150,7 @@ fn check_regex<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, utf8: bool) {
 
     if let ExprKind::Lit(ref lit) = expr.kind {
         if let LitKind::Str(ref r, style) = lit.node {
-            let r = &r.as_str();
+            let r = r.as_str();
             let offset = if let StrStyle::Raw(n) = style { 2 + n } else { 1 };
             match parser.parse(r) {
                 Ok(r) => {

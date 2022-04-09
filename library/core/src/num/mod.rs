@@ -193,26 +193,22 @@ macro_rules! widening_impl {
     };
 }
 
-#[lang = "i8"]
 impl i8 {
     int_impl! { i8, i8, u8, 8, 7, -128, 127, 2, "-0x7e", "0xa", "0x12", "0x12", "0x48",
     "[0x12]", "[0x12]", "", "" }
 }
 
-#[lang = "i16"]
 impl i16 {
     int_impl! { i16, i16, u16, 16, 15, -32768, 32767, 4, "-0x5ffd", "0x3a", "0x1234", "0x3412",
     "0x2c48", "[0x34, 0x12]", "[0x12, 0x34]", "", "" }
 }
 
-#[lang = "i32"]
 impl i32 {
     int_impl! { i32, i32, u32, 32, 31, -2147483648, 2147483647, 8, "0x10000b3", "0xb301",
     "0x12345678", "0x78563412", "0x1e6a2c48", "[0x78, 0x56, 0x34, 0x12]",
     "[0x12, 0x34, 0x56, 0x78]", "", "" }
 }
 
-#[lang = "i64"]
 impl i64 {
     int_impl! { i64, i64, u64, 64, 63, -9223372036854775808, 9223372036854775807, 12,
     "0xaa00000000006e1", "0x6e10aa", "0x1234567890123456", "0x5634129078563412",
@@ -220,7 +216,6 @@ impl i64 {
     "[0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56]", "", "" }
 }
 
-#[lang = "i128"]
 impl i128 {
     int_impl! { i128, i128, u128, 128, 127, -170141183460469231731687303715884105728,
     170141183460469231731687303715884105727, 16,
@@ -233,7 +228,6 @@ impl i128 {
 }
 
 #[cfg(target_pointer_width = "16")]
-#[lang = "isize"]
 impl isize {
     int_impl! { isize, i16, usize, 16, 15, -32768, 32767, 4, "-0x5ffd", "0x3a", "0x1234",
     "0x3412", "0x2c48", "[0x34, 0x12]", "[0x12, 0x34]",
@@ -241,7 +235,6 @@ impl isize {
 }
 
 #[cfg(target_pointer_width = "32")]
-#[lang = "isize"]
 impl isize {
     int_impl! { isize, i32, usize, 32, 31, -2147483648, 2147483647, 8, "0x10000b3", "0xb301",
     "0x12345678", "0x78563412", "0x1e6a2c48", "[0x78, 0x56, 0x34, 0x12]",
@@ -250,7 +243,6 @@ impl isize {
 }
 
 #[cfg(target_pointer_width = "64")]
-#[lang = "isize"]
 impl isize {
     int_impl! { isize, i64, usize, 64, 63, -9223372036854775808, 9223372036854775807,
     12, "0xaa00000000006e1", "0x6e10aa",  "0x1234567890123456", "0x5634129078563412",
@@ -262,9 +254,8 @@ impl isize {
 /// If 6th bit set ascii is upper case.
 const ASCII_CASE_MASK: u8 = 0b0010_0000;
 
-#[lang = "u8"]
 impl u8 {
-    uint_impl! { u8, u8, i8, 8, 255, 2, "0x82", "0xa", "0x12", "0x12", "0x48", "[0x12]",
+    uint_impl! { u8, u8, i8, NonZeroU8, 8, 255, 2, "0x82", "0xa", "0x12", "0x12", "0x48", "[0x12]",
     "[0x12]", "", "" }
     widening_impl! { u8, u16, 8, unsigned }
 
@@ -281,7 +272,7 @@ impl u8 {
     /// ```
     #[must_use]
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
-    #[rustc_const_stable(feature = "const_ascii_methods_on_intrinsics", since = "1.43.0")]
+    #[rustc_const_stable(feature = "const_u8_is_ascii", since = "1.43.0")]
     #[inline]
     pub const fn is_ascii(&self) -> bool {
         *self & 128 == 0
@@ -791,7 +782,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(inherent_ascii_escape)]
     ///
     /// assert_eq!("0", b'0'.escape_ascii().to_string());
     /// assert_eq!("\\t", b'\t'.escape_ascii().to_string());
@@ -804,30 +794,58 @@ impl u8 {
     /// ```
     #[must_use = "this returns the escaped byte as an iterator, \
                   without modifying the original"]
-    #[unstable(feature = "inherent_ascii_escape", issue = "77174")]
+    #[stable(feature = "inherent_ascii_escape", since = "1.60.0")]
     #[inline]
-    pub fn escape_ascii(&self) -> ascii::EscapeDefault {
-        ascii::escape_default(*self)
+    pub fn escape_ascii(self) -> ascii::EscapeDefault {
+        ascii::escape_default(self)
+    }
+
+    #[inline]
+    pub(crate) const fn is_utf8_char_boundary(self) -> bool {
+        // This is bit magic equivalent to: b < 128 || b >= 192
+        (self as i8) >= -0x40
     }
 }
 
-#[lang = "u16"]
 impl u16 {
-    uint_impl! { u16, u16, i16, 16, 65535, 4, "0xa003", "0x3a", "0x1234", "0x3412", "0x2c48",
+    uint_impl! { u16, u16, i16, NonZeroU16, 16, 65535, 4, "0xa003", "0x3a", "0x1234", "0x3412", "0x2c48",
     "[0x34, 0x12]", "[0x12, 0x34]", "", "" }
     widening_impl! { u16, u32, 16, unsigned }
+
+    /// Checks if the value is a Unicode surrogate code point, which are disallowed values for [`char`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(utf16_extra)]
+    ///
+    /// let low_non_surrogate = 0xA000u16;
+    /// let low_surrogate = 0xD800u16;
+    /// let high_surrogate = 0xDC00u16;
+    /// let high_non_surrogate = 0xE000u16;
+    ///
+    /// assert!(!low_non_surrogate.is_utf16_surrogate());
+    /// assert!(low_surrogate.is_utf16_surrogate());
+    /// assert!(high_surrogate.is_utf16_surrogate());
+    /// assert!(!high_non_surrogate.is_utf16_surrogate());
+    /// ```
+    #[must_use]
+    #[unstable(feature = "utf16_extra", issue = "94919")]
+    #[rustc_const_unstable(feature = "utf16_extra_const", issue = "94919")]
+    #[inline]
+    pub const fn is_utf16_surrogate(self) -> bool {
+        matches!(self, 0xD800..=0xDFFF)
+    }
 }
 
-#[lang = "u32"]
 impl u32 {
-    uint_impl! { u32, u32, i32, 32, 4294967295, 8, "0x10000b3", "0xb301", "0x12345678",
+    uint_impl! { u32, u32, i32, NonZeroU32, 32, 4294967295, 8, "0x10000b3", "0xb301", "0x12345678",
     "0x78563412", "0x1e6a2c48", "[0x78, 0x56, 0x34, 0x12]", "[0x12, 0x34, 0x56, 0x78]", "", "" }
     widening_impl! { u32, u64, 32, unsigned }
 }
 
-#[lang = "u64"]
 impl u64 {
-    uint_impl! { u64, u64, i64, 64, 18446744073709551615, 12, "0xaa00000000006e1", "0x6e10aa",
+    uint_impl! { u64, u64, i64, NonZeroU64, 64, 18446744073709551615, 12, "0xaa00000000006e1", "0x6e10aa",
     "0x1234567890123456", "0x5634129078563412", "0x6a2c48091e6a2c48",
     "[0x56, 0x34, 0x12, 0x90, 0x78, 0x56, 0x34, 0x12]",
     "[0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56]",
@@ -835,9 +853,8 @@ impl u64 {
     widening_impl! { u64, u128, 64, unsigned }
 }
 
-#[lang = "u128"]
 impl u128 {
-    uint_impl! { u128, u128, i128, 128, 340282366920938463463374607431768211455, 16,
+    uint_impl! { u128, u128, i128, NonZeroU128, 128, 340282366920938463463374607431768211455, 16,
     "0x13f40000000000000000000000004f76", "0x4f7613f4", "0x12345678901234567890123456789012",
     "0x12907856341290785634129078563412", "0x48091e6a2c48091e6a2c48091e6a2c48",
     "[0x12, 0x90, 0x78, 0x56, 0x34, 0x12, 0x90, 0x78, \
@@ -848,26 +865,23 @@ impl u128 {
 }
 
 #[cfg(target_pointer_width = "16")]
-#[lang = "usize"]
 impl usize {
-    uint_impl! { usize, u16, isize, 16, 65535, 4, "0xa003", "0x3a", "0x1234", "0x3412", "0x2c48",
+    uint_impl! { usize, u16, isize, NonZeroUsize, 16, 65535, 4, "0xa003", "0x3a", "0x1234", "0x3412", "0x2c48",
     "[0x34, 0x12]", "[0x12, 0x34]",
     usize_isize_to_xe_bytes_doc!(), usize_isize_from_xe_bytes_doc!() }
     widening_impl! { usize, u32, 16, unsigned }
 }
 #[cfg(target_pointer_width = "32")]
-#[lang = "usize"]
 impl usize {
-    uint_impl! { usize, u32, isize, 32, 4294967295, 8, "0x10000b3", "0xb301", "0x12345678",
+    uint_impl! { usize, u32, isize, NonZeroUsize, 32, 4294967295, 8, "0x10000b3", "0xb301", "0x12345678",
     "0x78563412", "0x1e6a2c48", "[0x78, 0x56, 0x34, 0x12]", "[0x12, 0x34, 0x56, 0x78]",
     usize_isize_to_xe_bytes_doc!(), usize_isize_from_xe_bytes_doc!() }
     widening_impl! { usize, u64, 32, unsigned }
 }
 
 #[cfg(target_pointer_width = "64")]
-#[lang = "usize"]
 impl usize {
-    uint_impl! { usize, u64, isize, 64, 18446744073709551615, 12, "0xaa00000000006e1", "0x6e10aa",
+    uint_impl! { usize, u64, isize, NonZeroUsize, 64, 18446744073709551615, 12, "0xaa00000000006e1", "0x6e10aa",
     "0x1234567890123456", "0x5634129078563412", "0x6a2c48091e6a2c48",
     "[0x56, 0x34, 0x12, 0x90, 0x78, 0x56, 0x34, 0x12]",
     "[0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56]",

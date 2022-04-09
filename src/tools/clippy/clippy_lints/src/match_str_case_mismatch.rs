@@ -2,14 +2,13 @@ use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::ty::is_type_diagnostic_item;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
-use rustc_hir::intravisit::{walk_expr, NestedVisitorMap, Visitor};
+use rustc_hir::intravisit::{walk_expr, Visitor};
 use rustc_hir::{Arm, Expr, ExprKind, MatchSource, PatKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::hir::map::Map;
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty;
 use rustc_session::{declare_lint_pass, declare_tool_lint};
-use rustc_span::symbol::SymbolStr;
+use rustc_span::symbol::Symbol;
 use rustc_span::{sym, Span};
 
 declare_clippy_lint! {
@@ -39,6 +38,7 @@ declare_clippy_lint! {
     ///     _ => {},
     /// }
     /// ```
+    #[clippy::version = "1.58.0"]
     pub MATCH_STR_CASE_MISMATCH,
     correctness,
     "creation of a case altering match expression with non-compliant arms"
@@ -54,7 +54,7 @@ enum CaseMethod {
     AsciiUppercase,
 }
 
-impl LateLintPass<'_> for MatchStrCaseMismatch {
+impl<'tcx> LateLintPass<'tcx> for MatchStrCaseMismatch {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         if_chain! {
             if !in_external_macro(cx.tcx.sess, expr.span);
@@ -70,8 +70,8 @@ impl LateLintPass<'_> for MatchStrCaseMismatch {
                 visitor.visit_expr(match_expr);
 
                 if let Some(case_method) = visitor.case_method {
-                    if let Some((bad_case_span, bad_case_str)) = verify_case(&case_method, arms) {
-                        lint(cx, &case_method, bad_case_span, &bad_case_str);
+                    if let Some((bad_case_span, bad_case_sym)) = verify_case(&case_method, arms) {
+                        lint(cx, &case_method, bad_case_span, bad_case_sym.as_str());
                     }
                 }
             }
@@ -85,16 +85,9 @@ struct MatchExprVisitor<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for MatchExprVisitor<'a, 'tcx> {
-    type Map = Map<'tcx>;
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
-    }
-
     fn visit_expr(&mut self, ex: &'tcx Expr<'_>) {
         match ex.kind {
-            ExprKind::MethodCall(segment, _, [receiver], _)
-                if self.case_altered(&*segment.ident.as_str(), receiver) => {},
+            ExprKind::MethodCall(segment, [receiver], _) if self.case_altered(segment.ident.as_str(), receiver) => {},
             _ => walk_expr(self, ex),
         }
     }
@@ -125,7 +118,7 @@ fn get_case_method(segment_ident_str: &str) -> Option<CaseMethod> {
     }
 }
 
-fn verify_case<'a>(case_method: &'a CaseMethod, arms: &'a [Arm<'_>]) -> Option<(Span, SymbolStr)> {
+fn verify_case<'a>(case_method: &'a CaseMethod, arms: &'a [Arm<'_>]) -> Option<(Span, Symbol)> {
     let case_check = match case_method {
         CaseMethod::LowerCase => |input: &str| -> bool { input.chars().all(|c| c.to_lowercase().next() == Some(c)) },
         CaseMethod::AsciiLowerCase => |input: &str| -> bool { !input.chars().any(|c| c.is_ascii_uppercase()) },
@@ -141,9 +134,9 @@ fn verify_case<'a>(case_method: &'a CaseMethod, arms: &'a [Arm<'_>]) -> Option<(
                             }) = arm.pat.kind;
             if let LitKind::Str(symbol, _) = lit.node;
             let input = symbol.as_str();
-            if !case_check(&input);
+            if !case_check(input);
             then {
-                return Some((lit.span, input));
+                return Some((lit.span, symbol));
             }
         }
     }

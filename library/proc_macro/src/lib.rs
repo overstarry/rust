@@ -20,17 +20,15 @@
 #![feature(rustc_allow_const_fn_unstable)]
 #![feature(nll)]
 #![feature(staged_api)]
-#![feature(const_fn_trait_bound)]
-#![feature(const_fn_fn_ptr_basics)]
 #![feature(allow_internal_unstable)]
 #![feature(decl_macro)]
 #![feature(extern_types)]
-#![feature(in_band_lifetimes)]
 #![feature(negative_impls)]
 #![feature(auto_traits)]
 #![feature(restricted_std)]
 #![feature(rustc_attrs)]
 #![feature(min_specialization)]
+#![feature(panic_update_hook)]
 #![recursion_limit = "256"]
 
 #[unstable(feature = "proc_macro_internals", issue = "27812")]
@@ -1106,7 +1104,7 @@ impl Literal {
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn f32_unsuffixed(n: f32) -> Literal {
         if !n.is_finite() {
-            panic!("Invalid float literal {}", n);
+            panic!("Invalid float literal {n}");
         }
         let mut repr = n.to_string();
         if !repr.contains('.') {
@@ -1131,7 +1129,7 @@ impl Literal {
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn f32_suffixed(n: f32) -> Literal {
         if !n.is_finite() {
-            panic!("Invalid float literal {}", n);
+            panic!("Invalid float literal {n}");
         }
         Literal(bridge::client::Literal::f32(&n.to_string()))
     }
@@ -1151,7 +1149,7 @@ impl Literal {
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn f64_unsuffixed(n: f64) -> Literal {
         if !n.is_finite() {
-            panic!("Invalid float literal {}", n);
+            panic!("Invalid float literal {n}");
         }
         let mut repr = n.to_string();
         if !repr.contains('.') {
@@ -1176,7 +1174,7 @@ impl Literal {
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn f64_suffixed(n: f64) -> Literal {
         if !n.is_finite() {
-            panic!("Invalid float literal {}", n);
+            panic!("Invalid float literal {n}");
         }
         Literal(bridge::client::Literal::f64(&n.to_string()))
     }

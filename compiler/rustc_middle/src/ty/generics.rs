@@ -24,13 +24,18 @@ impl GenericParamDefKind {
             GenericParamDefKind::Const { .. } => "constant",
         }
     }
-    pub fn to_ord(&self, tcx: TyCtxt<'_>) -> ast::ParamKindOrd {
+    pub fn to_ord(&self) -> ast::ParamKindOrd {
         match self {
             GenericParamDefKind::Lifetime => ast::ParamKindOrd::Lifetime,
             GenericParamDefKind::Type { .. } => ast::ParamKindOrd::Type,
-            GenericParamDefKind::Const { .. } => {
-                ast::ParamKindOrd::Const { unordered: tcx.features().unordered_const_ty_params() }
-            }
+            GenericParamDefKind::Const { .. } => ast::ParamKindOrd::Const,
+        }
+    }
+
+    pub fn is_ty_or_const(&self) -> bool {
+        match self {
+            GenericParamDefKind::Lifetime => false,
+            GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => true,
         }
     }
 }

@@ -21,9 +21,9 @@ rustc_index::newtype_index! {
 impl ExpressionOperandId {
     /// An expression operand for a "zero counter", as described in the following references:
     ///
-    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/docs/CoverageMappingFormat.rst#counter>
-    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/docs/CoverageMappingFormat.rst#tag>
-    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/11.0-2020-10-12/llvm/docs/CoverageMappingFormat.rst#counter-expressions>
+    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/13.0-2021-09-30/llvm/docs/CoverageMappingFormat.rst#counter>
+    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/13.0-2021-09-30/llvm/docs/CoverageMappingFormat.rst#tag>
+    /// * <https://github.com/rust-lang/llvm-project/blob/rustc/13.0-2021-09-30/llvm/docs/CoverageMappingFormat.rst#counter-expressions>
     ///
     /// This operand can be used to count two or more separate code regions with a single counter,
     /// if they run sequentially with no branches, by injecting the `Counter` in a `BasicBlock` for
@@ -46,7 +46,7 @@ impl CounterValueReference {
 
     /// Returns explicitly-requested zero-based version of the counter id, used
     /// during codegen. LLVM expects zero-based indexes.
-    pub fn zero_based_index(&self) -> u32 {
+    pub fn zero_based_index(self) -> u32 {
         let one_based_index = self.as_u32();
         debug_assert!(one_based_index > 0);
         one_based_index - 1

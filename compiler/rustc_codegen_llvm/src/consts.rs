@@ -2,6 +2,7 @@ use crate::base;
 use crate::common::CodegenCx;
 use crate::debuginfo;
 use crate::llvm::{self, True};
+use crate::llvm_util;
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
@@ -11,7 +12,7 @@ use rustc_codegen_ssa::traits::*;
 use rustc_hir::def_id::DefId;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::interpret::{
-    read_target_uint, Allocation, ErrorHandled, GlobalAlloc, InitChunk, Pointer,
+    read_target_uint, Allocation, ConstAllocation, ErrorHandled, GlobalAlloc, InitChunk, Pointer,
     Scalar as InterpScalar,
 };
 use rustc_middle::mir::mono::MonoItem;
@@ -24,7 +25,8 @@ use rustc_target::abi::{
 use std::ops::Range;
 use tracing::debug;
 
-pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_>, alloc: &Allocation) -> &'ll Value {
+pub fn const_alloc_to_llvm<'ll>(cx: &CodegenCx<'ll, '_>, alloc: ConstAllocation<'_>) -> &'ll Value {
+    let alloc = alloc.inner();
     let mut llvals = Vec::with_capacity(alloc.relocations().len() + 1);
     let dl = cx.data_layout();
     let pointer_size = dl.pointer_size.bytes() as usize;
@@ -37,7 +39,7 @@ pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_>, alloc: &Allocation) -> &'ll 
         alloc: &'a Allocation,
         range: Range<usize>,
     ) {
-        let mut chunks = alloc
+        let chunks = alloc
             .init_mask()
             .range_as_init_chunks(Size::from_bytes(range.start), Size::from_bytes(range.end));
 
@@ -53,30 +55,26 @@ pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_>, alloc: &Allocation) -> &'ll 
             }
         };
 
-        // Generating partially-uninit consts inhibits optimizations, so it is disabled by default.
-        // See https://github.com/rust-lang/rust/issues/84565.
-        let allow_partially_uninit =
-            match cx.sess().opts.debugging_opts.partially_uninit_const_threshold {
-                Some(max) => range.len() <= max,
-                None => false,
-            };
+        // Generating partially-uninit consts is limited to small numbers of chunks,
+        // to avoid the cost of generating large complex const expressions.
+        // For example, `[(u32, u8); 1024 * 1024]` contains uninit padding in each element,
+        // and would result in `{ [5 x i8] zeroinitializer, [3 x i8] undef, ...repeat 1M times... }`.
+        let max = if llvm_util::get_version() < (14, 0, 0) {
+            // Generating partially-uninit consts inhibits optimizations in LLVM < 14.
+            // See https://github.com/rust-lang/rust/issues/84565.
+            1
+        } else {
+            cx.sess().opts.debugging_opts.uninit_const_chunk_threshold
+        };
+        let allow_uninit_chunks = chunks.clone().take(max.saturating_add(1)).count() <= max;
 
-        if allow_partially_uninit {
+        if allow_uninit_chunks {
             llvals.extend(chunks.map(chunk_to_llval));
         } else {
-            let llval = match (chunks.next(), chunks.next()) {
-                (Some(chunk), None) => {
-                    // exactly one chunk, either fully init or fully uninit
-                    chunk_to_llval(chunk)
-                }
-                _ => {
-                    // partially uninit, codegen as if it was initialized
-                    // (using some arbitrary value for uninit bytes)
-                    let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(range);
-                    cx.const_bytes(bytes)
-                }
-            };
-            llvals.push(llval);
+            // If this allocation contains any uninit bytes, codegen as if it was initialized
+            // (using some arbitrary value for uninit bytes).
+            let bytes = alloc.inspect_with_uninit_and_ptr_outside_interpreter(range);
+            llvals.push(cx.const_bytes(bytes));
         }
     }
 
@@ -111,7 +109,10 @@ pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_>, alloc: &Allocation) -> &'ll 
                 Pointer::new(alloc_id, Size::from_bytes(ptr_offset)),
                 &cx.tcx,
             ),
-            Scalar { value: Primitive::Pointer, valid_range: WrappingRange { start: 0, end: !0 } },
+            Scalar::Initialized {
+                value: Primitive::Pointer,
+                valid_range: WrappingRange::full(dl.pointer_size),
+            },
             cx.type_i8p_ext(address_space),
         ));
         next_offset = offset + pointer_size;
@@ -127,15 +128,15 @@ pub fn const_alloc_to_llvm(cx: &CodegenCx<'ll, '_>, alloc: &Allocation) -> &'ll 
     cx.const_struct(&llvals, true)
 }
 
-pub fn codegen_static_initializer(
+pub fn codegen_static_initializer<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     def_id: DefId,
-) -> Result<(&'ll Value, &'tcx Allocation), ErrorHandled> {
+) -> Result<(&'ll Value, ConstAllocation<'tcx>), ErrorHandled> {
     let alloc = cx.tcx.eval_static_initializer(def_id)?;
     Ok((const_alloc_to_llvm(cx, alloc), alloc))
 }
 
-fn set_global_alignment(cx: &CodegenCx<'ll, '_>, gv: &'ll Value, mut align: Align) {
+fn set_global_alignment<'ll>(cx: &CodegenCx<'ll, '_>, gv: &'ll Value, mut align: Align) {
     // The target may require greater alignment for globals than the type does.
     // Note: GCC and Clang also allow `__attribute__((aligned))` on variables,
     // which can force it to be smaller.  Rust doesn't support this yet.
@@ -152,7 +153,7 @@ fn set_global_alignment(cx: &CodegenCx<'ll, '_>, gv: &'ll Value, mut align: Alig
     }
 }
 
-fn check_and_apply_linkage(
+fn check_and_apply_linkage<'ll, 'tcx>(
     cx: &CodegenCx<'ll, 'tcx>,
     attrs: &CodegenFnAttrs,
     ty: Ty<'tcx>,
@@ -206,11 +207,11 @@ fn check_and_apply_linkage(
     }
 }
 
-pub fn ptrcast(val: &'ll Value, ty: &'ll Type) -> &'ll Value {
+pub fn ptrcast<'ll>(val: &'ll Value, ty: &'ll Type) -> &'ll Value {
     unsafe { llvm::LLVMConstPointerCast(val, ty) }
 }
 
-impl CodegenCx<'ll, 'tcx> {
+impl<'ll> CodegenCx<'ll, '_> {
     crate fn const_bitcast(&self, val: &'ll Value, ty: &'ll Type) -> &'ll Value {
         unsafe { llvm::LLVMConstBitCast(val, ty) }
     }
@@ -225,7 +226,7 @@ impl CodegenCx<'ll, 'tcx> {
             let gv = match kind {
                 Some(kind) if !self.tcx.sess.fewer_names() => {
                     let name = self.generate_local_symbol_name(kind);
-                    let gv = self.define_global(&name[..], self.val_ty(cv)).unwrap_or_else(|| {
+                    let gv = self.define_global(&name, self.val_ty(cv)).unwrap_or_else(|| {
                         bug!("symbol `{}` is already defined", name);
                     });
                     llvm::LLVMRustSetLinkage(gv, llvm::Linkage::PrivateLinkage);
@@ -344,7 +345,7 @@ impl CodegenCx<'ll, 'tcx> {
     }
 }
 
-impl StaticMethods for CodegenCx<'ll, 'tcx> {
+impl<'ll> StaticMethods for CodegenCx<'ll, '_> {
     fn static_addr_of(&self, cv: &'ll Value, align: Align, kind: Option<&str>) -> &'ll Value {
         if let Some(&gv) = self.const_globals.borrow().get(&cv) {
             unsafe {
@@ -369,11 +370,11 @@ impl StaticMethods for CodegenCx<'ll, 'tcx> {
         unsafe {
             let attrs = self.tcx.codegen_fn_attrs(def_id);
 
-            let (v, alloc) = match codegen_static_initializer(self, def_id) {
-                Ok(v) => v,
+            let Ok((v, alloc)) = codegen_static_initializer(self, def_id) else {
                 // Error has already been reported
-                Err(_) => return,
+                return;
             };
+            let alloc = alloc.inner();
 
             let g = self.get_static(def_id);
 
@@ -430,7 +431,7 @@ impl StaticMethods for CodegenCx<'ll, 'tcx> {
                 llvm::LLVMSetGlobalConstant(g, llvm::True);
             }
 
-            debuginfo::create_global_var_metadata(self, def_id, g);
+            debuginfo::build_global_var_di_node(self, def_id, g);
 
             if attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL) {
                 llvm::set_thread_local_mode(g, self.tls_model);
@@ -522,6 +523,9 @@ impl StaticMethods for CodegenCx<'ll, 'tcx> {
             }
 
             if attrs.flags.contains(CodegenFnAttrFlags::USED) {
+                // `USED` and `USED_LINKER` can't be used together.
+                assert!(!attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER));
+
                 // The semantics of #[used] in Rust only require the symbol to make it into the
                 // object file. It is explicitly allowed for the linker to strip the symbol if it
                 // is dead. As such, use llvm.compiler.used instead of llvm.used.
@@ -529,6 +533,12 @@ impl StaticMethods for CodegenCx<'ll, 'tcx> {
                 // sections with SHF_GNU_RETAIN flag for llvm.used symbols, which may trigger bugs
                 // in some versions of the gold linker.
                 self.add_compiler_used_global(g);
+            }
+            if attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER) {
+                // `USED` and `USED_LINKER` can't be used together.
+                assert!(!attrs.flags.contains(CodegenFnAttrFlags::USED));
+
+                self.add_used_global(g);
             }
         }
     }

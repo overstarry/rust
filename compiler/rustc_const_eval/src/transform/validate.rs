@@ -1,14 +1,13 @@
 //! Validates the MIR to ensure that invariants are upheld.
 
-use super::MirPass;
 use rustc_index::bit_set::BitSet;
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::traversal;
 use rustc_middle::mir::visit::{PlaceContext, Visitor};
 use rustc_middle::mir::{
-    AggregateKind, BasicBlock, Body, BorrowKind, Local, Location, MirPhase, Operand, PlaceElem,
-    PlaceRef, ProjectionElem, Rvalue, SourceScope, Statement, StatementKind, Terminator,
+    AggregateKind, BasicBlock, Body, BorrowKind, Local, Location, MirPass, MirPhase, Operand,
+    PlaceElem, PlaceRef, ProjectionElem, Rvalue, SourceScope, Statement, StatementKind, Terminator,
     TerminatorKind, START_BLOCK,
 };
 use rustc_middle::ty::fold::BottomUpFolder;
@@ -56,6 +55,7 @@ impl<'tcx> MirPass<'tcx> for Validator {
             reachable_blocks: traversal::reachable_as_bitset(body),
             storage_liveness,
             place_cache: Vec::new(),
+            value_cache: Vec::new(),
         }
         .visit_body(body);
     }
@@ -67,7 +67,7 @@ impl<'tcx> MirPass<'tcx> for Validator {
 ///
 /// The point of this function is to approximate "equal up to subtyping".  However,
 /// the approximation is incorrect as variance is ignored.
-pub fn equal_up_to_regions(
+pub fn equal_up_to_regions<'tcx>(
     tcx: TyCtxt<'tcx>,
     param_env: ParamEnv<'tcx>,
     src: Ty<'tcx>,
@@ -79,7 +79,6 @@ pub fn equal_up_to_regions(
     }
 
     // Normalize lifetimes away on both sides, then compare.
-    let param_env = param_env.with_reveal_all_normalized(tcx);
     let normalize = |ty: Ty<'tcx>| {
         tcx.normalize_erasing_regions(
             param_env,
@@ -110,6 +109,7 @@ struct TypeChecker<'a, 'tcx> {
     reachable_blocks: BitSet<BasicBlock>,
     storage_liveness: ResultsCursor<'a, 'tcx, MaybeStorageLive>,
     place_cache: Vec<PlaceRef<'tcx>>,
+    value_cache: Vec<u128>,
 }
 
 impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
@@ -169,9 +169,12 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             // Equal types, all is good.
             return true;
         }
+        // Normalization reveals opaque types, but we may be validating MIR while computing
+        // said opaque types, causing cycles.
+        if (src, dest).has_opaque_types() {
+            return true;
+        }
         // Normalize projections and things like that.
-        // FIXME: We need to reveal_all, as some optimizations change types in ways
-        // that require unfolding opaque types.
         let param_env = self.param_env.with_reveal_all_normalized(self.tcx);
         let src = self.tcx.normalize_erasing_regions(param_env, src);
         let dest = self.tcx.normalize_erasing_regions(param_env, dest);
@@ -265,22 +268,15 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                             );
                         }
                     }
-                    // The deaggregator currently does not deaggreagate arrays.
-                    // So for now, we ignore them here.
-                    Rvalue::Aggregate(box AggregateKind::Array { .. }, _) => {}
-                    // All other aggregates must be gone after some phases.
-                    Rvalue::Aggregate(box kind, _) => {
-                        if self.mir_phase > MirPhase::DropLowering
-                            && !matches!(kind, AggregateKind::Generator(..))
-                        {
-                            // Generators persist until the state machine transformation, but all
-                            // other aggregates must have been lowered.
-                            self.fail(
-                                location,
-                                format!("{:?} have been lowered to field assignments", rvalue),
-                            )
-                        } else if self.mir_phase > MirPhase::GeneratorLowering {
-                            // No more aggregates after drop and generator lowering.
+                    Rvalue::Aggregate(agg_kind, _) => {
+                        let disallowed = match **agg_kind {
+                            AggregateKind::Array(..) => false,
+                            AggregateKind::Generator(..) => {
+                                self.mir_phase >= MirPhase::GeneratorsLowered
+                            }
+                            _ => self.mir_phase >= MirPhase::Deaggregated,
+                        };
+                        if disallowed {
                             self.fail(
                                 location,
                                 format!("{:?} have been lowered to field assignments", rvalue),
@@ -288,7 +284,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                         }
                     }
                     Rvalue::Ref(_, BorrowKind::Shallow, _) => {
-                        if self.mir_phase > MirPhase::DropLowering {
+                        if self.mir_phase >= MirPhase::DropsLowered {
                             self.fail(
                                 location,
                                 "`Assign` statement with a `Shallow` borrow should have been removed after drop lowering phase",
@@ -299,7 +295,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             StatementKind::AscribeUserType(..) => {
-                if self.mir_phase > MirPhase::DropLowering {
+                if self.mir_phase >= MirPhase::DropsLowered {
                     self.fail(
                         location,
                         "`AscribeUserType` should have been removed after drop lowering phase",
@@ -307,7 +303,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             StatementKind::FakeRead(..) => {
-                if self.mir_phase > MirPhase::DropLowering {
+                if self.mir_phase >= MirPhase::DropsLowered {
                     self.fail(
                         location,
                         "`FakeRead` should have been removed after drop lowering phase",
@@ -350,11 +346,18 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     self.fail(location, format!("bad arg ({:?} != usize)", op_cnt_ty))
                 }
             }
-            StatementKind::SetDiscriminant { .. }
-            | StatementKind::StorageLive(..)
+            StatementKind::SetDiscriminant { .. } => {
+                if self.mir_phase < MirPhase::DropsLowered {
+                    self.fail(location, "`SetDiscriminant` is not allowed until drop elaboration");
+                }
+            }
+            StatementKind::Retag(_, _) => {
+                // FIXME(JakobDegen) The validator should check that `self.mir_phase <
+                // DropsLowered`. However, this causes ICEs with generation of drop shims, which
+                // seem to fail to set their `MirPhase` correctly.
+            }
+            StatementKind::StorageLive(..)
             | StatementKind::StorageDead(..)
-            | StatementKind::LlvmInlineAsm(..)
-            | StatementKind::Retag(_, _)
             | StatementKind::Coverage(_)
             | StatementKind::Nop => {}
         }
@@ -400,6 +403,22 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                     self.check_edge(location, target, EdgeKind::Normal);
                 }
                 self.check_edge(location, targets.otherwise(), EdgeKind::Normal);
+
+                self.value_cache.clear();
+                self.value_cache.extend(targets.iter().map(|(value, _)| value));
+                let all_len = self.value_cache.len();
+                self.value_cache.sort_unstable();
+                self.value_cache.dedup();
+                let has_duplicates = all_len != self.value_cache.len();
+                if has_duplicates {
+                    self.fail(
+                        location,
+                        format!(
+                            "duplicated values in `SwitchInt` terminator: {:?}",
+                            terminator.kind,
+                        ),
+                    );
+                }
             }
             TerminatorKind::Drop { target, unwind, .. } => {
                 self.check_edge(location, *target, EdgeKind::Normal);
@@ -408,10 +427,10 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             TerminatorKind::DropAndReplace { target, unwind, .. } => {
-                if self.mir_phase > MirPhase::DropLowering {
+                if self.mir_phase >= MirPhase::DropsLowered {
                     self.fail(
                         location,
-                        "`DropAndReplace` is not permitted to exist after drop elaboration",
+                        "`DropAndReplace` should have been removed during drop elaboration",
                     );
                 }
                 self.check_edge(location, *target, EdgeKind::Normal);
@@ -478,7 +497,7 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             TerminatorKind::Yield { resume, drop, .. } => {
-                if self.mir_phase > MirPhase::GeneratorLowering {
+                if self.mir_phase >= MirPhase::GeneratorsLowered {
                     self.fail(location, "`Yield` should have been replaced by generator lowering");
                 }
                 self.check_edge(location, *resume, EdgeKind::Normal);
@@ -487,26 +506,48 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
             }
             TerminatorKind::FalseEdge { real_target, imaginary_target } => {
+                if self.mir_phase >= MirPhase::DropsLowered {
+                    self.fail(
+                        location,
+                        "`FalseEdge` should have been removed after drop elaboration",
+                    );
+                }
                 self.check_edge(location, *real_target, EdgeKind::Normal);
                 self.check_edge(location, *imaginary_target, EdgeKind::Normal);
             }
             TerminatorKind::FalseUnwind { real_target, unwind } => {
+                if self.mir_phase >= MirPhase::DropsLowered {
+                    self.fail(
+                        location,
+                        "`FalseUnwind` should have been removed after drop elaboration",
+                    );
+                }
                 self.check_edge(location, *real_target, EdgeKind::Normal);
                 if let Some(unwind) = unwind {
                     self.check_edge(location, *unwind, EdgeKind::Unwind);
                 }
             }
-            TerminatorKind::InlineAsm { destination, .. } => {
+            TerminatorKind::InlineAsm { destination, cleanup, .. } => {
                 if let Some(destination) = destination {
                     self.check_edge(location, *destination, EdgeKind::Normal);
+                }
+                if let Some(cleanup) = cleanup {
+                    self.check_edge(location, *cleanup, EdgeKind::Unwind);
+                }
+            }
+            TerminatorKind::GeneratorDrop => {
+                if self.mir_phase >= MirPhase::GeneratorsLowered {
+                    self.fail(
+                        location,
+                        "`GeneratorDrop` should have been replaced by generator lowering",
+                    );
                 }
             }
             // Nothing to validate for these.
             TerminatorKind::Resume
             | TerminatorKind::Abort
             | TerminatorKind::Return
-            | TerminatorKind::Unreachable
-            | TerminatorKind::GeneratorDrop => {}
+            | TerminatorKind::Unreachable => {}
         }
 
         self.super_terminator(terminator, location);

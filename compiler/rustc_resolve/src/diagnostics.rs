@@ -1,10 +1,11 @@
-use std::cmp::Reverse;
 use std::ptr;
 
 use rustc_ast::{self as ast, Path};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder};
+use rustc_errors::{
+    struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed, MultiSpan,
+};
 use rustc_feature::BUILTIN_ATTRIBUTES;
 use rustc_hir::def::Namespace::{self, *};
 use rustc_hir::def::{self, CtorKind, CtorOf, DefKind, NonMacroAttrKind};
@@ -17,16 +18,14 @@ use rustc_span::hygiene::MacroKind;
 use rustc_span::lev_distance::find_best_match_for_name;
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::{BytePos, MultiSpan, Span};
+use rustc_span::{BytePos, Span};
 use tracing::debug;
 
 use crate::imports::{Import, ImportKind, ImportResolver};
 use crate::path_names_to_string;
 use crate::{AmbiguityError, AmbiguityErrorMisc, AmbiguityKind};
-use crate::{
-    BindingError, CrateLint, HasGenericParams, MacroRulesScope, Module, ModuleOrUniformRoot,
-};
-use crate::{NameBinding, NameBindingKind, PrivacyError, VisResolutionError};
+use crate::{BindingError, HasGenericParams, MacroRulesScope, Module, ModuleOrUniformRoot};
+use crate::{Finalize, NameBinding, NameBindingKind, PrivacyError, VisResolutionError};
 use crate::{ParentScope, PathResult, ResolutionError, Resolver, Scope, ScopeSet, Segment};
 
 type Res = def::Res<ast::NodeId>;
@@ -111,7 +110,7 @@ impl<'a> Resolver<'a> {
         &self,
         span: Span,
         resolution_error: ResolutionError<'_>,
-    ) -> DiagnosticBuilder<'_> {
+    ) -> DiagnosticBuilder<'_, ErrorGuaranteed> {
         match resolution_error {
             ResolutionError::GenericParamsFromOuterFunction(outer_res, has_generic_params) => {
                 let mut err = struct_span_err!(
@@ -124,7 +123,7 @@ impl<'a> Resolver<'a> {
 
                 let sm = self.session.source_map();
                 match outer_res {
-                    Res::SelfTy(maybe_trait_defid, maybe_impl_defid) => {
+                    Res::SelfTy { trait_: maybe_trait_defid, alias_to: maybe_impl_defid } => {
                         if let Some(impl_span) =
                             maybe_impl_defid.and_then(|(def_id, _)| self.opt_span(def_id))
                         {
@@ -454,28 +453,28 @@ impl<'a> Resolver<'a> {
                 // edit:
                 // only do this if the const and usage of the non-constant value are on the same line
                 // the further the two are apart, the higher the chance of the suggestion being wrong
-                // also make sure that the pos for the suggestion is not 0 (ICE #90878)
 
-                let sp =
-                    self.session.source_map().span_extend_to_prev_str(ident.span, current, true);
+                let sp = self
+                    .session
+                    .source_map()
+                    .span_extend_to_prev_str(ident.span, current, true, false);
 
-                let pos_for_suggestion = sp.lo().0.saturating_sub(current.len() as u32);
-
-                if sp.lo().0 == 0
-                    || pos_for_suggestion == 0
-                    || self.session.source_map().is_multiline(sp)
-                {
-                    err.span_label(ident.span, &format!("this would need to be a `{}`", sugg));
-                } else {
-                    let sp = sp.with_lo(BytePos(pos_for_suggestion));
-                    err.span_suggestion(
-                        sp,
-                        &format!("consider using `{}` instead of `{}`", sugg, current),
-                        format!("{} {}", sugg, ident),
-                        Applicability::MaybeIncorrect,
-                    );
-                    err.span_label(span, "non-constant value");
+                match sp {
+                    Some(sp) if !self.session.source_map().is_multiline(sp) => {
+                        let sp = sp.with_lo(BytePos(sp.lo().0 - (current.len() as u32)));
+                        err.span_suggestion(
+                            sp,
+                            &format!("consider using `{}` instead of `{}`", sugg, current),
+                            format!("{} {}", sugg, ident),
+                            Applicability::MaybeIncorrect,
+                        );
+                        err.span_label(span, "non-constant value");
+                    }
+                    _ => {
+                        err.span_label(ident.span, &format!("this would need to be a `{}`", sugg));
+                    }
                 }
+
                 err
             }
             ResolutionError::BindingShadowsSomethingUnacceptable {
@@ -603,10 +602,32 @@ impl<'a> Resolver<'a> {
 
                 err
             }
+            ResolutionError::TraitImplMismatch {
+                name,
+                kind,
+                code,
+                trait_item_span,
+                trait_path,
+            } => {
+                let mut err = self.session.struct_span_err_with_code(
+                    span,
+                    &format!(
+                        "item `{}` is an associated {}, which doesn't match its trait `{}`",
+                        name, kind, trait_path,
+                    ),
+                    code,
+                );
+                err.span_label(span, "does not match trait");
+                err.span_label(trait_item_span, "item in trait");
+                err
+            }
         }
     }
 
-    crate fn report_vis_error(&self, vis_resolution_error: VisResolutionError<'_>) {
+    crate fn report_vis_error(
+        &self,
+        vis_resolution_error: VisResolutionError<'_>,
+    ) -> ErrorGuaranteed {
         match vis_resolution_error {
             VisResolutionError::Relative2018(span, path) => {
                 let mut err = self.session.struct_span_err(
@@ -784,7 +805,7 @@ impl<'a> Resolver<'a> {
         });
 
         // Make sure error reporting is deterministic.
-        suggestions.sort_by_cached_key(|suggestion| suggestion.candidate.as_str());
+        suggestions.sort_by(|a, b| a.candidate.as_str().partial_cmp(b.candidate.as_str()).unwrap());
 
         match find_best_match_for_name(
             &suggestions.iter().map(|suggestion| suggestion.candidate).collect::<Vec<Symbol>>(),
@@ -896,7 +917,7 @@ impl<'a> Resolver<'a> {
                             // a note about editions
                             let note = if let Some(did) = did {
                                 let requires_note = !did.is_local()
-                                    && this.cstore().item_attrs(did, this.session).iter().any(
+                                    && this.cstore().item_attrs_untracked(did, this.session).any(
                                         |attr| {
                                             if attr.has_name(sym::rustc_diagnostic_item) {
                                                 [sym::TryInto, sym::TryFrom, sym::FromIterator]
@@ -1013,7 +1034,7 @@ impl<'a> Resolver<'a> {
 
     crate fn unresolved_macro_suggestions(
         &mut self,
-        err: &mut DiagnosticBuilder<'a>,
+        err: &mut Diagnostic,
         macro_kind: MacroKind,
         parent_scope: &ParentScope<'a>,
         ident: Ident,
@@ -1053,9 +1074,8 @@ impl<'a> Resolver<'a> {
                 ident,
                 ScopeSet::All(ns, false),
                 &parent_scope,
+                None,
                 false,
-                false,
-                ident.span,
             ) {
                 let desc = match binding.res() {
                     Res::Def(DefKind::Macro(MacroKind::Bang), _) => {
@@ -1102,7 +1122,7 @@ impl<'a> Resolver<'a> {
 
     crate fn add_typo_suggestion(
         &self,
-        err: &mut DiagnosticBuilder<'_>,
+        err: &mut Diagnostic,
         suggestion: Option<TypoSuggestion>,
         span: Span,
     ) -> bool {
@@ -1178,7 +1198,7 @@ impl<'a> Resolver<'a> {
 
     fn binding_description(&self, b: &NameBinding<'_>, ident: Ident, from_prelude: bool) -> String {
         let res = b.res();
-        if b.span.is_dummy() {
+        if b.span.is_dummy() || self.session.source_map().span_to_snippet(b.span).is_err() {
             // These already contain the "built-in" prefix or look bad with it.
             let add_built_in =
                 !matches!(b.res(), Res::NonMacroAttr(..) | Res::PrimTy(..) | Res::ToolMod);
@@ -1186,7 +1206,7 @@ impl<'a> Resolver<'a> {
                 ("", " from prelude")
             } else if b.is_extern_crate()
                 && !b.is_import()
-                && self.session.opts.externs.get(&ident.as_str()).is_some()
+                && self.session.opts.externs.get(ident.as_str()).is_some()
             {
                 ("", " passed with `--extern`")
             } else if add_built_in {
@@ -1321,7 +1341,7 @@ impl<'a> Resolver<'a> {
             let def_span = self.session.source_map().guess_head_span(binding.span);
             let mut note_span = MultiSpan::from_span(def_span);
             if !first && binding.vis.is_public() {
-                note_span.push_span_label(def_span, "consider importing it directly".into());
+                note_span.push_span_label(def_span, "consider importing it directly");
             }
             err.span_note(note_span, &msg);
         }
@@ -1344,8 +1364,7 @@ impl<'a> Resolver<'a> {
                     .filter(|(_, module)| {
                         current_module.is_ancestor_of(module) && !ptr::eq(current_module, *module)
                     })
-                    .map(|(_, module)| module.kind.name())
-                    .flatten(),
+                    .flat_map(|(_, module)| module.kind.name()),
             )
             .filter(|c| !c.to_string().is_empty())
             .collect::<Vec<_>>();
@@ -1383,10 +1402,10 @@ impl<'a, 'b> ImportResolver<'a, 'b> {
             _ => return None,
         }
 
-        self.make_missing_self_suggestion(span, path.clone(), parent_scope)
-            .or_else(|| self.make_missing_crate_suggestion(span, path.clone(), parent_scope))
-            .or_else(|| self.make_missing_super_suggestion(span, path.clone(), parent_scope))
-            .or_else(|| self.make_external_crate_suggestion(span, path, parent_scope))
+        self.make_missing_self_suggestion(path.clone(), parent_scope)
+            .or_else(|| self.make_missing_crate_suggestion(path.clone(), parent_scope))
+            .or_else(|| self.make_missing_super_suggestion(path.clone(), parent_scope))
+            .or_else(|| self.make_external_crate_suggestion(path, parent_scope))
     }
 
     /// Suggest a missing `self::` if that resolves to an correct module.
@@ -1398,13 +1417,12 @@ impl<'a, 'b> ImportResolver<'a, 'b> {
     /// ```
     fn make_missing_self_suggestion(
         &mut self,
-        span: Span,
         mut path: Vec<Segment>,
         parent_scope: &ParentScope<'b>,
     ) -> Option<(Vec<Segment>, Vec<String>)> {
         // Replace first ident with `self` and check if that is valid.
         path[0].ident.name = kw::SelfLower;
-        let result = self.r.resolve_path(&path, None, parent_scope, false, span, CrateLint::No);
+        let result = self.r.resolve_path(&path, None, parent_scope, Finalize::No);
         debug!("make_missing_self_suggestion: path={:?} result={:?}", path, result);
         if let PathResult::Module(..) = result { Some((path, Vec::new())) } else { None }
     }
@@ -1418,13 +1436,12 @@ impl<'a, 'b> ImportResolver<'a, 'b> {
     /// ```
     fn make_missing_crate_suggestion(
         &mut self,
-        span: Span,
         mut path: Vec<Segment>,
         parent_scope: &ParentScope<'b>,
     ) -> Option<(Vec<Segment>, Vec<String>)> {
         // Replace first ident with `crate` and check if that is valid.
         path[0].ident.name = kw::Crate;
-        let result = self.r.resolve_path(&path, None, parent_scope, false, span, CrateLint::No);
+        let result = self.r.resolve_path(&path, None, parent_scope, Finalize::No);
         debug!("make_missing_crate_suggestion:  path={:?} result={:?}", path, result);
         if let PathResult::Module(..) = result {
             Some((
@@ -1450,13 +1467,12 @@ impl<'a, 'b> ImportResolver<'a, 'b> {
     /// ```
     fn make_missing_super_suggestion(
         &mut self,
-        span: Span,
         mut path: Vec<Segment>,
         parent_scope: &ParentScope<'b>,
     ) -> Option<(Vec<Segment>, Vec<String>)> {
         // Replace first ident with `crate` and check if that is valid.
         path[0].ident.name = kw::Super;
-        let result = self.r.resolve_path(&path, None, parent_scope, false, span, CrateLint::No);
+        let result = self.r.resolve_path(&path, None, parent_scope, Finalize::No);
         debug!("make_missing_super_suggestion:  path={:?} result={:?}", path, result);
         if let PathResult::Module(..) = result { Some((path, Vec::new())) } else { None }
     }
@@ -1473,7 +1489,6 @@ impl<'a, 'b> ImportResolver<'a, 'b> {
     /// name as the first part of path.
     fn make_external_crate_suggestion(
         &mut self,
-        span: Span,
         mut path: Vec<Segment>,
         parent_scope: &ParentScope<'b>,
     ) -> Option<(Vec<Segment>, Vec<String>)> {
@@ -1481,17 +1496,17 @@ impl<'a, 'b> ImportResolver<'a, 'b> {
             return None;
         }
 
-        // Sort extern crate names in reverse order to get
+        // Sort extern crate names in *reverse* order to get
         // 1) some consistent ordering for emitted diagnostics, and
         // 2) `std` suggestions before `core` suggestions.
         let mut extern_crate_names =
             self.r.extern_prelude.iter().map(|(ident, _)| ident.name).collect::<Vec<_>>();
-        extern_crate_names.sort_by_key(|name| Reverse(name.as_str()));
+        extern_crate_names.sort_by(|a, b| b.as_str().partial_cmp(a.as_str()).unwrap());
 
         for name in extern_crate_names.into_iter() {
             // Replace first ident with a crate name and check if that is valid.
             path[0].ident.name = name;
-            let result = self.r.resolve_path(&path, None, parent_scope, false, span, CrateLint::No);
+            let result = self.r.resolve_path(&path, None, parent_scope, Finalize::No);
             debug!(
                 "make_external_crate_suggestion: name={:?} path={:?} result={:?}",
                 name, path, result
@@ -1588,7 +1603,7 @@ impl<'a, 'b> ImportResolver<'a, 'b> {
                 // Remove the `removal_span`.
                 corrections.push((removal_span, "".to_string()));
 
-                // Find the span after the crate name and if it has nested imports immediatately
+                // Find the span after the crate name and if it has nested imports immediately
                 // after the crate name already.
                 //   ie. `use a::b::{c, d};`
                 //               ^^^^^^^^^
@@ -1800,7 +1815,7 @@ fn find_span_immediately_after_crate_name(
 crate fn show_candidates(
     definitions: &rustc_hir::definitions::Definitions,
     session: &Session,
-    err: &mut DiagnosticBuilder<'_>,
+    err: &mut Diagnostic,
     // This is `None` if all placement locations are inside expansions
     use_placement_span: Option<Span>,
     candidates: &[ImportSuggestion],
@@ -1841,7 +1856,7 @@ crate fn show_candidates(
         let instead = if instead { " instead" } else { "" };
         let mut msg = format!("consider importing {} {}{}", determiner, kind, instead);
 
-        for note in accessible_path_strings.iter().map(|cand| cand.3.as_ref()).flatten() {
+        for note in accessible_path_strings.iter().flat_map(|cand| cand.3.as_ref()) {
             err.note(note);
         }
 
@@ -1924,7 +1939,7 @@ crate fn show_candidates(
                 multi_span.push_span_label(span, format!("`{}`: not accessible", name));
             }
 
-            for note in inaccessible_path_strings.iter().map(|cand| cand.3.as_ref()).flatten() {
+            for note in inaccessible_path_strings.iter().flat_map(|cand| cand.3.as_ref()) {
                 err.note(note);
             }
 

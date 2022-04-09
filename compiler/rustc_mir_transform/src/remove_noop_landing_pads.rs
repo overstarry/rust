@@ -10,18 +10,14 @@ use rustc_target::spec::PanicStrategy;
 /// code for these.
 pub struct RemoveNoopLandingPads;
 
-pub fn remove_noop_landing_pads<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-    if tcx.sess.panic_strategy() == PanicStrategy::Abort {
-        return;
-    }
-    debug!("remove_noop_landing_pads({:?})", body);
-
-    RemoveNoopLandingPads.remove_nop_landing_pads(body)
-}
-
 impl<'tcx> MirPass<'tcx> for RemoveNoopLandingPads {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        remove_noop_landing_pads(tcx, body);
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.panic_strategy() != PanicStrategy::Abort
+    }
+
+    fn run_pass(&self, _: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+        debug!("remove_noop_landing_pads({:?})", body);
+        self.remove_nop_landing_pads(body)
     }
 }
 
@@ -40,7 +36,7 @@ impl RemoveNoopLandingPads {
                 | StatementKind::AscribeUserType(..)
                 | StatementKind::Coverage(..)
                 | StatementKind::Nop => {
-                    // These are all nops in a landing pad
+                    // These are all noops in a landing pad
                 }
 
                 StatementKind::Assign(box (place, Rvalue::Use(_) | Rvalue::Discriminant(_))) => {
@@ -54,7 +50,6 @@ impl RemoveNoopLandingPads {
 
                 StatementKind::Assign { .. }
                 | StatementKind::SetDiscriminant { .. }
-                | StatementKind::LlvmInlineAsm { .. }
                 | StatementKind::CopyNonOverlapping(..)
                 | StatementKind::Retag { .. } => {
                     return false;

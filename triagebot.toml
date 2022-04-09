@@ -73,6 +73,13 @@ Thanks! <3
 """
 label = "O-riscv"
 
+[ping.fuchsia]
+message = """\
+Hey friends of Fuchsia! This issue could use some guidance on how this should be
+resolved/implemented on Fuchsia. Could one of you weigh in?
+"""
+label = "O-fuchsia"
+
 [prioritize]
 label = "I-prioritize"
 
@@ -89,6 +96,44 @@ exclude_labels = [
     "T-infra",
     "T-release",
     "requires-nightly",
+]
+
+[autolabel."T-rustdoc"]
+trigger_files = [
+    # Source code
+    "src/librustdoc",
+    "src/tools/rustdoc",
+    "src/rustdoc-json-types",
+
+    # Tests
+    "src/test/rustdoc",
+    "src/test/rustdoc-ui",
+    "src/test/rustdoc-gui",
+    "src/test/rustdoc-js",
+    "src/test/rustdoc-js-std",
+    "src/test/rustdoc-json",
+
+    # Internal tooling
+    "src/etc/htmldocck.py",
+    "src/tools/jsondocck",
+    "src/tools/rustdoc-gui",
+    "src/tools/rustdoc-js",
+    "src/tools/rustdoc-themes",
+]
+exclude_labels = [
+    "T-*",
+]
+
+[autolabel."T-compiler"]
+trigger_files = [
+    # Source code
+    "compiler",
+
+    # Tests
+    "src/test/ui",
+]
+exclude_labels = [
+    "T-*",
 ]
 
 [notify-zulip."I-prioritize"]

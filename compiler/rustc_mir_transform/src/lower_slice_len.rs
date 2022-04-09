@@ -10,6 +10,10 @@ use rustc_middle::ty::{self, TyCtxt};
 pub struct LowerSliceLenCalls;
 
 impl<'tcx> MirPass<'tcx> for LowerSliceLenCalls {
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.opts.mir_opt_level() > 0
+    }
+
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         lower_slice_len_calls(tcx, body)
     }
@@ -57,10 +61,7 @@ fn lower_slice_len_call<'tcx>(
             if args.len() != 1 {
                 return;
             }
-            let arg = match args[0].place() {
-                Some(arg) => arg,
-                None => return,
-            };
+            let Some(arg) = args[0].place() else { return };
             let func_ty = func.ty(local_decls, tcx);
             match func_ty.kind() {
                 ty::FnDef(fn_def_id, _) if fn_def_id == &slice_len_fn_item_def_id => {

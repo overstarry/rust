@@ -23,6 +23,13 @@ use crate::sys::os as os_imp;
 
 /// Returns the current working directory as a [`PathBuf`].
 ///
+/// # Platform-specific behavior
+///
+/// This function [currently] corresponds to the `getcwd` function on Unix
+/// and the `GetCurrentDirectoryW` function on Windows.
+///
+/// [currently]: crate::io#platform-specific-behavior
+///
 /// # Errors
 ///
 /// Returns an [`Err`] if the current working directory value is invalid.
@@ -49,7 +56,14 @@ pub fn current_dir() -> io::Result<PathBuf> {
 
 /// Changes the current working directory to the specified path.
 ///
+/// # Platform-specific behavior
+///
+/// This function [currently] corresponds to the `chdir` function on Unix
+/// and the `SetCurrentDirectoryW` function on Windows.
+///
 /// Returns an [`Err`] if the operation fails.
+///
+/// [currently]: crate::io#platform-specific-behavior
 ///
 /// # Examples
 ///
@@ -108,7 +122,7 @@ pub struct VarsOs {
 /// // We will iterate through the references to the element returned by
 /// // env::vars();
 /// for (key, value) in env::vars() {
-///     println!("{}: {}", key, value);
+///     println!("{key}: {value}");
 /// }
 /// ```
 ///
@@ -138,7 +152,7 @@ pub fn vars() -> Vars {
 /// // We will iterate through the references to the element returned by
 /// // env::vars_os();
 /// for (key, value) in env::vars_os() {
-///     println!("{:?}: {:?}", key, value);
+///     println!("{key:?}: {value:?}");
 /// }
 /// ```
 #[must_use]
@@ -202,8 +216,8 @@ impl fmt::Debug for VarsOs {
 ///
 /// let key = "HOME";
 /// match env::var(key) {
-///     Ok(val) => println!("{}: {:?}", key, val),
-///     Err(e) => println!("couldn't interpret {}: {}", key, e),
+///     Ok(val) => println!("{key}: {val:?}"),
+///     Err(e) => println!("couldn't interpret {key}: {e}"),
 /// }
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
@@ -242,8 +256,8 @@ fn _var(key: &OsStr) -> Result<String, VarError> {
 ///
 /// let key = "HOME";
 /// match env::var_os(key) {
-///     Some(val) => println!("{}: {:?}", key, val),
-///     None => println!("{} is not defined in the environment.", key)
+///     Some(val) => println!("{key}: {val:?}"),
+///     None => println!("{key} is not defined in the environment.")
 /// }
 /// ```
 #[must_use]
@@ -333,7 +347,7 @@ pub fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
 
 fn _set_var(key: &OsStr, value: &OsStr) {
     os_imp::setenv(key, value).unwrap_or_else(|e| {
-        panic!("failed to set environment variable `{:?}` to `{:?}`: {}", key, value, e)
+        panic!("failed to set environment variable `{key:?}` to `{value:?}`: {e}")
     })
 }
 
@@ -375,7 +389,7 @@ pub fn remove_var<K: AsRef<OsStr>>(key: K) {
 
 fn _remove_var(key: &OsStr) {
     os_imp::unsetenv(key)
-        .unwrap_or_else(|e| panic!("failed to remove environment variable `{:?}`: {}", key, e))
+        .unwrap_or_else(|e| panic!("failed to remove environment variable `{key:?}`: {e}"))
 }
 
 /// An iterator that splits an environment variable into paths according to
@@ -411,7 +425,7 @@ pub struct SplitPaths<'a> {
 ///             println!("'{}'", path.display());
 ///         }
 ///     }
-///     None => println!("{} is not defined in the environment.", key)
+///     None => println!("{key} is not defined in the environment.")
 /// }
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
@@ -583,28 +597,25 @@ pub fn home_dir() -> Option<PathBuf> {
 /// may result in "insecure temporary file" security vulnerabilities. Consider
 /// using a crate that securely creates temporary files or directories.
 ///
-/// # Unix
+/// # Platform-specific behavior
 ///
-/// Returns the value of the `TMPDIR` environment variable if it is
+/// On Unix, returns the value of the `TMPDIR` environment variable if it is
 /// set, otherwise for non-Android it returns `/tmp`. If Android, since there
 /// is no global temporary folder (it is usually allocated per-app), it returns
 /// `/data/local/tmp`.
+/// On Windows, the behavior is equivalent to that of [`GetTempPath2`][GetTempPath2] /
+/// [`GetTempPath`][GetTempPath], which this function uses internally.
+/// Note that, this [may change in the future][changes].
 ///
-/// # Windows
-///
-/// Returns the value of, in order, the `TMP`, `TEMP`,
-/// `USERPROFILE` environment variable if any are set and not the empty
-/// string. Otherwise, `temp_dir` returns the path of the Windows directory.
-/// This behavior is identical to that of [`GetTempPath`][msdn], which this
-/// function uses internally.
-///
-/// [msdn]: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppatha
+/// [changes]: io#platform-specific-behavior
+/// [GetTempPath2]: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppath2a
+/// [GetTempPath]: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppatha
 ///
 /// ```no_run
 /// use std::env;
 ///
 /// fn main() {
-///     let mut dir = env::temp_dir();
+///     let dir = env::temp_dir();
 ///     println!("Temporary directory: {}", dir.display());
 /// }
 /// ```
@@ -677,7 +688,7 @@ pub fn temp_dir() -> PathBuf {
 /// match env::current_exe() {
 ///     Ok(exe_path) => println!("Path of this executable is: {}",
 ///                              exe_path.display()),
-///     Err(e) => println!("failed to get current exe path: {}", e),
+///     Err(e) => println!("failed to get current exe path: {e}"),
 /// };
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
@@ -748,7 +759,7 @@ pub struct ArgsOs {
 ///
 /// // Prints each argument on a separate line
 /// for argument in env::args() {
-///     println!("{}", argument);
+///     println!("{argument}");
 /// }
 /// ```
 #[stable(feature = "env", since = "1.0.0")]
@@ -783,7 +794,7 @@ pub fn args() -> Args {
 ///
 /// // Prints each argument on a separate line
 /// for argument in env::args_os() {
-///     println!("{:?}", argument);
+///     println!("{argument:?}");
 /// }
 /// ```
 #[stable(feature = "env", since = "1.0.0")]

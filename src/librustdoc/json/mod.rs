@@ -7,7 +7,8 @@
 mod conversions;
 
 use std::cell::RefCell;
-use std::fs::File;
+use std::fs::{create_dir_all, File};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -18,14 +19,14 @@ use rustc_session::Session;
 
 use rustdoc_json_types as types;
 
-use crate::clean;
-use crate::clean::ExternalCrate;
+use crate::clean::types::{ExternalCrate, ExternalLocation};
 use crate::config::RenderOptions;
+use crate::docfs::PathError;
 use crate::error::Error;
 use crate::formats::cache::Cache;
 use crate::formats::FormatRenderer;
-use crate::html::render::cache::ExternalLocation;
 use crate::json::conversions::{from_item_id, IntoWithTcx};
+use crate::{clean, try_err};
 
 #[derive(Clone)]
 crate struct JsonRenderer<'tcx> {
@@ -38,7 +39,7 @@ crate struct JsonRenderer<'tcx> {
     cache: Rc<Cache>,
 }
 
-impl JsonRenderer<'tcx> {
+impl<'tcx> JsonRenderer<'tcx> {
     fn sess(&self) -> &'tcx Session {
         self.tcx.sess
     }
@@ -121,7 +122,7 @@ impl JsonRenderer<'tcx> {
                                 })
                                 .0
                                 .last()
-                                .map(Clone::clone),
+                                .map(|s| s.to_string()),
                             visibility: types::Visibility::Public,
                             inner: types::ItemEnum::Trait(trait_item.clone().into_tcx(self.tcx)),
                             span: None,
@@ -178,7 +179,7 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
         let id = item.def_id;
         if let Some(mut new_item) = self.convert_item(item) {
             if let types::ItemEnum::Trait(ref mut t) = new_item.inner {
-                t.implementors = self.get_trait_implementors(id.expect_def_id())
+                t.implementations = self.get_trait_implementors(id.expect_def_id())
             } else if let types::ItemEnum::Struct(ref mut s) = new_item.inner {
                 s.impls = self.get_impls(id.expect_def_id())
             } else if let types::ItemEnum::Enum(ref mut e) = new_item.inner {
@@ -213,7 +214,7 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
         let mut index = (*self.index).clone().into_inner();
         index.extend(self.get_trait_items());
         // This needs to be the default HashMap for compatibility with the public interface for
-        // rustdoc-json
+        // rustdoc-json-types
         #[allow(rustc::default_hash_types)]
         let output = types::Crate {
             root: types::Id(String::from("0:0")),
@@ -231,7 +232,7 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
                         from_item_id(k.into()),
                         types::ItemSummary {
                             crate_id: k.krate.as_u32(),
-                            path,
+                            path: path.iter().map(|s| s.to_string()).collect(),
                             kind: kind.into_tcx(self.tcx),
                         },
                     )
@@ -257,11 +258,16 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
                 .collect(),
             format_version: types::FORMAT_VERSION,
         };
-        let mut p = self.out_path.clone();
+        let out_dir = self.out_path.clone();
+        try_err!(create_dir_all(&out_dir), out_dir);
+
+        let mut p = out_dir;
         p.push(output.index.get(&output.root).unwrap().name.clone().unwrap());
         p.set_extension("json");
-        let file = File::create(&p).map_err(|error| Error { error: error.to_string(), file: p })?;
-        serde_json::ser::to_writer(&file, &output).unwrap();
+        let mut file = BufWriter::new(try_err!(File::create(&p), p));
+        serde_json::ser::to_writer(&mut file, &output).unwrap();
+        try_err!(file.flush(), p);
+
         Ok(())
     }
 

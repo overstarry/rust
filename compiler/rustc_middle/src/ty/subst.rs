@@ -2,10 +2,11 @@
 
 use crate::mir;
 use crate::ty::codec::{TyDecoder, TyEncoder};
-use crate::ty::fold::{TypeFoldable, TypeFolder, TypeVisitor};
+use crate::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeFolder, TypeVisitor};
 use crate::ty::sty::{ClosureSubsts, GeneratorSubsts, InlineConstSubsts};
 use crate::ty::{self, Lift, List, ParamConst, Ty, TyCtxt};
 
+use rustc_data_structures::intern::{Interned, WithStableHash};
 use rustc_hir::def_id::DefId;
 use rustc_macros::HashStable;
 use rustc_serialize::{self, Decodable, Encodable};
@@ -19,16 +20,20 @@ use std::marker::PhantomData;
 use std::mem;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
+use std::slice;
 
 /// An entity in the Rust type system, which can be one of
 /// several kinds (types, lifetimes, and consts).
 /// To reduce memory usage, a `GenericArg` is an interned pointer,
 /// with the lowest 2 bits being reserved for a tag to
 /// indicate the type (`Ty`, `Region`, or `Const`) it points to.
+///
+/// Note: the `PartialEq`, `Eq` and `Hash` derives are only valid because `Ty`,
+/// `Region` and `Const` are all interned.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct GenericArg<'tcx> {
     ptr: NonZeroUsize,
-    marker: PhantomData<(Ty<'tcx>, ty::Region<'tcx>, &'tcx ty::Const<'tcx>)>,
+    marker: PhantomData<(Ty<'tcx>, ty::Region<'tcx>, ty::Const<'tcx>)>,
 }
 
 const TAG_MASK: usize = 0b11;
@@ -36,30 +41,56 @@ const TYPE_TAG: usize = 0b00;
 const REGION_TAG: usize = 0b01;
 const CONST_TAG: usize = 0b10;
 
-#[derive(Debug, TyEncodable, TyDecodable, PartialEq, Eq, PartialOrd, Ord, HashStable)]
+#[derive(Debug, TyEncodable, TyDecodable, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GenericArgKind<'tcx> {
     Lifetime(ty::Region<'tcx>),
     Type(Ty<'tcx>),
-    Const(&'tcx ty::Const<'tcx>),
+    Const(ty::Const<'tcx>),
+}
+
+/// This function goes from `&'a [Ty<'tcx>]` to `&'a [GenericArg<'tcx>]`
+///
+/// This is sound as, for types, `GenericArg` is just
+/// `NonZeroUsize::new_unchecked(ty as *const _ as usize)` as
+/// long as we use `0` for the `TYPE_TAG`.
+pub fn ty_slice_as_generic_args<'a, 'tcx>(ts: &'a [Ty<'tcx>]) -> &'a [GenericArg<'tcx>] {
+    assert_eq!(TYPE_TAG, 0);
+    // SAFETY: the whole slice is valid and immutable.
+    // `Ty` and `GenericArg` is explained above.
+    unsafe { slice::from_raw_parts(ts.as_ptr().cast(), ts.len()) }
+}
+
+impl<'tcx> List<Ty<'tcx>> {
+    /// Allows to freely switch between `List<Ty<'tcx>>` and `List<GenericArg<'tcx>>`.
+    ///
+    /// As lists are interned, `List<Ty<'tcx>>` and `List<GenericArg<'tcx>>` have
+    /// be interned together, see `intern_type_list` for more details.
+    #[inline]
+    pub fn as_substs(&'tcx self) -> SubstsRef<'tcx> {
+        assert_eq!(TYPE_TAG, 0);
+        // SAFETY: `List<T>` is `#[repr(C)]`. `Ty` and `GenericArg` is explained above.
+        unsafe { &*(self as *const List<Ty<'tcx>> as *const List<GenericArg<'tcx>>) }
+    }
 }
 
 impl<'tcx> GenericArgKind<'tcx> {
+    #[inline]
     fn pack(self) -> GenericArg<'tcx> {
         let (tag, ptr) = match self {
             GenericArgKind::Lifetime(lt) => {
                 // Ensure we can use the tag bits.
-                assert_eq!(mem::align_of_val(lt) & TAG_MASK, 0);
-                (REGION_TAG, lt as *const _ as usize)
+                assert_eq!(mem::align_of_val(lt.0.0) & TAG_MASK, 0);
+                (REGION_TAG, lt.0.0 as *const ty::RegionKind as usize)
             }
             GenericArgKind::Type(ty) => {
                 // Ensure we can use the tag bits.
-                assert_eq!(mem::align_of_val(ty) & TAG_MASK, 0);
-                (TYPE_TAG, ty as *const _ as usize)
+                assert_eq!(mem::align_of_val(ty.0.0) & TAG_MASK, 0);
+                (TYPE_TAG, ty.0.0 as *const WithStableHash<ty::TyS<'tcx>> as usize)
             }
             GenericArgKind::Const(ct) => {
                 // Ensure we can use the tag bits.
-                assert_eq!(mem::align_of_val(ct) & TAG_MASK, 0);
-                (CONST_TAG, ct as *const _ as usize)
+                assert_eq!(mem::align_of_val(ct.0.0) & TAG_MASK, 0);
+                (CONST_TAG, ct.0.0 as *const ty::ConstS<'tcx> as usize)
             }
         };
 
@@ -67,7 +98,7 @@ impl<'tcx> GenericArgKind<'tcx> {
     }
 }
 
-impl fmt::Debug for GenericArg<'tcx> {
+impl<'tcx> fmt::Debug for GenericArg<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.unpack() {
             GenericArgKind::Lifetime(lt) => lt.fmt(f),
@@ -90,19 +121,22 @@ impl<'tcx> PartialOrd for GenericArg<'tcx> {
 }
 
 impl<'tcx> From<ty::Region<'tcx>> for GenericArg<'tcx> {
+    #[inline]
     fn from(r: ty::Region<'tcx>) -> GenericArg<'tcx> {
         GenericArgKind::Lifetime(r).pack()
     }
 }
 
 impl<'tcx> From<Ty<'tcx>> for GenericArg<'tcx> {
+    #[inline]
     fn from(ty: Ty<'tcx>) -> GenericArg<'tcx> {
         GenericArgKind::Type(ty).pack()
     }
 }
 
-impl<'tcx> From<&'tcx ty::Const<'tcx>> for GenericArg<'tcx> {
-    fn from(c: &'tcx ty::Const<'tcx>) -> GenericArg<'tcx> {
+impl<'tcx> From<ty::Const<'tcx>> for GenericArg<'tcx> {
+    #[inline]
+    fn from(c: ty::Const<'tcx>) -> GenericArg<'tcx> {
         GenericArgKind::Const(c).pack()
     }
 }
@@ -111,11 +145,20 @@ impl<'tcx> GenericArg<'tcx> {
     #[inline]
     pub fn unpack(self) -> GenericArgKind<'tcx> {
         let ptr = self.ptr.get();
+        // SAFETY: use of `Interned::new_unchecked` here is ok because these
+        // pointers were originally created from `Interned` types in `pack()`,
+        // and this is just going in the other direction.
         unsafe {
             match ptr & TAG_MASK {
-                REGION_TAG => GenericArgKind::Lifetime(&*((ptr & !TAG_MASK) as *const _)),
-                TYPE_TAG => GenericArgKind::Type(&*((ptr & !TAG_MASK) as *const _)),
-                CONST_TAG => GenericArgKind::Const(&*((ptr & !TAG_MASK) as *const _)),
+                REGION_TAG => GenericArgKind::Lifetime(ty::Region(Interned::new_unchecked(
+                    &*((ptr & !TAG_MASK) as *const ty::RegionKind),
+                ))),
+                TYPE_TAG => GenericArgKind::Type(Ty(Interned::new_unchecked(
+                    &*((ptr & !TAG_MASK) as *const WithStableHash<ty::TyS<'tcx>>),
+                ))),
+                CONST_TAG => GenericArgKind::Const(ty::Const(Interned::new_unchecked(
+                    &*((ptr & !TAG_MASK) as *const ty::ConstS<'tcx>),
+                ))),
                 _ => intrinsics::unreachable(),
             }
         }
@@ -132,7 +175,7 @@ impl<'tcx> GenericArg<'tcx> {
     }
 
     /// Unpack the `GenericArg` as a const when it is known certainly to be a const.
-    pub fn expect_const(self) -> &'tcx ty::Const<'tcx> {
+    pub fn expect_const(self) -> ty::Const<'tcx> {
         match self.unpack() {
             GenericArgKind::Const(c) => c,
             _ => bug!("expected a const, but found another kind"),
@@ -153,11 +196,14 @@ impl<'a, 'tcx> Lift<'tcx> for GenericArg<'a> {
 }
 
 impl<'tcx> TypeFoldable<'tcx> for GenericArg<'tcx> {
-    fn super_fold_with<F: TypeFolder<'tcx>>(self, folder: &mut F) -> Self {
+    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
         match self.unpack() {
-            GenericArgKind::Lifetime(lt) => lt.fold_with(folder).into(),
-            GenericArgKind::Type(ty) => ty.fold_with(folder).into(),
-            GenericArgKind::Const(ct) => ct.fold_with(folder).into(),
+            GenericArgKind::Lifetime(lt) => lt.try_fold_with(folder).map(Into::into),
+            GenericArgKind::Type(ty) => ty.try_fold_with(folder).map(Into::into),
+            GenericArgKind::Const(ct) => ct.try_fold_with(folder).map(Into::into),
         }
     }
 
@@ -177,8 +223,8 @@ impl<'tcx, E: TyEncoder<'tcx>> Encodable<E> for GenericArg<'tcx> {
 }
 
 impl<'tcx, D: TyDecoder<'tcx>> Decodable<D> for GenericArg<'tcx> {
-    fn decode(d: &mut D) -> Result<GenericArg<'tcx>, D::Error> {
-        Ok(GenericArgKind::decode(d)?.pack())
+    fn decode(d: &mut D) -> GenericArg<'tcx> {
+        GenericArgKind::decode(d).pack()
     }
 }
 
@@ -188,6 +234,17 @@ pub type InternalSubsts<'tcx> = List<GenericArg<'tcx>>;
 pub type SubstsRef<'tcx> = &'tcx InternalSubsts<'tcx>;
 
 impl<'a, 'tcx> InternalSubsts<'tcx> {
+    /// Checks whether all elements of this list are types, if so, transmute.
+    pub fn try_as_type_list(&'tcx self) -> Option<&'tcx List<Ty<'tcx>>> {
+        if self.iter().all(|arg| matches!(arg.unpack(), GenericArgKind::Type(_))) {
+            assert_eq!(TYPE_TAG, 0);
+            // SAFETY: All elements are types, see `List<Ty<'tcx>>::as_substs`.
+            Some(unsafe { &*(self as *const List<GenericArg<'tcx>> as *const List<Ty<'tcx>>) })
+        } else {
+            None
+        }
+    }
+
     /// Interpret these substitutions as the substitutions of a closure type.
     /// Closure substitutions have a particular structure controlled by the
     /// compiler that encodes information like the signature and closure kind;
@@ -272,10 +329,6 @@ impl<'a, 'tcx> InternalSubsts<'tcx> {
         }
     }
 
-    pub fn is_noop(&self) -> bool {
-        self.is_empty()
-    }
-
     #[inline]
     pub fn types(&'a self) -> impl DoubleEndedIterator<Item = Ty<'tcx>> + 'a {
         self.iter()
@@ -290,7 +343,7 @@ impl<'a, 'tcx> InternalSubsts<'tcx> {
     }
 
     #[inline]
-    pub fn consts(&'a self) -> impl DoubleEndedIterator<Item = &'tcx ty::Const<'tcx>> + 'a {
+    pub fn consts(&'a self) -> impl DoubleEndedIterator<Item = ty::Const<'tcx>> + 'a {
         self.iter().filter_map(|k| {
             if let GenericArgKind::Const(ct) = k.unpack() { Some(ct) } else { None }
         })
@@ -325,7 +378,7 @@ impl<'a, 'tcx> InternalSubsts<'tcx> {
     }
 
     #[inline]
-    pub fn const_at(&self, i: usize) -> &'tcx ty::Const<'tcx> {
+    pub fn const_at(&self, i: usize) -> ty::Const<'tcx> {
         if let GenericArgKind::Const(ct) = self[i].unpack() {
             ct
         } else {
@@ -372,7 +425,10 @@ impl<'a, 'tcx> InternalSubsts<'tcx> {
 }
 
 impl<'tcx> TypeFoldable<'tcx> for SubstsRef<'tcx> {
-    fn super_fold_with<F: TypeFolder<'tcx>>(self, folder: &mut F) -> Self {
+    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
         // This code is hot enough that it's worth specializing for the most
         // common length lists, to avoid the overhead of `SmallVec` creation.
         // The match arms are in order of frequency. The 1, 2, and 0 cases are
@@ -381,23 +437,59 @@ impl<'tcx> TypeFoldable<'tcx> for SubstsRef<'tcx> {
         // calling `intern_substs`.
         match self.len() {
             1 => {
-                let param0 = self[0].fold_with(folder);
-                if param0 == self[0] { self } else { folder.tcx().intern_substs(&[param0]) }
+                let param0 = self[0].try_fold_with(folder)?;
+                if param0 == self[0] { Ok(self) } else { Ok(folder.tcx().intern_substs(&[param0])) }
             }
             2 => {
-                let param0 = self[0].fold_with(folder);
-                let param1 = self[1].fold_with(folder);
+                let param0 = self[0].try_fold_with(folder)?;
+                let param1 = self[1].try_fold_with(folder)?;
                 if param0 == self[0] && param1 == self[1] {
-                    self
+                    Ok(self)
                 } else {
-                    folder.tcx().intern_substs(&[param0, param1])
+                    Ok(folder.tcx().intern_substs(&[param0, param1]))
                 }
             }
-            0 => self,
-            _ => {
-                let params: SmallVec<[_; 8]> = self.iter().map(|k| k.fold_with(folder)).collect();
-                if params[..] == self[..] { self } else { folder.tcx().intern_substs(&params) }
+            0 => Ok(self),
+            _ => ty::util::fold_list(self, folder, |tcx, v| tcx.intern_substs(v)),
+        }
+    }
+
+    fn super_visit_with<V: TypeVisitor<'tcx>>(&self, visitor: &mut V) -> ControlFlow<V::BreakTy> {
+        self.iter().try_for_each(|t| t.visit_with(visitor))
+    }
+}
+
+impl<'tcx> TypeFoldable<'tcx> for &'tcx ty::List<Ty<'tcx>> {
+    fn try_super_fold_with<F: FallibleTypeFolder<'tcx>>(
+        self,
+        folder: &mut F,
+    ) -> Result<Self, F::Error> {
+        // This code is fairly hot, though not as hot as `SubstsRef`.
+        //
+        // When compiling stage 2, I get the following results:
+        //
+        // len |   total   |   %
+        // --- | --------- | -----
+        //  2  |  15083590 |  48.1
+        //  3  |   7540067 |  24.0
+        //  1  |   5300377 |  16.9
+        //  4  |   1351897 |   4.3
+        //  0  |   1256849 |   4.0
+        //
+        // I've tried it with some private repositories and got
+        // close to the same result, with 4 and 0 swapping places
+        // sometimes.
+        match self.len() {
+            2 => {
+                let param0 = self[0].try_fold_with(folder)?;
+                let param1 = self[1].try_fold_with(folder)?;
+                if param0 == self[0] && param1 == self[1] {
+                    Ok(self)
+                } else {
+                    Ok(folder.tcx().intern_type_list(&[param0, param1]))
+                }
             }
+            _ => ty::util::fold_list(self, folder, |tcx, v| tcx.intern_type_list(v)),
         }
     }
 
@@ -494,7 +586,7 @@ impl<'a, 'tcx> TypeFolder<'tcx> for SubstFolder<'a, 'tcx> {
     }
 
     fn fold_ty(&mut self, t: Ty<'tcx>) -> Ty<'tcx> {
-        if !t.potentially_needs_subst() {
+        if !t.needs_subst() {
             return t;
         }
 
@@ -504,8 +596,8 @@ impl<'a, 'tcx> TypeFolder<'tcx> for SubstFolder<'a, 'tcx> {
         }
     }
 
-    fn fold_const(&mut self, c: &'tcx ty::Const<'tcx>) -> &'tcx ty::Const<'tcx> {
-        if let ty::ConstKind::Param(p) = c.val {
+    fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
+        if let ty::ConstKind::Param(p) = c.val() {
             self.const_for_param(p, c)
         } else {
             c.super_fold_with(self)
@@ -554,11 +646,7 @@ impl<'a, 'tcx> SubstFolder<'a, 'tcx> {
         self.shift_vars_through_binders(ty)
     }
 
-    fn const_for_param(
-        &self,
-        p: ParamConst,
-        source_ct: &'tcx ty::Const<'tcx>,
-    ) -> &'tcx ty::Const<'tcx> {
+    fn const_for_param(&self, p: ParamConst, source_ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
         // Look up the const in the substitutions. It really should be in there.
         let opt_ct = self.substs.get(p.index as usize).map(|k| k.unpack());
         let ct = match opt_ct {

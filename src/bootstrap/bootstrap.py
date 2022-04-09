@@ -13,7 +13,45 @@ import sys
 import tarfile
 import tempfile
 
-from time import time
+from time import time, sleep
+
+# Acquire a lock on the build directory to make sure that
+# we don't cause a race condition while building
+# Lock is created in `build_dir/lock.db`
+def acquire_lock(build_dir):
+    try:
+        import sqlite3
+
+        path = os.path.join(build_dir, "lock.db")
+        try:
+            con = sqlite3.Connection(path, timeout=0)
+            curs = con.cursor()
+            curs.execute("BEGIN EXCLUSIVE")
+            # The lock is released when the cursor is dropped
+            return curs
+        # If the database is busy then lock has already been acquired
+        # so we wait for the lock.
+        # We retry every quarter second so that execution is passed back to python
+        # so that it can handle signals
+        except sqlite3.OperationalError:
+            del con
+            del curs
+            print("Waiting for lock on build directory")
+            con = sqlite3.Connection(path, timeout=0.25)
+            curs = con.cursor()
+            while True:
+                try:
+                    curs.execute("BEGIN EXCLUSIVE")
+                    break
+                except sqlite3.OperationalError:
+                    pass
+                sleep(0.25)
+            return curs
+    except ImportError:
+        print("warning: sqlite3 not available in python, skipping build directory lock")
+        print("please file an issue on rust-lang/rust")
+        print("this is not a problem for non-concurrent x.py invocations")
+        return None
 
 def support_xz():
     try:
@@ -25,7 +63,7 @@ def support_xz():
     except tarfile.CompressionError:
         return False
 
-def get(base, url, path, checksums, verbose=False, do_verify=True):
+def get(base, url, path, checksums, verbose=False, do_verify=True, help_on_error=None):
     with tempfile.NamedTemporaryFile(delete=False) as temp_file:
         temp_path = temp_file.name
 
@@ -44,7 +82,7 @@ def get(base, url, path, checksums, verbose=False, do_verify=True):
                         print("ignoring already-download file",
                             path, "due to failed verification")
                     os.unlink(path)
-        download(temp_path, "{}/{}".format(base, url), True, verbose)
+        download(temp_path, "{}/{}".format(base, url), True, verbose, help_on_error=help_on_error)
         if do_verify and not verify(temp_path, sha256, verbose):
             raise RuntimeError("failed verification")
         if verbose:
@@ -57,17 +95,17 @@ def get(base, url, path, checksums, verbose=False, do_verify=True):
             os.unlink(temp_path)
 
 
-def download(path, url, probably_big, verbose):
+def download(path, url, probably_big, verbose, help_on_error=None):
     for _ in range(0, 4):
         try:
-            _download(path, url, probably_big, verbose, True)
+            _download(path, url, probably_big, verbose, True, help_on_error=help_on_error)
             return
         except RuntimeError:
             print("\nspurious failure, trying again")
-    _download(path, url, probably_big, verbose, False)
+    _download(path, url, probably_big, verbose, False, help_on_error=help_on_error)
 
 
-def _download(path, url, probably_big, verbose, exception):
+def _download(path, url, probably_big, verbose, exception, help_on_error=None):
     if probably_big or verbose:
         print("downloading {}".format(url))
     # see https://serverfault.com/questions/301128/how-to-download
@@ -88,7 +126,8 @@ def _download(path, url, probably_big, verbose, exception):
              "--connect-timeout", "30",  # timeout if cannot connect within 30 seconds
              "--retry", "3", "-Sf", "-o", path, url],
             verbose=verbose,
-            exception=exception)
+            exception=exception,
+            help_on_error=help_on_error)
 
 
 def verify(path, expected, verbose):
@@ -129,7 +168,7 @@ def unpack(tarball, tarball_suffix, dst, verbose=False, match=None):
     shutil.rmtree(os.path.join(dst, fname))
 
 
-def run(args, verbose=False, exception=False, is_bootstrap=False, **kwargs):
+def run(args, verbose=False, exception=False, is_bootstrap=False, help_on_error=None, **kwargs):
     """Run a child program in a new process"""
     if verbose:
         print("running: " + ' '.join(args))
@@ -140,6 +179,8 @@ def run(args, verbose=False, exception=False, is_bootstrap=False, **kwargs):
     code = ret.wait()
     if code != 0:
         err = "failed to run: " + ' '.join(args)
+        if help_on_error is not None:
+            err += "\n" + help_on_error
         if verbose or exception:
             raise RuntimeError(err)
         # For most failures, we definitely do want to print this error, or the user will have no
@@ -189,11 +230,11 @@ def default_build_triple(verbose):
         host = next(x for x in version.split('\n') if x.startswith("host: "))
         triple = host.split("host: ")[1]
         if verbose:
-            print("detected default triple {}".format(triple))
+            print("detected default triple {} from pre-installed rustc".format(triple))
         return triple
     except Exception as e:
         if verbose:
-            print("rustup not detected: {}".format(e))
+            print("pre-installed rustc not detected: {}".format(e))
             print("falling back to auto-detect")
 
     required = sys.platform != 'win32'
@@ -265,7 +306,7 @@ def default_build_triple(verbose):
         err = "unknown OS type: {}".format(ostype)
         sys.exit(err)
 
-    if cputype == 'powerpc' and ostype == 'unknown-freebsd':
+    if cputype in ['powerpc', 'riscv'] and ostype == 'unknown-freebsd':
         cputype = subprocess.check_output(
               ['uname', '-p']).strip().decode(default_encoding)
     cputype_mapper = {
@@ -586,6 +627,14 @@ class RustBuild(object):
         filename = "rust-dev-nightly-" + self.build + tarball_suffix
         tarball = os.path.join(rustc_cache, filename)
         if not os.path.exists(tarball):
+            help_on_error = "error: failed to download llvm from ci"
+            help_on_error += "\nhelp: old builds get deleted after a certain time"
+            help_on_error += "\nhelp: if trying to compile an old commit of rustc,"
+            help_on_error += " disable `download-ci-llvm` in config.toml:"
+            help_on_error += "\n"
+            help_on_error += "\n[llvm]"
+            help_on_error += "\ndownload-ci-llvm = false"
+            help_on_error += "\n"
             get(
                 base,
                 "{}/{}".format(url, filename),
@@ -593,6 +642,7 @@ class RustBuild(object):
                 self.checksums_sha256,
                 verbose=self.verbose,
                 do_verify=False,
+                help_on_error=help_on_error,
             )
         unpack(tarball, tarball_suffix, self.llvm_root(),
                 match="rust-dev",
@@ -628,7 +678,7 @@ class RustBuild(object):
             # The latter one does not exist on NixOS when using tmpfs as root.
             try:
                 with open("/etc/os-release", "r") as f:
-                    if not any(line.strip() == "ID=nixos" for line in f):
+                    if not any(l.strip() in ["ID=nixos", "ID='nixos'", 'ID="nixos"'] for l in f):
                         return
             except FileNotFoundError:
                 return
@@ -726,12 +776,15 @@ class RustBuild(object):
         status = subprocess.call(["git", "diff-index", "--quiet", commit, "--", compiler, library])
         if status != 0:
             if download_rustc == "if-unchanged":
+                if self.verbose:
+                    print("warning: saw changes to compiler/ or library/ since {}; " \
+                          "ignoring `download-rustc`".format(commit))
                 return None
-            print("warning: `download-rustc` is enabled, but there are changes to \
-                   compiler/ or library/")
+            print("warning: `download-rustc` is enabled, but there are changes to " \
+                  "compiler/ or library/")
 
         if self.verbose:
-            print("using downloaded stage1 artifacts from CI (commit {})".format(commit))
+            print("using downloaded stage2 artifacts from CI (commit {})".format(commit))
         self.rustc_commit = commit
         # FIXME: support downloading artifacts from the beta channel
         self.download_toolchain(False, "nightly")
@@ -822,7 +875,7 @@ class RustBuild(object):
         >>> rb.get_toml("key2")
         'value2'
 
-        If the key does not exists, the result is None:
+        If the key does not exist, the result is None:
 
         >>> rb.get_toml("key3") is None
         True
@@ -935,6 +988,7 @@ class RustBuild(object):
 
     def build_bootstrap(self):
         """Build bootstrap"""
+        print("Building rustbuild")
         build_dir = os.path.join(self.build_dir, "bootstrap")
         if self.clean and os.path.exists(build_dir):
             shutil.rmtree(build_dir)
@@ -1094,7 +1148,7 @@ class RustBuild(object):
             recorded_submodules[data[3]] = data[2]
         for module in filtered_submodules:
             self.update_submodule(module[0], module[1], recorded_submodules)
-        print("Submodules updated in %.2f seconds" % (time() - start_time))
+        print("  Submodules updated in %.2f seconds" % (time() - start_time))
 
     def set_dist_environment(self, url):
         """Set download URL for normal environment"""
@@ -1179,16 +1233,18 @@ def bootstrap(help_triggered):
     build.verbose = args.verbose
     build.clean = args.clean
 
-    # Read from `RUST_BOOTSTRAP_CONFIG`, then `--config`, then fallback to `config.toml` (if it
-    # exists).
-    toml_path = os.getenv('RUST_BOOTSTRAP_CONFIG') or args.config
-    if not toml_path and os.path.exists('config.toml'):
+    # Read from `--config`, then `RUST_BOOTSTRAP_CONFIG`, then `./config.toml`,
+    # then `config.toml` in the root directory.
+    toml_path = args.config or os.getenv('RUST_BOOTSTRAP_CONFIG')
+    using_default_path = toml_path is None
+    if using_default_path:
         toml_path = 'config.toml'
-
-    if toml_path:
         if not os.path.exists(toml_path):
             toml_path = os.path.join(build.rust_root, toml_path)
 
+    # Give a hard error if `--config` or `RUST_BOOTSTRAP_CONFIG` are set to a missing path,
+    # but not if `config.toml` hasn't been created.
+    if not using_default_path or os.path.exists(toml_path):
         with open(toml_path) as config:
             build.config_toml = config.read()
 
@@ -1213,7 +1269,7 @@ def bootstrap(help_triggered):
     build.check_vendored_status()
 
     build_dir = build.get_toml('build-dir', 'build') or 'build'
-    build.build_dir = os.path.abspath(build_dir.replace("$ROOT", build.rust_root))
+    build.build_dir = os.path.abspath(build_dir)
 
     with open(os.path.join(build.rust_root, "src", "stage0.json")) as f:
         data = json.load(f)
@@ -1225,6 +1281,12 @@ def bootstrap(help_triggered):
     build.set_dist_environment(data["dist_server"])
 
     build.build = args.build or build.build_triple()
+
+    # Acquire the lock before doing any build actions
+    # The lock is released when `lock` is dropped
+    if not os.path.exists(build.build_dir):
+        os.makedirs(build.build_dir)
+    lock = acquire_lock(build.build_dir)
     build.update_submodules()
 
     # Fetch/build the bootstrap
@@ -1242,10 +1304,7 @@ def bootstrap(help_triggered):
     env = os.environ.copy()
     env["BOOTSTRAP_PARENT_ID"] = str(os.getpid())
     env["BOOTSTRAP_PYTHON"] = sys.executable
-    env["BUILD_DIR"] = build.build_dir
     env["RUSTC_BOOTSTRAP"] = '1'
-    if toml_path:
-        env["BOOTSTRAP_CONFIG"] = toml_path
     if build.rustc_commit is not None:
         env["BOOTSTRAP_DOWNLOAD_RUSTC"] = '1'
     run(args, env=env, verbose=build.verbose, is_bootstrap=True)

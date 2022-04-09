@@ -21,7 +21,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) {
     unused_crates_lint(tcx);
 }
 
-impl ItemLikeVisitor<'v> for CheckVisitor<'tcx> {
+impl<'tcx> ItemLikeVisitor<'_> for CheckVisitor<'tcx> {
     fn visit_item(&mut self, item: &hir::Item<'_>) {
         if item.vis.node.is_pub() || item.span.is_dummy() {
             return;
@@ -43,7 +43,7 @@ struct CheckVisitor<'tcx> {
     used_trait_imports: FxHashSet<LocalDefId>,
 }
 
-impl CheckVisitor<'tcx> {
+impl<'tcx> CheckVisitor<'tcx> {
     fn check_import(&self, item_id: hir::ItemId, span: Span) {
         if !self.tcx.maybe_unused_trait_import(item_id.def_id) {
             return;
@@ -82,8 +82,7 @@ fn unused_crates_lint(tcx: TyCtxt<'_>) {
             // The `def_id` here actually was calculated during resolution (at least
             // at the time of this writing) and is being shipped to us via a side
             // channel of the tcx. There may have been extra expansion phases,
-            // however, which ended up removing the `def_id` *after* expansion such
-            // as the `ReplaceBodyWithLoop` pass (which is a bit of a hack, but hey)
+            // however, which ended up removing the `def_id` *after* expansion.
             //
             // As a result we need to verify that `def_id` is indeed still valid for
             // our AST and actually present in the HIR map. If it's not there then
@@ -119,13 +118,13 @@ fn unused_crates_lint(tcx: TyCtxt<'_>) {
 
     for extern_crate in &crates_to_lint {
         let def_id = extern_crate.def_id.expect_local();
-        let id = tcx.hir().local_def_id_to_hir_id(def_id);
-        let item = tcx.hir().expect_item(id);
+        let item = tcx.hir().expect_item(def_id);
 
         // If the crate is fully unused, we suggest removing it altogether.
         // We do this in any edition.
         if extern_crate.warn_if_unused {
             if let Some(&span) = unused_extern_crates.get(&def_id) {
+                let id = tcx.hir().local_def_id_to_hir_id(def_id);
                 tcx.struct_span_lint_hir(lint, id, span, |lint| {
                     // Removal suggestion span needs to include attributes (Issue #54400)
                     let span_with_attrs = tcx
@@ -173,6 +172,7 @@ fn unused_crates_lint(tcx: TyCtxt<'_>) {
         if !tcx.get_attrs(extern_crate.def_id).is_empty() {
             continue;
         }
+        let id = tcx.hir().local_def_id_to_hir_id(def_id);
         tcx.struct_span_lint_hir(lint, id, extern_crate.span, |lint| {
             // Otherwise, we can convert it into a `use` of some kind.
             let base_replacement = match extern_crate.orig_name {

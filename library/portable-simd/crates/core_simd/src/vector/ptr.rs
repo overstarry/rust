@@ -21,9 +21,11 @@ where
     #[inline]
     #[must_use]
     pub fn wrapping_add(self, addend: Simd<usize, LANES>) -> Self {
+        // Safety: converting pointers to usize and vice-versa is safe
+        // (even if using that pointer is not)
         unsafe {
             let x: Simd<usize, LANES> = mem::transmute_copy(&self);
-            mem::transmute_copy(&{ x + (addend * mem::size_of::<T>()) })
+            mem::transmute_copy(&{ x + (addend * Simd::splat(mem::size_of::<T>())) })
         }
     }
 }
@@ -47,9 +49,11 @@ where
     #[inline]
     #[must_use]
     pub fn wrapping_add(self, addend: Simd<usize, LANES>) -> Self {
+        // Safety: converting pointers to usize and vice-versa is safe
+        // (even if using that pointer is not)
         unsafe {
             let x: Simd<usize, LANES> = mem::transmute_copy(&self);
-            mem::transmute_copy(&{ x + (addend * mem::size_of::<T>()) })
+            mem::transmute_copy(&{ x + (addend * Simd::splat(mem::size_of::<T>())) })
         }
     }
 }

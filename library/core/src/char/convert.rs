@@ -1,11 +1,10 @@
 //! Character conversions.
 
+use crate::char::TryFromCharError;
 use crate::convert::TryFrom;
 use crate::fmt;
 use crate::mem::transmute;
 use crate::str::FromStr;
-
-use super::MAX;
 
 /// Converts a `u32` to a `char`.
 ///
@@ -166,6 +165,20 @@ impl const From<char> for u128 {
     }
 }
 
+/// Map `char` with code point in U+0000..=U+00FF to byte in 0x00..=0xFF with same value, failing
+/// if the code point is greater than U+00FF.
+///
+/// See [`impl From<u8> for char`](char#impl-From<u8>) for details on the encoding.
+#[stable(feature = "u8_from_char", since = "1.59.0")]
+impl TryFrom<char> for u8 {
+    type Error = TryFromCharError;
+
+    #[inline]
+    fn try_from(c: char) -> Result<u8, Self::Error> {
+        u8::try_from(u32::from(c)).map_err(|_| TryFromCharError(()))
+    }
+}
+
 /// Maps a byte in 0x00..=0xFF to a `char` whose code point has the same value, in U+0000..=U+00FF.
 ///
 /// Unicode is designed such that this effectively decodes bytes
@@ -205,6 +218,8 @@ impl const From<u8> for char {
 }
 
 /// An error which can be returned when parsing a char.
+///
+/// This `struct` is created when using the [`char::from_str`] method.
 #[stable(feature = "char_from_str", since = "1.20.0")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseCharError {
@@ -256,7 +271,20 @@ impl FromStr for char {
 
 #[inline]
 const fn char_try_from_u32(i: u32) -> Result<char, CharTryFromError> {
-    if (i > MAX as u32) || (i >= 0xD800 && i <= 0xDFFF) {
+    // This is an optimized version of the check
+    // (i > MAX as u32) || (i >= 0xD800 && i <= 0xDFFF),
+    // which can also be written as
+    // i >= 0x110000 || (i >= 0xD800 && i < 0xE000).
+    //
+    // The XOR with 0xD800 permutes the ranges such that 0xD800..0xE000 is
+    // mapped to 0x0000..0x0800, while keeping all the high bits outside 0xFFFF the same.
+    // In particular, numbers >= 0x110000 stay in this range.
+    //
+    // Subtracting 0x800 causes 0x0000..0x0800 to wrap, meaning that a single
+    // unsigned comparison against 0x110000 - 0x800 will detect both the wrapped
+    // surrogate range as well as the numbers originally larger than 0x110000.
+    //
+    if (i ^ 0xD800).wrapping_sub(0x800) >= 0x110000 - 0x800 {
         Err(CharTryFromError(()))
     } else {
         // SAFETY: checked that it's a legal unicode value
@@ -274,7 +302,10 @@ impl TryFrom<u32> for char {
     }
 }
 
-/// The error type returned when a conversion from u32 to char fails.
+/// The error type returned when a conversion from [`prim@u32`] to [`prim@char`] fails.
+///
+/// This `struct` is created by the [`char::try_from<u32>`](char#impl-TryFrom<u32>) method.
+/// See its documentation for more.
 #[stable(feature = "try_from", since = "1.34.0")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct CharTryFromError(());

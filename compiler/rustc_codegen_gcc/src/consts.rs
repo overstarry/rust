@@ -1,4 +1,4 @@
-use gccjit::{LValue, RValue, ToRValue, Type};
+use gccjit::{GlobalKind, LValue, RValue, ToRValue, Type};
 use rustc_codegen_ssa::traits::{BaseTypeMethods, ConstMethods, DerivedTypeMethods, StaticMethods};
 use rustc_hir as hir;
 use rustc_hir::Node;
@@ -7,7 +7,7 @@ use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs}
 use rustc_middle::mir::mono::MonoItem;
 use rustc_middle::ty::{self, Instance, Ty};
 use rustc_middle::ty::layout::LayoutOf;
-use rustc_middle::mir::interpret::{self, Allocation, ErrorHandled, Scalar as InterpScalar, read_target_uint};
+use rustc_middle::mir::interpret::{self, ConstAllocation, ErrorHandled, Scalar as InterpScalar, read_target_uint};
 use rustc_span::Span;
 use rustc_span::def_id::DefId;
 use rustc_target::abi::{self, Align, HasDataLayout, Primitive, Size, WrappingRange};
@@ -20,7 +20,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
     pub fn const_bitcast(&self, value: RValue<'gcc>, typ: Type<'gcc>) -> RValue<'gcc> {
         if value.get_type() == self.bool_type.make_pointer() {
             if let Some(pointee) = typ.get_pointee() {
-                if pointee.is_vector().is_some() {
+                if pointee.dyncast_vector().is_some() {
                     panic!()
                 }
             }
@@ -31,9 +31,18 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
 
 impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
     fn static_addr_of(&self, cv: RValue<'gcc>, align: Align, kind: Option<&str>) -> RValue<'gcc> {
-        if let Some(global_value) = self.const_globals.borrow().get(&cv) {
-            // TODO(antoyo): upgrade alignment.
-            return *global_value;
+        // TODO(antoyo): implement a proper rvalue comparison in libgccjit instead of doing the
+        // following:
+        for (value, variable) in &*self.const_globals.borrow() {
+            if format!("{:?}", value) == format!("{:?}", cv) {
+                if let Some(global_variable) = self.global_lvalues.borrow().get(variable) {
+                    let alignment = align.bits() as i32;
+                    if alignment > global_variable.get_alignment() {
+                        global_variable.set_alignment(alignment);
+                    }
+                }
+                return *variable;
+            }
         }
         let global_value = self.static_addr_of_mut(cv, align, kind);
         // TODO(antoyo): set global constant.
@@ -77,7 +86,7 @@ impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
             else {
                 value
             };
-        global.global_set_initializer_value(value);
+        global.global_set_initializer_rvalue(value);
 
         // As an optimization, all shared statics which do not have interior
         // mutability are placed into read-only memory.
@@ -140,7 +149,7 @@ impl<'gcc, 'tcx> StaticMethods for CodegenCx<'gcc, 'tcx> {
             // TODO(antoyo): set link section.
         }
 
-        if attrs.flags.contains(CodegenFnAttrFlags::USED) {
+        if attrs.flags.contains(CodegenFnAttrFlags::USED) || attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER) {
             self.add_used_global(global.to_rvalue());
         }
     }
@@ -161,11 +170,9 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
             match kind {
                 Some(kind) if !self.tcx.sess.fewer_names() => {
                     let name = self.generate_local_symbol_name(kind);
-                    // TODO(antoyo): check if it's okay that TLS is off here.
-                    // TODO(antoyo): check if it's okay that link_section is None here.
+                    // TODO(antoyo): check if it's okay that no link_section is set.
                     // TODO(antoyo): set alignment here as well.
-                    let global = self.define_global(&name[..], self.val_ty(cv), false, None);
-                    // TODO(antoyo): set linkage.
+                    let global = self.declare_private_global(&name[..], self.val_ty(cv));
                     global
                 }
                 _ => {
@@ -174,11 +181,11 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
                     global
                 },
             };
-        // FIXME(antoyo): I think the name coming from generate_local_symbol_name() above cannot be used
-        // globally.
-        global.global_set_initializer_value(cv);
+        global.global_set_initializer_rvalue(cv);
         // TODO(antoyo): set unnamed address.
-        global.get_address(None)
+        let rvalue = global.get_address(None);
+        self.global_lvalues.borrow_mut().insert(rvalue, global);
+        rvalue
     }
 
     pub fn get_static(&self, def_id: DefId) -> LValue<'gcc> {
@@ -214,7 +221,13 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
                         }
 
                         let is_tls = fn_attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL);
-                        let global = self.declare_global(&sym, llty, is_tls, fn_attrs.link_section);
+                        let global = self.declare_global(
+                            &sym,
+                            llty,
+                            GlobalKind::Exported,
+                            is_tls,
+                            fn_attrs.link_section,
+                        );
 
                         if !self.tcx.is_reachable_non_generic(def_id) {
                             // TODO(antoyo): set visibility.
@@ -280,7 +293,8 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
     }
 }
 
-pub fn const_alloc_to_gcc<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, alloc: &Allocation) -> RValue<'gcc> {
+pub fn const_alloc_to_gcc<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, alloc: ConstAllocation<'tcx>) -> RValue<'gcc> {
+    let alloc = alloc.inner();
     let mut llvals = Vec::with_capacity(alloc.relocations().len() + 1);
     let dl = cx.data_layout();
     let pointer_size = dl.pointer_size.bytes() as usize;
@@ -314,7 +328,7 @@ pub fn const_alloc_to_gcc<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, alloc: &Alloca
                 interpret::Pointer::new(alloc_id, Size::from_bytes(ptr_offset)),
                 &cx.tcx,
             ),
-            abi::Scalar { value: Primitive::Pointer, valid_range: WrappingRange { start: 0, end: !0 } },
+            abi::Scalar::Initialized { value: Primitive::Pointer, valid_range: WrappingRange::full(dl.pointer_size) },
             cx.type_i8p(),
         ));
         next_offset = offset + pointer_size;
@@ -334,7 +348,7 @@ pub fn const_alloc_to_gcc<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, alloc: &Alloca
     cx.const_struct(&llvals, true)
 }
 
-pub fn codegen_static_initializer<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, def_id: DefId) -> Result<(RValue<'gcc>, &'tcx Allocation), ErrorHandled> {
+pub fn codegen_static_initializer<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, def_id: DefId) -> Result<(RValue<'gcc>, ConstAllocation<'tcx>), ErrorHandled> {
     let alloc = cx.tcx.eval_static_initializer(def_id)?;
     Ok((const_alloc_to_gcc(cx, alloc), alloc))
 }
@@ -371,7 +385,7 @@ fn check_and_apply_linkage<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, attrs: &Codeg
         real_name.push_str(&sym);
         let global2 = cx.define_global(&real_name, llty, is_tls, attrs.link_section);
         // TODO(antoyo): set linkage.
-        global2.global_set_initializer_value(global1.get_address(None));
+        global2.global_set_initializer_rvalue(global1.get_address(None));
         // TODO(antoyo): use global_set_initializer() when it will work.
         global2
     }
@@ -385,6 +399,6 @@ fn check_and_apply_linkage<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, attrs: &Codeg
         // don't do this then linker errors can be generated where the linker
         // complains that one object files has a thread local version of the
         // symbol and another one doesn't.
-        cx.declare_global(&sym, llty, is_tls, attrs.link_section)
+        cx.declare_global(&sym, llty, GlobalKind::Imported, is_tls, attrs.link_section)
     }
 }

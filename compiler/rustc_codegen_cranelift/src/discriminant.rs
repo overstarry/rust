@@ -68,11 +68,10 @@ pub(crate) fn codegen_get_discriminant<'tcx>(
     let layout = value.layout();
 
     if layout.abi == Abi::Uninhabited {
-        return trap_unreachable_ret_value(
-            fx,
-            dest_layout,
-            "[panic] Tried to get discriminant for uninhabited type.",
-        );
+        let true_ = fx.bcx.ins().iconst(types::I32, 1);
+        fx.bcx.ins().trapnz(true_, TrapCode::UnreachableCodeReached);
+        // Return a dummy value
+        return CValue::by_ref(Pointer::const_addr(fx, 0), dest_layout);
     }
 
     let (tag_scalar, tag_field, tag_encoding) = match &layout.variants {
@@ -106,7 +105,7 @@ pub(crate) fn codegen_get_discriminant<'tcx>(
     // Decode the discriminant (specifically if it's niche-encoded).
     match *tag_encoding {
         TagEncoding::Direct => {
-            let signed = match tag_scalar.value {
+            let signed = match tag_scalar.primitive() {
                 Int(_, signed) => signed,
                 _ => false,
             };

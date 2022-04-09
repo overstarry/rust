@@ -1,7 +1,12 @@
 // run-rustfix
 
 #![warn(clippy::unnecessary_cast)]
-#![allow(clippy::no_effect, clippy::unnecessary_operation, clippy::nonstandard_macro_braces)]
+#![allow(
+    clippy::no_effect,
+    clippy::unnecessary_operation,
+    clippy::nonstandard_macro_braces,
+    clippy::borrow_as_ptr
+)]
 
 fn main() {
     // casting integer literal to float is unnecessary
@@ -37,4 +42,9 @@ fn main() {
 
     let _ = -1 as i32;
     let _ = -1.0 as f32;
+
+    let _ = 1 as I32Alias;
+    let _ = &1 as &I32Alias;
 }
+
+type I32Alias = i32;

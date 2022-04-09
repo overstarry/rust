@@ -21,12 +21,12 @@ declare_lint_pass!(Pass => [TEST_LINT, PLEASE_LINT]);
 
 impl<'tcx> LateLintPass<'tcx> for Pass {
     fn check_item(&mut self, cx: &LateContext, it: &rustc_hir::Item) {
-        match &*it.ident.as_str() {
+        match it.ident.as_str() {
             "lintme" => cx.lint(TEST_LINT, |lint| {
-                lint.build("item is named 'lintme'").set_span(it.span).emit()
+                lint.build("item is named 'lintme'").set_span(it.span).emit();
             }),
             "pleaselintme" => cx.lint(PLEASE_LINT, |lint| {
-                lint.build("item is named 'pleaselintme'").set_span(it.span).emit()
+                lint.build("item is named 'pleaselintme'").set_span(it.span).emit();
             }),
             _ => {}
         }

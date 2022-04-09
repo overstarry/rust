@@ -5,10 +5,12 @@
 #![feature(rustc_private)]
 #![feature(array_methods)]
 #![feature(assert_matches)]
+#![feature(bool_to_option)]
 #![feature(box_patterns)]
 #![feature(control_flow_enum)]
 #![feature(box_syntax)]
-#![feature(in_band_lifetimes)]
+#![feature(drain_filter)]
+#![feature(let_chains)]
 #![feature(let_else)]
 #![feature(nll)]
 #![feature(test)]
@@ -17,8 +19,12 @@
 #![feature(once_cell)]
 #![feature(type_ascription)]
 #![feature(iter_intersperse)]
+#![feature(type_alias_impl_trait)]
+#![feature(generic_associated_types)]
 #![recursion_limit = "256"]
 #![warn(rustc::internal)]
+#![allow(clippy::collapsible_if, clippy::collapsible_else_if)]
+#![allow(rustc::potential_query_instability)]
 
 #[macro_use]
 extern crate tracing;
@@ -63,21 +69,20 @@ extern crate rustc_trait_selection;
 extern crate rustc_typeck;
 extern crate test;
 
+// See docs in https://github.com/rust-lang/rust/blob/master/compiler/rustc/src/main.rs
+// about jemalloc.
 #[cfg(feature = "jemalloc")]
 extern crate tikv_jemalloc_sys;
 #[cfg(feature = "jemalloc")]
 use tikv_jemalloc_sys as jemalloc_sys;
-#[cfg(feature = "jemalloc")]
-extern crate tikv_jemallocator;
-#[cfg(feature = "jemalloc")]
-use tikv_jemallocator as jemallocator;
 
 use std::default::Default;
-use std::env;
+use std::env::{self, VarError};
+use std::io;
 use std::process;
 
 use rustc_driver::{abort_on_err, describe_lints};
-use rustc_errors::ErrorReported;
+use rustc_errors::ErrorGuaranteed;
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::config::{make_crate_type_option, ErrorOutputType, RustcOptGroup};
@@ -85,6 +90,7 @@ use rustc_session::getopts;
 use rustc_session::{early_error, early_warn};
 
 use crate::clean::utils::DOC_RUST_LANG_ORG_CHANNEL;
+use crate::passes::collect_intra_doc_links;
 
 /// A macro to create a FxHashMap.
 ///
@@ -125,15 +131,9 @@ mod visit;
 mod visit_ast;
 mod visit_lib;
 
-// See docs in https://github.com/rust-lang/rust/blob/master/compiler/rustc/src/main.rs
-// about jemallocator
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
-
 pub fn main() {
     // See docs in https://github.com/rust-lang/rust/blob/master/compiler/rustc/src/main.rs
-    // about jemalloc-sys
+    // about jemalloc.
     #[cfg(feature = "jemalloc")]
     {
         use std::os::raw::{c_int, c_void};
@@ -152,10 +152,6 @@ pub fn main() {
         #[used]
         static _F6: unsafe extern "C" fn(*mut c_void) = jemalloc_sys::free;
 
-        // On OSX, jemalloc doesn't directly override malloc/free, but instead
-        // registers itself with the allocator's zone APIs in a ctor. However,
-        // the linker doesn't seem to consider ctors as "used" when statically
-        // linking, so we need to explicitly depend on the function.
         #[cfg(target_os = "macos")]
         {
             extern "C" {
@@ -184,53 +180,26 @@ pub fn main() {
 
     let exit_code = rustc_driver::catch_with_exit_code(|| match get_args() {
         Some(args) => main_args(&args),
-        _ => Err(ErrorReported),
+        _ => Err(ErrorGuaranteed::unchecked_claim_error_was_emitted()),
     });
     process::exit(exit_code);
 }
 
 fn init_logging() {
-    use std::io;
-
-    // FIXME remove these and use winapi 0.3 instead
-    // Duplicates: bootstrap/compile.rs, librustc_errors/emitter.rs, rustc_driver/lib.rs
-    #[cfg(unix)]
-    fn stdout_isatty() -> bool {
-        extern crate libc;
-        unsafe { libc::isatty(libc::STDOUT_FILENO) != 0 }
-    }
-
-    #[cfg(windows)]
-    fn stdout_isatty() -> bool {
-        extern crate winapi;
-        use winapi::um::consoleapi::GetConsoleMode;
-        use winapi::um::processenv::GetStdHandle;
-        use winapi::um::winbase::STD_OUTPUT_HANDLE;
-
-        unsafe {
-            let handle = GetStdHandle(STD_OUTPUT_HANDLE);
-            let mut out = 0;
-            GetConsoleMode(handle, &mut out) != 0
-        }
-    }
-
-    let color_logs = match std::env::var("RUSTDOC_LOG_COLOR") {
-        Ok(value) => match value.as_ref() {
-            "always" => true,
-            "never" => false,
-            "auto" => stdout_isatty(),
-            _ => early_error(
-                ErrorOutputType::default(),
-                &format!(
-                    "invalid log color value '{}': expected one of always, never, or auto",
-                    value
-                ),
-            ),
-        },
-        Err(std::env::VarError::NotPresent) => stdout_isatty(),
-        Err(std::env::VarError::NotUnicode(_value)) => early_error(
+    let color_logs = match std::env::var("RUSTDOC_LOG_COLOR").as_deref() {
+        Ok("always") => true,
+        Ok("never") => false,
+        Ok("auto") | Err(VarError::NotPresent) => atty::is(atty::Stream::Stdout),
+        Ok(value) => early_error(
             ErrorOutputType::default(),
-            "non-Unicode log color value: expected one of always, never, or auto",
+            &format!("invalid log color value '{}': expected one of always, never, or auto", value),
+        ),
+        Err(VarError::NotUnicode(value)) => early_error(
+            ErrorOutputType::default(),
+            &format!(
+                "invalid log color value '{}': expected one of always, never, or auto",
+                value.to_string_lossy()
+            ),
         ),
     };
     let filter = tracing_subscriber::EnvFilter::from_env("RUSTDOC_LOG");
@@ -274,11 +243,17 @@ fn opts() -> Vec<RustcOptGroup> {
         stable("h", |o| o.optflagmulti("h", "help", "show this help message")),
         stable("V", |o| o.optflagmulti("V", "version", "print rustdoc's version")),
         stable("v", |o| o.optflagmulti("v", "verbose", "use verbose output")),
-        stable("r", |o| {
-            o.optopt("r", "input-format", "the input type of the specified file", "[rust]")
-        }),
         stable("w", |o| o.optopt("w", "output-format", "the output type to write", "[html]")),
-        stable("o", |o| o.optopt("o", "output", "where to place the output", "PATH")),
+        stable("output", |o| {
+            o.optopt(
+                "",
+                "output",
+                "Which directory to place the output. \
+                 This option is deprecated, use --out-dir instead.",
+                "PATH",
+            )
+        }),
+        stable("o", |o| o.optopt("o", "out-dir", "which directory to place the output", "PATH")),
         stable("crate-name", |o| {
             o.optopt("", "crate-name", "specify the name of this crate", "NAME")
         }),
@@ -287,6 +262,7 @@ fn opts() -> Vec<RustcOptGroup> {
             o.optmulti("L", "library-path", "directory to add to crate search path", "DIR")
         }),
         stable("cfg", |o| o.optmulti("", "cfg", "pass a --cfg to rustc", "")),
+        unstable("check-cfg", |o| o.optmulti("", "check-cfg", "pass a --check-cfg to rustc", "")),
         stable("extern", |o| o.optmulti("", "extern", "pass an --extern to rustc", "NAME[=PATH]")),
         unstable("extern-html-root-url", |o| {
             o.optmulti(
@@ -304,21 +280,9 @@ fn opts() -> Vec<RustcOptGroup> {
                 "give precedence to `--extern-html-root-url`, not `html_root_url`",
             )
         }),
-        stable("plugin-path", |o| o.optmulti("", "plugin-path", "removed", "DIR")),
         stable("C", |o| {
             o.optmulti("C", "codegen", "pass a codegen option to rustc", "OPT[=VALUE]")
         }),
-        stable("passes", |o| {
-            o.optmulti(
-                "",
-                "passes",
-                "list of passes to also run, you might want to pass it multiple times; a value of \
-                 `list` will print available passes",
-                "PASSES",
-            )
-        }),
-        stable("plugins", |o| o.optmulti("", "plugins", "removed", "PLUGINS")),
-        stable("no-default", |o| o.optflagmulti("", "no-defaults", "don't run the default passes")),
         stable("document-private-items", |o| {
             o.optflagmulti("", "document-private-items", "document private items")
         }),
@@ -636,12 +600,60 @@ fn opts() -> Vec<RustcOptGroup> {
                 "collect function call information for functions from the target crate",
             )
         }),
+        unstable("scrape-tests", |o| {
+            o.optflag("", "scrape-tests", "Include test code when scraping examples")
+        }),
         unstable("with-examples", |o| {
             o.optmulti(
                 "",
                 "with-examples",
                 "",
                 "path to function call information (for displaying examples in the documentation)",
+            )
+        }),
+        // deprecated / removed options
+        stable("plugin-path", |o| {
+            o.optmulti(
+                "",
+                "plugin-path",
+                "removed, see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
+                for more information",
+                "DIR",
+            )
+        }),
+        stable("passes", |o| {
+            o.optmulti(
+                "",
+                "passes",
+                "removed, see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
+                for more information",
+                "PASSES",
+            )
+        }),
+        stable("plugins", |o| {
+            o.optmulti(
+                "",
+                "plugins",
+                "removed, see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
+                for more information",
+                "PLUGINS",
+            )
+        }),
+        stable("no-default", |o| {
+            o.optflagmulti(
+                "",
+                "no-defaults",
+                "removed, see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
+                for more information",
+            )
+        }),
+        stable("r", |o| {
+            o.optopt(
+                "r",
+                "input-format",
+                "removed, see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
+                for more information",
+                "[rust]",
             )
         }),
     ]
@@ -661,7 +673,7 @@ fn usage(argv0: &str) {
 }
 
 /// A result type used by several functions under `main()`.
-type MainResult = Result<(), ErrorReported>;
+type MainResult = Result<(), ErrorGuaranteed>;
 
 fn main_args(at_args: &[String]) -> MainResult {
     let args = rustc_driver::args::arg_expand_all(at_args);
@@ -681,12 +693,17 @@ fn main_args(at_args: &[String]) -> MainResult {
     // codes from `from_matches` here.
     let options = match config::Options::from_matches(&matches) {
         Ok(opts) => opts,
-        Err(code) => return if code == 0 { Ok(()) } else { Err(ErrorReported) },
+        Err(code) => {
+            return if code == 0 {
+                Ok(())
+            } else {
+                Err(ErrorGuaranteed::unchecked_claim_error_was_emitted())
+            };
+        }
     };
-    rustc_interface::util::setup_callbacks_and_run_in_thread_pool_with_globals(
+    rustc_interface::util::run_in_thread_pool_with_globals(
         options.edition,
         1, // this runs single-threaded, even in a parallel compiler
-        &None,
         move || main_options(options),
     )
 }
@@ -695,8 +712,8 @@ fn wrap_return(diag: &rustc_errors::Handler, res: Result<(), String>) -> MainRes
     match res {
         Ok(()) => Ok(()),
         Err(err) => {
-            diag.struct_err(&err).emit();
-            Err(ErrorReported)
+            let reported = diag.struct_err(&err).emit();
+            Err(reported)
         }
     }
 }
@@ -713,12 +730,10 @@ fn run_renderer<'tcx, T: formats::FormatRenderer<'tcx>>(
             let mut msg =
                 tcx.sess.struct_err(&format!("couldn't generate documentation: {}", e.error));
             let file = e.file.display().to_string();
-            if file.is_empty() {
-                msg.emit()
-            } else {
-                msg.note(&format!("failed to create or modify \"{}\"", file)).emit()
+            if !file.is_empty() {
+                msg.note(&format!("failed to create or modify \"{}\"", file));
             }
-            Err(ErrorReported)
+            Err(msg.emit())
         }
     }
 }
@@ -752,13 +767,12 @@ fn main_options(options: config::Options) -> MainResult {
     // plug/cleaning passes.
     let crate_version = options.crate_version.clone();
 
-    let default_passes = options.default_passes;
     let output_format = options.output_format;
     // FIXME: fix this clone (especially render_options)
     let externs = options.externs.clone();
-    let manual_passes = options.manual_passes.clone();
     let render_options = options.render_options.clone();
     let scrape_examples_options = options.scrape_examples_options.clone();
+    let document_private = options.render_options.document_private;
     let config = core::create_config(options);
 
     interface::create_compiler_and_run(config, |compiler| {
@@ -774,9 +788,22 @@ fn main_options(options: config::Options) -> MainResult {
             // We need to hold on to the complete resolver, so we cause everything to be
             // cloned for the analysis passes to use. Suboptimal, but necessary in the
             // current architecture.
-            let resolver = core::create_resolver(externs, queries, sess);
+            // FIXME(#83761): Resolver cloning can lead to inconsistencies between data in the
+            // two copies because one of the copies can be modified after `TyCtxt` construction.
+            let (resolver, resolver_caches) = {
+                let (krate, resolver, _) = &*abort_on_err(queries.expansion(), sess).peek();
+                let resolver_caches = resolver.borrow_mut().access(|resolver| {
+                    collect_intra_doc_links::early_resolve_intra_doc_links(
+                        resolver,
+                        krate,
+                        externs,
+                        document_private,
+                    )
+                });
+                (resolver.clone(), resolver_caches)
+            };
 
-            if sess.diagnostic().has_errors_or_lint_errors() {
+            if sess.diagnostic().has_errors_or_lint_errors().is_some() {
                 sess.fatal("Compilation failed, aborting rustdoc");
             }
 
@@ -787,8 +814,8 @@ fn main_options(options: config::Options) -> MainResult {
                     core::run_global_ctxt(
                         tcx,
                         resolver,
-                        default_passes,
-                        manual_passes,
+                        resolver_caches,
+                        show_coverage,
                         render_options,
                         output_format,
                     )

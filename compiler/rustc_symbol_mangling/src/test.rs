@@ -31,7 +31,7 @@ struct SymbolNamesTest<'tcx> {
     tcx: TyCtxt<'tcx>,
 }
 
-impl SymbolNamesTest<'tcx> {
+impl SymbolNamesTest<'_> {
     fn process_attrs(&mut self, def_id: LocalDefId) {
         let tcx = self.tcx;
         for attr in tcx.get_attrs(def_id.to_def_id()).iter() {
@@ -48,7 +48,7 @@ impl SymbolNamesTest<'tcx> {
                     tcx.sess.span_err(attr.span, &format!("demangling-alt({:#})", demangling));
                 }
             } else if attr.has_name(DEF_PATH) {
-                let path = with_no_trimmed_paths(|| tcx.def_path_str(def_id.to_def_id()));
+                let path = with_no_trimmed_paths!(tcx.def_path_str(def_id.to_def_id()));
                 tcx.sess.span_err(attr.span, &format!("def-path({})", path));
             }
 
@@ -59,7 +59,7 @@ impl SymbolNamesTest<'tcx> {
     }
 }
 
-impl hir::itemlikevisit::ItemLikeVisitor<'tcx> for SymbolNamesTest<'tcx> {
+impl<'tcx> hir::itemlikevisit::ItemLikeVisitor<'tcx> for SymbolNamesTest<'tcx> {
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
         self.process_attrs(item.def_id);
     }

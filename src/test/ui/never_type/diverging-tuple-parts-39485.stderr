@@ -6,10 +6,10 @@ LL |     &panic!()
    |
    = note: expected unit type `()`
               found reference `&_`
-help: try adding a return type
+help: a return type might be missing here
    |
-LL | fn g() -> &_ {
-   |        +++++
+LL | fn g() -> _ {
+   |        ++++
 help: consider removing the borrow
    |
 LL -     &panic!()

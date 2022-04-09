@@ -303,9 +303,7 @@ fn characteristic_def_id_of_mono_item<'tcx>(
 
                 // When polymorphization is enabled, methods which do not depend on their generic
                 // parameters, but the self-type of their impl block do will fail to normalize.
-                if !tcx.sess.opts.debugging_opts.polymorphize
-                    || !instance.definitely_needs_subst(tcx)
-                {
+                if !tcx.sess.opts.debugging_opts.polymorphize || !instance.needs_subst() {
                     // This is a method within an impl, find out what the self-type is:
                     let impl_self_ty = tcx.subst_and_normalize_erasing_regions(
                         instance.substs,
@@ -378,7 +376,7 @@ fn fallback_cgu_name(name_builder: &mut CodegenUnitNameBuilder<'_>) -> Symbol {
     name_builder.build_cgu_name(LOCAL_CRATE, &["fallback"], Some("cgu"))
 }
 
-fn mono_item_linkage_and_visibility(
+fn mono_item_linkage_and_visibility<'tcx>(
     tcx: TyCtxt<'tcx>,
     mono_item: &MonoItem<'tcx>,
     can_be_internalized: &mut bool,
@@ -393,7 +391,7 @@ fn mono_item_linkage_and_visibility(
 
 type CguNameCache = FxHashMap<(DefId, bool), Symbol>;
 
-fn mono_item_visibility(
+fn mono_item_visibility<'tcx>(
     tcx: TyCtxt<'tcx>,
     mono_item: &MonoItem<'tcx>,
     can_be_internalized: &mut bool,
@@ -503,7 +501,7 @@ fn mono_item_visibility(
         // * First is weak lang items. These are basically mechanisms for
         //   libcore to forward-reference symbols defined later in crates like
         //   the standard library or `#[panic_handler]` definitions. The
-        //   definition of these weak lang items needs to be referenceable by
+        //   definition of these weak lang items needs to be referencable by
         //   libcore, so we're no longer a candidate for internalization.
         //   Removal of these functions can't be done by LLVM but rather must be
         //   done by the linker as it's a non-local decision.

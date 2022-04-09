@@ -17,6 +17,9 @@ fn main() {
         } else {
             println!("cargo:rustc-link-lib=gcc");
         }
+
+        // Android's unwinding library depends on dl_iterate_phdr in `libdl`.
+        println!("cargo:rustc-link-lib=dl");
     } else if target.contains("freebsd") {
         println!("cargo:rustc-link-lib=gcc_s");
     } else if target.contains("netbsd") {
@@ -36,8 +39,6 @@ fn main() {
     } else if target.contains("pc-windows-gnu") {
         // This is handled in the target spec with late_link_args_[static|dynamic]
     } else if target.contains("uwp-windows-gnu") {
-        println!("cargo:rustc-link-lib=unwind");
-    } else if target.contains("fuchsia") {
         println!("cargo:rustc-link-lib=unwind");
     } else if target.contains("haiku") {
         println!("cargo:rustc-link-lib=gcc_s");

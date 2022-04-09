@@ -90,10 +90,10 @@ use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir::def::*;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
+use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{Expr, HirId, HirIdMap, HirIdSet};
 use rustc_index::vec::IndexVec;
-use rustc_middle::hir::map::Map;
+use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, DefIdTree, RootVariableMinCaptureList, Ty, TyCtxt};
 use rustc_session::lint;
@@ -103,7 +103,6 @@ use rustc_span::Span;
 use std::collections::VecDeque;
 use std::io;
 use std::io::prelude::*;
-use std::iter;
 use std::rc::Rc;
 
 mod rwu_table;
@@ -198,7 +197,7 @@ struct IrMaps<'tcx> {
     lnks: IndexVec<LiveNode, LiveNodeKind>,
 }
 
-impl IrMaps<'tcx> {
+impl<'tcx> IrMaps<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> IrMaps<'tcx> {
         IrMaps {
             tcx,
@@ -317,10 +316,10 @@ impl IrMaps<'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for IrMaps<'tcx> {
-    type Map = Map<'tcx>;
+    type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::OnlyBodies(self.tcx.hir())
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
     }
 
     fn visit_body(&mut self, body: &'tcx hir::Body<'tcx>) {
@@ -333,12 +332,11 @@ impl<'tcx> Visitor<'tcx> for IrMaps<'tcx> {
         let def_id = local_def_id.to_def_id();
 
         // Don't run unused pass for #[derive()]
-        if let Some(parent) = self.tcx.parent(def_id) {
-            if let DefKind::Impl = self.tcx.def_kind(parent.expect_local()) {
-                if self.tcx.has_attr(parent, sym::automatically_derived) {
-                    return;
-                }
-            }
+        if let Some(parent) = self.tcx.parent(def_id)
+            && let DefKind::Impl = self.tcx.def_kind(parent.expect_local())
+            && self.tcx.has_attr(parent, sym::automatically_derived)
+        {
+            return;
         }
 
         // Don't run unused pass for #[naked]
@@ -429,8 +427,8 @@ impl<'tcx> Visitor<'tcx> for IrMaps<'tcx> {
                 intravisit::walk_expr(self, expr);
             }
 
-            hir::ExprKind::Let(ref pat, ..) => {
-                self.add_from_pat(pat);
+            hir::ExprKind::Let(let_expr) => {
+                self.add_from_pat(let_expr.pat);
                 intravisit::walk_expr(self, expr);
             }
 
@@ -470,7 +468,6 @@ impl<'tcx> Visitor<'tcx> for IrMaps<'tcx> {
             | hir::ExprKind::Struct(..)
             | hir::ExprKind::Repeat(..)
             | hir::ExprKind::InlineAsm(..)
-            | hir::ExprKind::LlvmInlineAsm(..)
             | hir::ExprKind::Box(..)
             | hir::ExprKind::Type(..)
             | hir::ExprKind::Err
@@ -726,7 +723,7 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
                             );
                             self.acc(self.exit_ln, var, ACC_READ | ACC_USE);
                         }
-                        ty::UpvarCapture::ByValue(_) => {}
+                        ty::UpvarCapture::ByValue => {}
                     }
                 }
             }
@@ -856,9 +853,9 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
                 })
             }
 
-            hir::ExprKind::Let(ref pat, ref scrutinee, _) => {
-                let succ = self.propagate_through_expr(scrutinee, succ);
-                self.define_bindings_in_pat(pat, succ)
+            hir::ExprKind::Let(let_expr) => {
+                let succ = self.propagate_through_expr(let_expr.init, succ);
+                self.define_bindings_in_pat(let_expr.pat, succ)
             }
 
             // Note that labels have been resolved, so we don't need to look
@@ -1091,26 +1088,6 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
                 succ
             }
 
-            hir::ExprKind::LlvmInlineAsm(ref asm) => {
-                let ia = &asm.inner;
-                let outputs = asm.outputs_exprs;
-                let inputs = asm.inputs_exprs;
-                let succ = iter::zip(&ia.outputs, outputs).rev().fold(succ, |succ, (o, output)| {
-                    // see comment on places
-                    // in propagate_through_place_components()
-                    if o.is_indirect {
-                        self.propagate_through_expr(output, succ)
-                    } else {
-                        let acc = if o.is_rw { ACC_WRITE | ACC_READ } else { ACC_WRITE };
-                        let succ = self.write_place(output, succ, acc);
-                        self.propagate_through_place_components(output, succ)
-                    }
-                });
-
-                // Inputs are executed first. Propagate last because of rev order
-                self.propagate_through_exprs(inputs, succ)
-            }
-
             hir::ExprKind::Lit(..)
             | hir::ExprKind::ConstBlock(..)
             | hir::ExprKind::Err
@@ -1327,12 +1304,6 @@ impl<'a, 'tcx> Liveness<'a, 'tcx> {
 // Checking for error conditions
 
 impl<'a, 'tcx> Visitor<'tcx> for Liveness<'a, 'tcx> {
-    type Map = intravisit::ErasedMap<'tcx>;
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
-    }
-
     fn visit_local(&mut self, local: &'tcx hir::Local<'tcx>) {
         self.check_unused_vars_in_pat(&local.pat, None, |spans, hir_id, ln, var| {
             if local.init.is_some() {
@@ -1387,22 +1358,8 @@ fn check_expr<'tcx>(this: &mut Liveness<'_, 'tcx>, expr: &'tcx Expr<'tcx>) {
             }
         }
 
-        hir::ExprKind::LlvmInlineAsm(ref asm) => {
-            for input in asm.inputs_exprs {
-                this.visit_expr(input);
-            }
-
-            // Output operands must be places
-            for (o, output) in iter::zip(&asm.inner.outputs, asm.outputs_exprs) {
-                if !o.is_indirect {
-                    this.check_place(output);
-                }
-                this.visit_expr(output);
-            }
-        }
-
-        hir::ExprKind::Let(ref pat, ..) => {
-            this.check_unused_vars_in_pat(pat, None, |_, _, _, _| {});
+        hir::ExprKind::Let(let_expr) => {
+            this.check_unused_vars_in_pat(let_expr.pat, None, |_, _, _, _| {});
         }
 
         // no correctness conditions related to liveness
@@ -1464,7 +1421,7 @@ impl<'tcx> Liveness<'_, 'tcx> {
         if name == kw::Empty {
             return None;
         }
-        let name: &str = &name.as_str();
+        let name = name.as_str();
         if name.as_bytes()[0] == b'_' {
             return None;
         }
@@ -1472,16 +1429,15 @@ impl<'tcx> Liveness<'_, 'tcx> {
     }
 
     fn warn_about_unused_upvars(&self, entry_ln: LiveNode) {
-        let closure_min_captures = match self.closure_min_captures {
-            None => return,
-            Some(closure_min_captures) => closure_min_captures,
+        let Some(closure_min_captures) = self.closure_min_captures else {
+            return;
         };
 
         // If closure_min_captures is Some(), upvars must be Some() too.
         for (&var_hir_id, min_capture_list) in closure_min_captures {
             for captured_place in min_capture_list {
                 match captured_place.info.capture_kind {
-                    ty::UpvarCapture::ByValue(_) => {}
+                    ty::UpvarCapture::ByValue => {}
                     ty::UpvarCapture::ByRef(..) => continue,
                 };
                 let span = captured_place.get_capture_kind_span(self.ir.tcx);
@@ -1632,7 +1588,7 @@ impl<'tcx> Liveness<'_, 'tcx> {
                                 shorthands,
                                 Applicability::MachineApplicable,
                             );
-                            err.emit()
+                            err.emit();
                         },
                     );
                 } else {
@@ -1655,7 +1611,7 @@ impl<'tcx> Liveness<'_, 'tcx> {
                                 non_shorthands,
                                 Applicability::MachineApplicable,
                             );
-                            err.emit()
+                            err.emit();
                         },
                     );
                 }

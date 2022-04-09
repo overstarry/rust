@@ -18,15 +18,15 @@ use crate::llvm;
 use crate::llvm::AttributePlace::Function;
 use crate::type_::Type;
 use crate::value::Value;
-use rustc_codegen_ssa::traits::*;
 use rustc_middle::ty::Ty;
+use smallvec::SmallVec;
 use tracing::debug;
 
 /// Declare a function.
 ///
 /// If there’s a value with the same name already declared, the function will
 /// update the declaration and return existing Value instead.
-fn declare_raw_fn(
+fn declare_raw_fn<'ll>(
     cx: &CodegenCx<'ll, '_>,
     name: &str,
     callconv: llvm::CallConv,
@@ -41,16 +41,20 @@ fn declare_raw_fn(
     llvm::SetFunctionCallConv(llfn, callconv);
     llvm::SetUnnamedAddress(llfn, unnamed);
 
+    let mut attrs = SmallVec::<[_; 4]>::new();
+
     if cx.tcx.sess.opts.cg.no_redzone.unwrap_or(cx.tcx.sess.target.disable_redzone) {
-        llvm::Attribute::NoRedZone.apply_llfn(Function, llfn);
+        attrs.push(llvm::AttributeKind::NoRedZone.create_attr(cx.llcx));
     }
 
-    attributes::default_optimisation_attrs(cx.tcx.sess, llfn);
-    attributes::non_lazy_bind(cx.sess(), llfn);
+    attrs.extend(attributes::non_lazy_bind_attr(cx));
+
+    attributes::apply_to_llfn(llfn, Function, &attrs);
+
     llfn
 }
 
-impl CodegenCx<'ll, 'tcx> {
+impl<'ll, 'tcx> CodegenCx<'ll, 'tcx> {
     /// Declare a global value.
     ///
     /// If there’s a value with the same name already declared, the function will

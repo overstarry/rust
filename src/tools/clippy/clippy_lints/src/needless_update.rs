@@ -40,6 +40,7 @@ declare_clippy_lint! {
     ///     ..zero_point
     /// };
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub NEEDLESS_UPDATE,
     complexity,
     "using `Foo { ..base }` when there are no missing fields"
@@ -53,7 +54,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessUpdate {
             let ty = cx.typeck_results().expr_ty(expr);
             if let ty::Adt(def, _) = ty.kind() {
                 if fields.len() == def.non_enum_variant().fields.len()
-                    && !def.variants[0_usize.into()].is_field_list_non_exhaustive()
+                    && !def.variant(0_usize.into()).is_field_list_non_exhaustive()
                 {
                     span_lint(
                         cx,

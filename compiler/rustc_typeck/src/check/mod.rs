@@ -103,7 +103,7 @@ pub use inherited::{Inherited, InheritedBuilder};
 use crate::astconv::AstConv;
 use crate::check::gather_locals::GatherLocalsVisitor;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use rustc_errors::{pluralize, struct_span_err, Applicability};
+use rustc_errors::{pluralize, struct_span_err, Applicability, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -121,7 +121,7 @@ use rustc_session::parse::feature_err;
 use rustc_session::Session;
 use rustc_span::source_map::DUMMY_SP;
 use rustc_span::symbol::{kw, Ident};
-use rustc_span::{self, BytePos, MultiSpan, Span};
+use rustc_span::{self, BytePos, Span};
 use rustc_target::abi::VariantIdx;
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::traits;
@@ -139,11 +139,13 @@ pub use self::Expectation::*;
 #[macro_export]
 macro_rules! type_error_struct {
     ($session:expr, $span:expr, $typ:expr, $code:ident, $($message:tt)*) => ({
+        let mut err = rustc_errors::struct_span_err!($session, $span, $code, $($message)*);
+
         if $typ.references_error() {
-            $session.diagnostic().struct_dummy()
-        } else {
-            rustc_errors::struct_span_err!($session, $span, $code, $($message)*)
+            err.downgrade_to_delayed_bug();
         }
+
+        err
     })
 }
 
@@ -341,6 +343,7 @@ fn diagnostic_only_typeck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> &ty::T
     typeck_with_fallback(tcx, def_id, fallback)
 }
 
+#[instrument(skip(tcx, fallback))]
 fn typeck_with_fallback<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
@@ -391,7 +394,6 @@ fn typeck_with_fallback<'tcx>(
             let mut wf_tys = FxHashSet::default();
             // Compute the fty from point of view of inside the fn.
             let fn_sig = tcx.liberate_late_bound_regions(def_id.to_def_id(), fn_sig);
-            wf_tys.extend(fn_sig.inputs_and_output.iter());
             let fn_sig = inh.normalize_associated_types_in(
                 body.value.span,
                 body_id.hir_id,
@@ -509,22 +511,18 @@ struct GeneratorTypes<'tcx> {
 
 /// Given a `DefId` for an opaque type in return position, find its parent item's return
 /// expressions.
-fn get_owner_return_paths(
+fn get_owner_return_paths<'tcx>(
     tcx: TyCtxt<'tcx>,
     def_id: LocalDefId,
-) -> Option<(hir::HirId, ReturnsVisitor<'tcx>)> {
+) -> Option<(LocalDefId, ReturnsVisitor<'tcx>)> {
     let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
-    let id = tcx.hir().get_parent_item(hir_id);
-    tcx.hir()
-        .find(id)
-        .map(|n| (id, n))
-        .and_then(|(hir_id, node)| node.body_id().map(|b| (hir_id, b)))
-        .map(|(hir_id, body_id)| {
-            let body = tcx.hir().body(body_id);
-            let mut visitor = ReturnsVisitor::default();
-            visitor.visit_body(body);
-            (hir_id, visitor)
-        })
+    let parent_id = tcx.hir().get_parent_item(hir_id);
+    tcx.hir().find_by_def_id(parent_id).and_then(|node| node.body_id()).map(|body_id| {
+        let body = tcx.hir().body(body_id);
+        let mut visitor = ReturnsVisitor::default();
+        visitor.visit_body(body);
+        (parent_id, visitor)
+    })
 }
 
 // Forbid defining intrinsics in Rust code,
@@ -556,7 +554,7 @@ fn maybe_check_static_with_link_section(tcx: TyCtxt<'_>, id: LocalDefId, span: S
     // the consumer's responsibility to ensure all bytes that have been read
     // have defined values.
     if let Ok(alloc) = tcx.eval_static_initializer(id.to_def_id()) {
-        if alloc.relocations().len() != 0 {
+        if alloc.inner().relocations().len() != 0 {
             let msg = "statics with a custom `#[link_section]` must be a \
                            simple list of bytes on the wasm target with no \
                            extra levels of indirection such as references";
@@ -567,7 +565,7 @@ fn maybe_check_static_with_link_section(tcx: TyCtxt<'_>, id: LocalDefId, span: S
 
 fn report_forbidden_specialization(
     tcx: TyCtxt<'_>,
-    impl_item: &hir::ImplItem<'_>,
+    impl_item: &hir::ImplItemRef,
     parent_impl: DefId,
 ) {
     let mut err = struct_span_err!(
@@ -599,12 +597,12 @@ fn report_forbidden_specialization(
 fn missing_items_err(
     tcx: TyCtxt<'_>,
     impl_span: Span,
-    missing_items: &[ty::AssocItem],
+    missing_items: &[&ty::AssocItem],
     full_impl_span: Span,
 ) {
     let missing_items_msg = missing_items
         .iter()
-        .map(|trait_item| trait_item.ident.to_string())
+        .map(|trait_item| trait_item.name.to_string())
         .collect::<Vec<_>>()
         .join("`, `");
 
@@ -633,7 +631,7 @@ fn missing_items_err(
         let msg = format!("implement the missing item: `{}`", snippet);
         let appl = Applicability::HasPlaceholders;
         if let Some(span) = tcx.hir().span_if_local(trait_item.def_id) {
-            err.span_label(span, format!("`{}` from trait", trait_item.ident));
+            err.span_label(span, format!("`{}` from trait", trait_item.name));
             err.tool_only_span_suggestion(sugg_sp, &msg, code, appl);
         } else {
             err.span_suggestion_hidden(sugg_sp, &msg, code, appl);
@@ -642,7 +640,32 @@ fn missing_items_err(
     err.emit();
 }
 
-/// Resugar `ty::GenericPredicates` in a way suitable to be used in structured suggestions.
+fn missing_items_must_implement_one_of_err(
+    tcx: TyCtxt<'_>,
+    impl_span: Span,
+    missing_items: &[Ident],
+    annotation_span: Option<Span>,
+) {
+    let missing_items_msg =
+        missing_items.iter().map(Ident::to_string).collect::<Vec<_>>().join("`, `");
+
+    let mut err = struct_span_err!(
+        tcx.sess,
+        impl_span,
+        E0046,
+        "not all trait items implemented, missing one of: `{}`",
+        missing_items_msg
+    );
+    err.span_label(impl_span, format!("missing one of `{}` in implementation", missing_items_msg));
+
+    if let Some(annotation_span) = annotation_span {
+        err.span_note(annotation_span, "required because of this annotation");
+    }
+
+    err.emit();
+}
+
+/// Re-sugar `ty::GenericPredicates` in a way suitable to be used in structured suggestions.
 fn bounds_from_generic_predicates<'tcx>(
     tcx: TyCtxt<'tcx>,
     predicates: ty::GenericPredicates<'tcx>,
@@ -687,9 +710,8 @@ fn bounds_from_generic_predicates<'tcx>(
     };
     let mut where_clauses = vec![];
     for (ty, bounds) in types {
-        for bound in &bounds {
-            where_clauses.push(format!("{}: {}", ty, tcx.def_path_str(*bound)));
-        }
+        where_clauses
+            .extend(bounds.into_iter().map(|bound| format!("{}: {}", ty, tcx.def_path_str(bound))));
     }
     for projection in &projections {
         let p = projection.skip_binder();
@@ -697,7 +719,11 @@ fn bounds_from_generic_predicates<'tcx>(
         // insert the associated types where they correspond, but for now let's be "lazy" and
         // propose this instead of the following valid resugaring:
         // `T: Trait, Trait::Assoc = K` → `T: Trait<Assoc = K>`
-        where_clauses.push(format!("{} = {}", tcx.def_path_str(p.projection_ty.item_def_id), p.ty));
+        where_clauses.push(format!(
+            "{} = {}",
+            tcx.def_path_str(p.projection_ty.item_def_id),
+            p.term,
+        ));
     }
     let where_clauses = if where_clauses.is_empty() {
         String::new()
@@ -782,28 +808,28 @@ fn suggestion_signature(assoc: &ty::AssocItem, tcx: TyCtxt<'_>) -> String {
             fn_sig_suggestion(
                 tcx,
                 tcx.fn_sig(assoc.def_id).skip_binder(),
-                assoc.ident,
+                assoc.ident(tcx),
                 tcx.predicates_of(assoc.def_id),
                 assoc,
             )
         }
-        ty::AssocKind::Type => format!("type {} = Type;", assoc.ident),
+        ty::AssocKind::Type => format!("type {} = Type;", assoc.name),
         ty::AssocKind::Const => {
             let ty = tcx.type_of(assoc.def_id);
             let val = expr::ty_kind_suggestion(ty).unwrap_or("value");
-            format!("const {}: {} = {};", assoc.ident, ty, val)
+            format!("const {}: {} = {};", assoc.name, ty, val)
         }
     }
 }
 
 /// Emit an error when encountering two or more variants in a transparent enum.
-fn bad_variant_count<'tcx>(tcx: TyCtxt<'tcx>, adt: &'tcx ty::AdtDef, sp: Span, did: DefId) {
+fn bad_variant_count<'tcx>(tcx: TyCtxt<'tcx>, adt: ty::AdtDef<'tcx>, sp: Span, did: DefId) {
     let variant_spans: Vec<_> = adt
-        .variants
+        .variants()
         .iter()
         .map(|variant| tcx.hir().span_if_local(variant.def_id).unwrap())
         .collect();
-    let msg = format!("needs exactly one variant, but has {}", adt.variants.len(),);
+    let msg = format!("needs exactly one variant, but has {}", adt.variants().len(),);
     let mut err = struct_span_err!(tcx.sess, sp, E0731, "transparent enum {}", msg);
     err.span_label(sp, &msg);
     if let [start @ .., end] = &*variant_spans {
@@ -819,7 +845,7 @@ fn bad_variant_count<'tcx>(tcx: TyCtxt<'tcx>, adt: &'tcx ty::AdtDef, sp: Span, d
 /// enum.
 fn bad_non_zero_sized_fields<'tcx>(
     tcx: TyCtxt<'tcx>,
-    adt: &'tcx ty::AdtDef,
+    adt: ty::AdtDef<'tcx>,
     field_count: usize,
     field_spans: impl Iterator<Item = Span>,
     sp: Span,
@@ -908,7 +934,7 @@ struct CheckItemTypesVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
 }
 
-impl ItemLikeVisitor<'tcx> for CheckItemTypesVisitor<'tcx> {
+impl<'tcx> ItemLikeVisitor<'tcx> for CheckItemTypesVisitor<'tcx> {
     fn visit_item(&mut self, i: &'tcx hir::Item<'tcx>) {
         check_item_type(self.tcx, i);
     }

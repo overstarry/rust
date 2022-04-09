@@ -4,11 +4,11 @@
 // @has - '//h2[@id="fields"]' 'Tuple Fields'
 // @has - '//h3[@class="sidebar-title"]/a[@href="#fields"]' 'Tuple Fields'
 // @has - '//*[@id="structfield.0"]' '0: u32'
-// @has - '//*[@id="main"]/div[@class="docblock"]' 'hello'
+// @has - '//*[@id="main-content"]/div[@class="docblock"]' 'hello'
 // @!has - '//*[@id="structfield.1"]'
 // @has - '//*[@id="structfield.2"]' '2: char'
 // @has - '//*[@id="structfield.3"]' '3: i8'
-// @has - '//*[@id="main"]/div[@class="docblock"]' 'not hello'
+// @has - '//*[@id="main-content"]/div[@class="docblock"]' 'not hello'
 pub struct Foo(
     /// hello
     pub u32,
@@ -24,6 +24,9 @@ pub struct Foo(
 // @has - '//*[@id="variant.BarVariant.field.0"]' '0: String'
 // @has - '//*[@id="variant.BarVariant.fields"]//*[@class="docblock"]' 'Hello docs'
 // @matches - '//*[@id="variant.FooVariant.fields"]/h4' '^Fields$'
+// @has - '//*[@id="variant.BazVariant.fields"]//*[@class="docblock"]' 'dox'
+// @has - '//*[@id="variant.OtherVariant.fields"]//*[@class="docblock"]' 'dox'
+// @!matches - '//*[@id="variant.QuuxVariant.fields"]/h4' '^Tuple Fields$'
 pub enum Bar {
     BarVariant(
         /// Hello docs
@@ -33,4 +36,15 @@ pub enum Bar {
        /// hello
        x: u32,
     },
+    BazVariant(
+        String,
+        /// dox
+        u32,
+    ),
+    OtherVariant(
+        /// dox
+        String,
+        u32,
+    ),
+    QuuxVariant(String),
 }

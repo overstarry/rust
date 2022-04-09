@@ -33,6 +33,7 @@
 #![feature(derive_default_enum)]
 #![feature(discriminant_kind)]
 #![feature(exhaustive_patterns)]
+#![feature(get_mut_unchecked)]
 #![feature(if_let_guard)]
 #![feature(map_first_last)]
 #![feature(never_type)]
@@ -40,23 +41,26 @@
 #![feature(new_uninit)]
 #![feature(nll)]
 #![feature(once_cell)]
+#![feature(let_chains)]
 #![feature(let_else)]
 #![feature(min_specialization)]
 #![feature(trusted_len)]
-#![feature(in_band_lifetimes)]
+#![feature(type_alias_impl_trait)]
 #![feature(crate_visibility_modifier)]
 #![feature(associated_type_bounds)]
 #![feature(rustc_attrs)]
 #![feature(half_open_range_patterns)]
 #![feature(control_flow_enum)]
 #![feature(associated_type_defaults)]
-#![feature(iter_zip)]
-#![feature(thread_local_const_init)]
 #![feature(trusted_step)]
 #![feature(try_blocks)]
 #![feature(try_reserve_kind)]
 #![feature(nonzero_ops)]
+#![feature(unwrap_infallible)]
+#![feature(decl_macro)]
+#![feature(drain_filter)]
 #![recursion_limit = "512"]
+#![allow(rustc::potential_query_instability)]
 
 #[macro_use]
 extern crate bitflags;
@@ -85,6 +89,7 @@ pub mod dep_graph;
 pub mod hir;
 pub mod infer;
 pub mod lint;
+pub mod metadata;
 pub mod middle;
 pub mod mir;
 pub mod thir;

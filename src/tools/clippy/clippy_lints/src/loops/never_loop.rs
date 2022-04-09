@@ -10,8 +10,8 @@ use rustc_span::Span;
 use std::iter::{once, Iterator};
 
 pub(super) fn check(
-    cx: &LateContext<'tcx>,
-    block: &'tcx Block<'_>,
+    cx: &LateContext<'_>,
+    block: &Block<'_>,
     loop_id: HirId,
     span: Span,
     for_loop: Option<&ForLoop<'_>>,
@@ -92,9 +92,7 @@ fn combine_branches(b1: NeverLoopResult, b2: NeverLoopResult) -> NeverLoopResult
 }
 
 fn never_loop_block(block: &Block<'_>, main_loop_id: HirId) -> NeverLoopResult {
-    let stmts = block.stmts.iter().map(stmt_to_expr);
-    let expr = once(block.expr);
-    let mut iter = stmts.chain(expr).flatten();
+    let mut iter = block.stmts.iter().filter_map(stmt_to_expr).chain(block.expr);
     never_loop_expr_seq(&mut iter, main_loop_id)
 }
 
@@ -117,13 +115,13 @@ fn never_loop_expr(expr: &Expr<'_>, main_loop_id: HirId) -> NeverLoopResult {
         | ExprKind::Unary(_, e)
         | ExprKind::Cast(e, _)
         | ExprKind::Type(e, _)
-        | ExprKind::Let(_, e, _)
         | ExprKind::Field(e, _)
         | ExprKind::AddrOf(_, _, e)
         | ExprKind::Struct(_, _, Some(e))
         | ExprKind::Repeat(e, _)
         | ExprKind::DropTemps(e) => never_loop_expr(e, main_loop_id),
-        ExprKind::Array(es) | ExprKind::MethodCall(_, _, es, _) | ExprKind::Tup(es) => {
+        ExprKind::Let(let_expr) => never_loop_expr(let_expr.init, main_loop_id),
+        ExprKind::Array(es) | ExprKind::MethodCall(_, es, _) | ExprKind::Tup(es) => {
             never_loop_expr_all(&mut es.iter(), main_loop_id)
         },
         ExprKind::Call(e, es) => never_loop_expr_all(&mut once(e).chain(es.iter()), main_loop_id),
@@ -183,7 +181,6 @@ fn never_loop_expr(expr: &Expr<'_>, main_loop_id: HirId) -> NeverLoopResult {
         ExprKind::Struct(_, _, None)
         | ExprKind::Yield(_, _)
         | ExprKind::Closure(_, _, _, _, _)
-        | ExprKind::LlvmInlineAsm(_)
         | ExprKind::Path(_)
         | ExprKind::ConstBlock(_)
         | ExprKind::Lit(_)

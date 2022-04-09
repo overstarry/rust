@@ -1,6 +1,7 @@
 //! A solver for dataflow problems.
 
-use std::borrow::BorrowMut;
+use crate::framework::BitSetExt;
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -31,12 +32,15 @@ where
     pub(super) entry_sets: IndexVec<BasicBlock, A::Domain>,
 }
 
-impl<A> Results<'tcx, A>
+impl<'tcx, A> Results<'tcx, A>
 where
     A: Analysis<'tcx>,
 {
     /// Creates a `ResultsCursor` that can inspect these `Results`.
-    pub fn into_results_cursor(self, body: &'mir mir::Body<'tcx>) -> ResultsCursor<'mir, 'tcx, A> {
+    pub fn into_results_cursor<'mir>(
+        self,
+        body: &'mir mir::Body<'tcx>,
+    ) -> ResultsCursor<'mir, 'tcx, A> {
         ResultsCursor::new(body, self)
     }
 
@@ -45,7 +49,7 @@ where
         &self.entry_sets[block]
     }
 
-    pub fn visit_with(
+    pub fn visit_with<'mir>(
         &self,
         body: &'mir mir::Body<'tcx>,
         blocks: impl IntoIterator<Item = BasicBlock>,
@@ -54,7 +58,7 @@ where
         visit_results(body, blocks, self, vis)
     }
 
-    pub fn visit_reachable_with(
+    pub fn visit_reachable_with<'mir>(
         &self,
         body: &'mir mir::Body<'tcx>,
         vis: &mut impl ResultsVisitor<'mir, 'tcx, FlowState = A::Domain>,
@@ -85,10 +89,10 @@ where
     apply_trans_for_block: Option<Box<dyn Fn(BasicBlock, &mut A::Domain)>>,
 }
 
-impl<A, D, T> Engine<'a, 'tcx, A>
+impl<'a, 'tcx, A, D, T> Engine<'a, 'tcx, A>
 where
     A: GenKillAnalysis<'tcx, Idx = T, Domain = D>,
-    D: Clone + JoinSemiLattice + GenKill<T> + BorrowMut<BitSet<T>>,
+    D: Clone + JoinSemiLattice + GenKill<T> + BitSetExt<T>,
     T: Idx,
 {
     /// Creates a new `Engine` to solve a gen-kill dataflow problem.
@@ -103,7 +107,7 @@ where
 
         // Otherwise, compute and store the cumulative transfer function for each block.
 
-        let identity = GenKillSet::identity(analysis.bottom_value(body).borrow().domain_size());
+        let identity = GenKillSet::identity(analysis.bottom_value(body).domain_size());
         let mut trans_for_block = IndexVec::from_elem(identity, body.basic_blocks());
 
         for (block, block_data) in body.basic_blocks().iter_enumerated() {
@@ -112,14 +116,14 @@ where
         }
 
         let apply_trans = Box::new(move |bb: BasicBlock, state: &mut A::Domain| {
-            trans_for_block[bb].apply(state.borrow_mut());
+            trans_for_block[bb].apply(state);
         });
 
         Self::new(tcx, body, analysis, Some(apply_trans as Box<_>))
     }
 }
 
-impl<A, D> Engine<'a, 'tcx, A>
+impl<'a, 'tcx, A, D> Engine<'a, 'tcx, A>
 where
     A: Analysis<'tcx, Domain = D>,
     D: Clone + JoinSemiLattice,
@@ -257,7 +261,7 @@ where
 
 /// Writes a DOT file containing the results of a dataflow analysis if the user requested it via
 /// `rustc_mir` attributes.
-fn write_graphviz_results<A>(
+fn write_graphviz_results<'tcx, A>(
     tcx: TyCtxt<'tcx>,
     body: &mir::Body<'tcx>,
     results: &Results<'tcx, A>,
@@ -271,11 +275,9 @@ where
     use std::io::{self, Write};
 
     let def_id = body.source.def_id();
-    let attrs = match RustcMirAttrs::parse(tcx, def_id) {
-        Ok(attrs) => attrs,
-
+    let Ok(attrs) = RustcMirAttrs::parse(tcx, def_id) else {
         // Invalid `rustc_mir` attrs are reported in `RustcMirAttrs::parse`
-        Err(()) => return Ok(()),
+        return Ok(());
     };
 
     let mut file = match attrs.output_path(A::NAME) {
@@ -330,7 +332,7 @@ struct RustcMirAttrs {
 }
 
 impl RustcMirAttrs {
-    fn parse(tcx: TyCtxt<'tcx>, def_id: DefId) -> Result<Self, ()> {
+    fn parse(tcx: TyCtxt<'_>, def_id: DefId) -> Result<Self, ()> {
         let attrs = tcx.get_attrs(def_id);
 
         let mut result = Ok(());
@@ -373,7 +375,7 @@ impl RustcMirAttrs {
 
     fn set_field<T>(
         field: &mut Option<T>,
-        tcx: TyCtxt<'tcx>,
+        tcx: TyCtxt<'_>,
         attr: &ast::NestedMetaItem,
         mapper: impl FnOnce(Symbol) -> Result<T, ()>,
     ) -> Result<(), ()> {

@@ -56,6 +56,12 @@ const ANNOTATIONS_TO_IGNORE: &[&str] = &[
     "// normalize-stderr-test",
 ];
 
+// Intentionally written in decimal rather than hex
+const PROBLEMATIC_CONSTS: &[u32] = &[
+    184594741, 2880289470, 2881141438, 2965027518, 2976579765, 3203381950, 3405691582, 3405697037,
+    3735927486, 4027431614, 4276992702,
+];
+
 /// Parser states for `line_is_url`.
 #[derive(Clone, Copy, PartialEq)]
 #[allow(non_camel_case_types)]
@@ -147,9 +153,9 @@ fn contains_ignore_directive(can_contain: bool, contents: &str, check: &str) -> 
         return Directive::Deny;
     }
     // Update `can_contain` when changing this
-    if contents.contains(&format!("// ignore-tidy-{}", check))
-        || contents.contains(&format!("# ignore-tidy-{}", check))
-        || contents.contains(&format!("/* ignore-tidy-{} */", check))
+    if contents.contains(&format!("// ignore-tidy-{check}"))
+        || contents.contains(&format!("# ignore-tidy-{check}"))
+        || contents.contains(&format!("/* ignore-tidy-{check} */"))
     {
         Directive::Ignore(false)
     } else {
@@ -217,6 +223,10 @@ pub fn check(path: &Path, bad: &mut bool) {
     fn skip(path: &Path) -> bool {
         super::filter_dirs(path) || skip_markdown_path(path)
     }
+    let problematic_consts_strings: Vec<String> = (PROBLEMATIC_CONSTS.iter().map(u32::to_string))
+        .chain(PROBLEMATIC_CONSTS.iter().map(|v| format!("{:x}", v)))
+        .chain(PROBLEMATIC_CONSTS.iter().map(|v| format!("{:X}", v)))
+        .collect();
     super::walk(path, &mut skip, &mut |entry, contents| {
         let file = entry.path();
         let filename = file.file_name().unwrap().to_string_lossy();
@@ -284,7 +294,7 @@ pub fn check(path: &Path, bad: &mut bool) {
                 suppressible_tidy_err!(
                     err,
                     skip_line_length,
-                    &format!("line longer than {} chars", max_columns)
+                    &format!("line longer than {max_columns} chars")
                 );
             }
             if !is_style_file && line.contains('\t') {
@@ -305,6 +315,11 @@ pub fn check(path: &Path, bad: &mut bool) {
                 }
                 if line.contains("//") && line.contains(" XXX") {
                     err("XXX is deprecated; use FIXME")
+                }
+                for s in problematic_consts_strings.iter() {
+                    if line.contains(s) {
+                        err("Don't use magic numbers that spell things (consider 0x12345678)");
+                    }
                 }
             }
             let is_test = || file.components().any(|c| c.as_os_str() == "tests");
@@ -366,7 +381,7 @@ pub fn check(path: &Path, bad: &mut bool) {
             n => suppressible_tidy_err!(
                 err,
                 skip_trailing_newlines,
-                &format!("too many trailing newlines ({})", n)
+                &format!("too many trailing newlines ({n})")
             ),
         };
         if lines > LINES {
@@ -380,6 +395,9 @@ pub fn check(path: &Path, bad: &mut bool) {
                 );
             };
             suppressible_tidy_err!(err, skip_file_length, "");
+        } else if lines > (LINES * 7) / 10 {
+            // Just set it to something that doesn't trigger the "unnecessarily ignored" warning.
+            skip_file_length = Directive::Ignore(true);
         }
 
         if let Directive::Ignore(false) = skip_cr {

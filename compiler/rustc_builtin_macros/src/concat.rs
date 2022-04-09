@@ -10,9 +10,8 @@ pub fn expand_concat(
     sp: rustc_span::Span,
     tts: TokenStream,
 ) -> Box<dyn base::MacResult + 'static> {
-    let es = match base::get_exprs_from_tts(cx, sp, tts) {
-        Some(e) => e,
-        None => return DummyResult::any(sp),
+    let Some(es) = base::get_exprs_from_tts(cx, sp, tts) else {
+        return DummyResult::any(sp);
     };
     let mut accumulator = String::new();
     let mut missing_literal = vec![];
@@ -21,7 +20,7 @@ pub fn expand_concat(
         match e.kind {
             ast::ExprKind::Lit(ref lit) => match lit.kind {
                 ast::LitKind::Str(ref s, _) | ast::LitKind::Float(ref s, _) => {
-                    accumulator.push_str(&s.as_str());
+                    accumulator.push_str(s.as_str());
                 }
                 ast::LitKind::Char(c) => {
                     accumulator.push(c);

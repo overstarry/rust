@@ -25,17 +25,20 @@
 //!
 //! This API is completely unstable and subject to change.
 
+#![allow(rustc::potential_query_instability)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(array_windows)]
 #![feature(bool_to_option)]
 #![feature(box_patterns)]
+#![feature(control_flow_enum)]
 #![feature(crate_visibility_modifier)]
-#![cfg_attr(bootstrap, feature(format_args_capture))]
+#![feature(if_let_guard)]
+#![feature(iter_intersperse)]
 #![feature(iter_order_by)]
-#![feature(iter_zip)]
+#![feature(let_chains)]
+#![feature(let_else)]
 #![feature(never_type)]
 #![feature(nll)]
-#![feature(control_flow_enum)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -48,6 +51,7 @@ pub mod builtin;
 mod context;
 mod early;
 mod enum_intrinsics_non_enums;
+mod expect;
 pub mod hidden_unicode_codepoints;
 mod internal;
 mod late;
@@ -57,6 +61,7 @@ mod non_ascii_idents;
 mod non_fmt_panic;
 mod nonstandard_style;
 mod noop_method_call;
+mod pass_by_value;
 mod passes;
 mod redundant_semicolon;
 mod traits;
@@ -86,6 +91,7 @@ use non_ascii_idents::*;
 use non_fmt_panic::NonPanicFmt;
 use nonstandard_style::*;
 use noop_method_call::*;
+use pass_by_value::*;
 use redundant_semicolon::*;
 use traits::*;
 use types::*;
@@ -93,8 +99,9 @@ use unused::*;
 
 /// Useful for other parts of the compiler / Clippy.
 pub use builtin::SoftLints;
-pub use context::{CheckLintNameResult, EarlyContext, LateContext, LintContext, LintStore};
-pub use early::check_ast_crate;
+pub use context::{CheckLintNameResult, FindLintError, LintStore};
+pub use context::{EarlyContext, LateContext, LintContext};
+pub use early::{check_ast_node, EarlyCheckNode};
 pub use late::check_crate;
 pub use passes::{EarlyLintPass, LateLintPass};
 pub use rustc_session::lint::Level::{self, *};
@@ -479,6 +486,11 @@ fn register_builtins(store: &mut LintStore, no_interleave_lints: bool) {
          <https://github.com/rust-lang/rust/issues/59014> for more information",
     );
     store.register_removed("plugin_as_library", "plugins have been deprecated and retired");
+    store.register_removed(
+        "unsupported_naked_functions",
+        "converted into hard error, see RFC 2972 \
+         <https://github.com/rust-lang/rfcs/blob/master/text/2972-constrained-naked.md> for more information",
+    );
 }
 
 fn register_internals(store: &mut LintStore) {
@@ -486,19 +498,24 @@ fn register_internals(store: &mut LintStore) {
     store.register_early_pass(|| Box::new(LintPassImpl));
     store.register_lints(&DefaultHashTypes::get_lints());
     store.register_late_pass(|| Box::new(DefaultHashTypes));
+    store.register_lints(&QueryStability::get_lints());
+    store.register_late_pass(|| Box::new(QueryStability));
     store.register_lints(&ExistingDocKeyword::get_lints());
     store.register_late_pass(|| Box::new(ExistingDocKeyword));
     store.register_lints(&TyTyKind::get_lints());
     store.register_late_pass(|| Box::new(TyTyKind));
+    store.register_lints(&PassByValue::get_lints());
+    store.register_late_pass(|| Box::new(PassByValue));
     store.register_group(
         false,
         "rustc::internal",
         None,
         vec![
             LintId::of(DEFAULT_HASH_TYPES),
+            LintId::of(POTENTIAL_QUERY_INSTABILITY),
             LintId::of(USAGE_OF_TY_TYKIND),
+            LintId::of(PASS_BY_VALUE),
             LintId::of(LINT_PASS_IMPL_WITHOUT_MACRO),
-            LintId::of(TY_PASS_BY_REFERENCE),
             LintId::of(USAGE_OF_QUALIFIED_TY),
             LintId::of(EXISTING_DOC_KEYWORD),
         ],

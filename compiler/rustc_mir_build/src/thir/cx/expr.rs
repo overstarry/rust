@@ -8,14 +8,15 @@ use rustc_middle::hir::place::Place as HirPlace;
 use rustc_middle::hir::place::PlaceBase as HirPlaceBase;
 use rustc_middle::hir::place::ProjectionKind as HirProjectionKind;
 use rustc_middle::middle::region;
-use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::{BinOp, BorrowKind, Field, UnOp};
 use rustc_middle::thir::*;
 use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AutoBorrow, AutoBorrowMutability, PointerCast,
 };
 use rustc_middle::ty::subst::{InternalSubsts, SubstsRef};
-use rustc_middle::ty::{self, AdtKind, Ty, UpvarSubsts, UserType};
+use rustc_middle::ty::{
+    self, AdtKind, InlineConstSubsts, InlineConstSubstsParts, ScalarInt, Ty, UpvarSubsts, UserType,
+};
 use rustc_span::def_id::DefId;
 use rustc_span::Span;
 use rustc_target::abi::VariantIdx;
@@ -163,9 +164,9 @@ impl<'tcx> Cx<'tcx> {
 
         let kind = match expr.kind {
             // Here comes the interesting stuff:
-            hir::ExprKind::MethodCall(_, method_span, ref args, fn_span) => {
+            hir::ExprKind::MethodCall(segment, ref args, fn_span) => {
                 // Rewrite a.b(c) into UFCS form like Trait::b(a, c)
-                let expr = self.method_callee(expr, method_span, None);
+                let expr = self.method_callee(expr, segment.ident.span, None);
                 // When we apply adjustments to the receiver, use the span of
                 // the overall method call for better diagnostics. args[0]
                 // is guaranteed to exist, since a method call always has a receiver.
@@ -229,7 +230,7 @@ impl<'tcx> Cx<'tcx> {
                         let user_ty =
                             user_provided_types.get(fun.hir_id).copied().map(|mut u_ty| {
                                 if let UserType::TypeOf(ref mut did, _) = &mut u_ty.value {
-                                    *did = adt_def.did;
+                                    *did = adt_def.did();
                                 }
                                 u_ty
                             });
@@ -291,11 +292,7 @@ impl<'tcx> Cx<'tcx> {
                 }
             }
 
-            hir::ExprKind::Lit(ref lit) => ExprKind::Literal {
-                literal: self.const_eval_literal(&lit.node, expr_ty, lit.span, false),
-                user_ty: None,
-                const_id: None,
-            },
+            hir::ExprKind::Lit(ref lit) => ExprKind::Literal { lit, neg: false },
 
             hir::ExprKind::Binary(op, ref lhs, ref rhs) => {
                 if self.typeck_results().is_method_call(expr) {
@@ -315,7 +312,6 @@ impl<'tcx> Cx<'tcx> {
                             lhs: self.mirror_expr(lhs),
                             rhs: self.mirror_expr(rhs),
                         },
-
                         _ => {
                             let op = bin_op(op.node);
                             ExprKind::Binary {
@@ -361,11 +357,7 @@ impl<'tcx> Cx<'tcx> {
                     let arg = self.mirror_expr(arg);
                     self.overloaded_operator(expr, Box::new([arg]))
                 } else if let hir::ExprKind::Lit(ref lit) = arg.kind {
-                    ExprKind::Literal {
-                        literal: self.const_eval_literal(&lit.node, expr_ty, lit.span, true),
-                        user_ty: None,
-                        const_id: None,
-                    }
+                    ExprKind::Literal { lit, neg: true }
                 } else {
                     ExprKind::Unary { op: UnOp::Neg, arg: self.mirror_expr(arg) }
                 }
@@ -378,7 +370,7 @@ impl<'tcx> Cx<'tcx> {
                         let user_ty = user_provided_types.get(expr.hir_id).copied();
                         debug!("make_mirror_unadjusted: (struct/union) user_ty={:?}", user_ty);
                         ExprKind::Adt(Box::new(Adt {
-                            adt_def: adt,
+                            adt_def: *adt,
                             variant_index: VariantIdx::new(0),
                             substs,
                             user_ty,
@@ -404,7 +396,7 @@ impl<'tcx> Cx<'tcx> {
                                 let user_ty = user_provided_types.get(expr.hir_id).copied();
                                 debug!("make_mirror_unadjusted: (variant) user_ty={:?}", user_ty);
                                 ExprKind::Adt(Box::new(Adt {
-                                    adt_def: adt,
+                                    adt_def: *adt,
                                     variant_index: index,
                                     substs,
                                     user_ty,
@@ -505,13 +497,12 @@ impl<'tcx> Cx<'tcx> {
                                 InlineAsmOperand::Const { value, span }
                             }
                             hir::InlineAsmOperand::Sym { ref expr } => {
-                                let qpath = match expr.kind {
-                                    hir::ExprKind::Path(ref qpath) => qpath,
-                                    _ => span_bug!(
+                                let hir::ExprKind::Path(ref qpath) = expr.kind else {
+                                    span_bug!(
                                         expr.span,
                                         "asm `sym` operand should be a path, found {:?}",
                                         expr.kind
-                                    ),
+                                    );
                                 };
                                 let temp_lifetime =
                                     self.region_scope_tree.temporary_scope(expr.hir_id.local_id);
@@ -527,16 +518,12 @@ impl<'tcx> Cx<'tcx> {
                                                 ty,
                                                 temp_lifetime,
                                                 span: expr.span,
-                                                kind: ExprKind::Literal {
-                                                    literal: ty::Const::zero_sized(self.tcx, ty),
-                                                    user_ty,
-                                                    const_id: None,
-                                                },
+                                                kind: ExprKind::zero_sized_literal(user_ty),
                                             }),
                                         }
                                     }
 
-                                    Res::Def(DefKind::Static, def_id) => {
+                                    Res::Def(DefKind::Static(_), def_id) => {
                                         InlineAsmOperand::SymStatic { def_id }
                                     }
 
@@ -553,11 +540,7 @@ impl<'tcx> Cx<'tcx> {
                                                 ty,
                                                 temp_lifetime,
                                                 span: expr.span,
-                                                kind: ExprKind::Literal {
-                                                    literal: ty::Const::zero_sized(self.tcx, ty),
-                                                    user_ty: None,
-                                                    const_id: None,
-                                                },
+                                                kind: ExprKind::zero_sized_literal(None),
                                             }),
                                         }
                                     }
@@ -570,24 +553,31 @@ impl<'tcx> Cx<'tcx> {
                 line_spans: asm.line_spans,
             },
 
-            hir::ExprKind::LlvmInlineAsm(ref asm) => ExprKind::LlvmInlineAsm {
-                asm: &asm.inner,
-                outputs: self.mirror_exprs(asm.outputs_exprs),
-                inputs: self.mirror_exprs(asm.inputs_exprs),
-            },
-
             hir::ExprKind::ConstBlock(ref anon_const) => {
-                let anon_const_def_id = self.tcx.hir().local_def_id(anon_const.hir_id);
-                let value = ty::Const::from_inline_const(self.tcx, anon_const_def_id);
+                let tcx = self.tcx;
+                let local_def_id = tcx.hir().local_def_id(anon_const.hir_id);
+                let anon_const_def_id = local_def_id.to_def_id();
 
-                ExprKind::ConstBlock { value }
+                // Need to include the parent substs
+                let hir_id = tcx.hir().local_def_id_to_hir_id(local_def_id);
+                let ty = tcx.typeck(local_def_id).node_type(hir_id);
+                let typeck_root_def_id = tcx.typeck_root_def_id(anon_const_def_id);
+                let parent_substs =
+                    tcx.erase_regions(InternalSubsts::identity_for_item(tcx, typeck_root_def_id));
+                let substs =
+                    InlineConstSubsts::new(tcx, InlineConstSubstsParts { parent_substs, ty })
+                        .substs;
+
+                ExprKind::ConstBlock { did: anon_const_def_id, substs }
             }
             // Now comes the rote stuff:
-            hir::ExprKind::Repeat(ref v, ref count) => {
-                let count_def_id = self.tcx.hir().local_def_id(count.hir_id);
-                let count = ty::Const::from_anon_const(self.tcx, count_def_id);
+            hir::ExprKind::Repeat(ref v, _) => {
+                let ty = self.typeck_results().expr_ty(expr);
+                let ty::Array(_, count) = ty.kind() else {
+                    span_bug!(expr.span, "unexpected repeat expr ty: {:?}", ty);
+                };
 
-                ExprKind::Repeat { value: self.mirror_expr(v), count }
+                ExprKind::Repeat { value: self.mirror_expr(v), count: *count }
             }
             hir::ExprKind::Ret(ref v) => {
                 ExprKind::Return { value: v.as_ref().map(|v| self.mirror_expr(v)) }
@@ -605,9 +595,10 @@ impl<'tcx> Cx<'tcx> {
                 },
                 Err(err) => bug!("invalid loop id for continue: {}", err),
             },
-            hir::ExprKind::Let(ref pat, ref expr, _) => {
-                ExprKind::Let { expr: self.mirror_expr(expr), pat: self.pattern_from_hir(pat) }
-            }
+            hir::ExprKind::Let(let_expr) => ExprKind::Let {
+                expr: self.mirror_expr(let_expr.init),
+                pat: self.pattern_from_hir(let_expr.pat),
+            },
             hir::ExprKind::If(cond, then, else_opt) => ExprKind::If {
                 if_then_scope: region::Scope {
                     id: then.hir_id.local_id,
@@ -683,7 +674,7 @@ impl<'tcx> Cx<'tcx> {
                                     let idx = adt_def.variant_index_with_ctor_id(variant_ctor_id);
                                     let (d, o) = adt_def.discriminant_def_for_variant(idx);
                                     use rustc_middle::ty::util::IntTypeExt;
-                                    let ty = adt_def.repr.discr_type();
+                                    let ty = adt_def.repr().discr_type();
                                     let ty = ty.to_ty(self.tcx());
                                     Some((d, o, ty))
                                 }
@@ -695,32 +686,36 @@ impl<'tcx> Cx<'tcx> {
                     };
 
                     let source = if let Some((did, offset, var_ty)) = var {
-                        let mk_const = |literal| Expr {
+                        let param_env_ty = self.param_env.and(var_ty);
+                        let size = self
+                            .tcx
+                            .layout_of(param_env_ty)
+                            .unwrap_or_else(|e| {
+                                panic!("could not compute layout for {:?}: {:?}", param_env_ty, e)
+                            })
+                            .size;
+                        let lit = ScalarInt::try_from_uint(offset as u128, size).unwrap();
+                        let kind = ExprKind::NonHirLiteral { lit, user_ty: None };
+                        let offset = self.thir.exprs.push(Expr {
                             temp_lifetime,
                             ty: var_ty,
                             span: expr.span,
-                            kind: ExprKind::Literal { literal, user_ty: None, const_id: None },
-                        };
-                        let offset = self.thir.exprs.push(mk_const(ty::Const::from_bits(
-                            self.tcx,
-                            offset as u128,
-                            self.param_env.and(var_ty),
-                        )));
+                            kind,
+                        });
                         match did {
                             Some(did) => {
                                 // in case we are offsetting from a computed discriminant
                                 // and not the beginning of discriminants (which is always `0`)
                                 let substs = InternalSubsts::identity_for_item(self.tcx(), did);
-                                let lhs = ty::Const {
-                                    val: ty::ConstKind::Unevaluated(ty::Unevaluated::new(
-                                        ty::WithOptConstParam::unknown(did),
-                                        substs,
-                                    )),
+                                let kind =
+                                    ExprKind::NamedConst { def_id: did, substs, user_ty: None };
+                                let lhs = self.thir.exprs.push(Expr {
+                                    temp_lifetime,
                                     ty: var_ty,
-                                };
-                                let lhs = self.thir.exprs.push(mk_const(self.tcx().mk_const(lhs)));
-                                let bin =
-                                    ExprKind::Binary { op: BinOp::Add, lhs: lhs, rhs: offset };
+                                    span: expr.span,
+                                    kind,
+                                });
+                                let bin = ExprKind::Binary { op: BinOp::Add, lhs, rhs: offset };
                                 self.thir.exprs.push(Expr {
                                     temp_lifetime,
                                     ty: var_ty,
@@ -835,16 +830,7 @@ impl<'tcx> Cx<'tcx> {
             }
         };
         let ty = self.tcx().mk_fn_def(def_id, substs);
-        Expr {
-            temp_lifetime,
-            ty,
-            span,
-            kind: ExprKind::Literal {
-                literal: ty::Const::zero_sized(self.tcx(), ty),
-                user_ty,
-                const_id: None,
-            },
-        }
+        Expr { temp_lifetime, ty, span, kind: ExprKind::zero_sized_literal(user_ty) }
     }
 
     fn convert_arm(&mut self, arm: &'tcx hir::Arm<'tcx>) -> ArmId {
@@ -871,17 +857,9 @@ impl<'tcx> Cx<'tcx> {
             Res::Def(DefKind::Fn, _)
             | Res::Def(DefKind::AssocFn, _)
             | Res::Def(DefKind::Ctor(_, CtorKind::Fn), _)
-            | Res::SelfCtor(..) => {
+            | Res::SelfCtor(_) => {
                 let user_ty = self.user_substs_applied_to_res(expr.hir_id, res);
-                debug!("convert_path_expr: user_ty={:?}", user_ty);
-                ExprKind::Literal {
-                    literal: ty::Const::zero_sized(
-                        self.tcx,
-                        self.typeck_results().node_type(expr.hir_id),
-                    ),
-                    user_ty,
-                    const_id: None,
-                }
+                ExprKind::zero_sized_literal(user_ty)
             }
 
             Res::Def(DefKind::ConstParam, def_id) => {
@@ -891,31 +869,14 @@ impl<'tcx> Cx<'tcx> {
                 let generics = self.tcx.generics_of(item_def_id);
                 let index = generics.param_def_id_to_index[&def_id];
                 let name = self.tcx.hir().name(hir_id);
-                let val = ty::ConstKind::Param(ty::ParamConst::new(index, name));
-                ExprKind::Literal {
-                    literal: self.tcx.mk_const(ty::Const {
-                        val,
-                        ty: self.typeck_results().node_type(expr.hir_id),
-                    }),
-                    user_ty: None,
-                    const_id: Some(def_id),
-                }
+                let param = ty::ParamConst::new(index, name);
+
+                ExprKind::ConstParam { param, def_id }
             }
 
             Res::Def(DefKind::Const, def_id) | Res::Def(DefKind::AssocConst, def_id) => {
                 let user_ty = self.user_substs_applied_to_res(expr.hir_id, res);
-                debug!("convert_path_expr: (const) user_ty={:?}", user_ty);
-                ExprKind::Literal {
-                    literal: self.tcx.mk_const(ty::Const {
-                        val: ty::ConstKind::Unevaluated(ty::Unevaluated::new(
-                            ty::WithOptConstParam::unknown(def_id),
-                            substs,
-                        )),
-                        ty: self.typeck_results().node_type(expr.hir_id),
-                    }),
-                    user_ty,
-                    const_id: Some(def_id),
-                }
+                ExprKind::NamedConst { def_id, substs, user_ty: user_ty }
             }
 
             Res::Def(DefKind::Ctor(_, CtorKind::Const), def_id) => {
@@ -927,7 +888,7 @@ impl<'tcx> Cx<'tcx> {
                     // A unit struct/variant which is used as a value.
                     // We return a completely different ExprKind here to account for this special case.
                     ty::Adt(adt_def, substs) => ExprKind::Adt(Box::new(Adt {
-                        adt_def,
+                        adt_def: *adt_def,
                         variant_index: adt_def.variant_index_with_ctor_id(def_id),
                         substs,
                         user_ty: user_provided_type,
@@ -940,21 +901,14 @@ impl<'tcx> Cx<'tcx> {
 
             // We encode uses of statics as a `*&STATIC` where the `&STATIC` part is
             // a constant reference (or constant raw pointer for `static mut`) in MIR
-            Res::Def(DefKind::Static, id) => {
+            Res::Def(DefKind::Static(_), id) => {
                 let ty = self.tcx.static_ptr_ty(id);
                 let temp_lifetime = self.region_scope_tree.temporary_scope(expr.hir_id.local_id);
                 let kind = if self.tcx.is_thread_local_static(id) {
                     ExprKind::ThreadLocalRef(id)
                 } else {
-                    let ptr = self.tcx.create_static_alloc(id);
-                    ExprKind::StaticRef {
-                        literal: ty::Const::from_scalar(
-                            self.tcx,
-                            Scalar::from_pointer(ptr.into(), &self.tcx),
-                            ty,
-                        ),
-                        def_id: id,
-                    }
+                    let alloc_id = self.tcx.create_static_alloc(id);
+                    ExprKind::StaticRef { alloc_id, ty, def_id: id }
                 };
                 ExprKind::Deref {
                     arg: self.thir.exprs.push(Expr { ty, temp_lifetime, span: expr.span, kind }),
@@ -1018,9 +972,8 @@ impl<'tcx> Cx<'tcx> {
         // Reconstruct the output assuming it's a reference with the
         // same region and mutability as the receiver. This holds for
         // `Deref(Mut)::Deref(_mut)` and `Index(Mut)::index(_mut)`.
-        let (region, mutbl) = match *self.thir[args[0]].ty.kind() {
-            ty::Ref(region, _, mutbl) => (region, mutbl),
-            _ => span_bug!(span, "overloaded_place: receiver is not a reference"),
+        let ty::Ref(region, _, mutbl) = *self.thir[args[0]].ty.kind() else {
+            span_bug!(span, "overloaded_place: receiver is not a reference");
         };
         let ref_ty = self.tcx.mk_ref(region, ty::TypeAndMut { ty: place_ty, mutbl });
 
@@ -1104,9 +1057,9 @@ impl<'tcx> Cx<'tcx> {
         let temp_lifetime = self.region_scope_tree.temporary_scope(closure_expr.hir_id.local_id);
 
         match upvar_capture {
-            ty::UpvarCapture::ByValue(_) => captured_place_expr,
+            ty::UpvarCapture::ByValue => captured_place_expr,
             ty::UpvarCapture::ByRef(upvar_borrow) => {
-                let borrow_kind = match upvar_borrow.kind {
+                let borrow_kind = match upvar_borrow {
                     ty::BorrowKind::ImmBorrow => BorrowKind::Shared,
                     ty::BorrowKind::UniqueImmBorrow => BorrowKind::Unique,
                     ty::BorrowKind::MutBorrow => BorrowKind::Mut { allow_two_phase_borrow: false },

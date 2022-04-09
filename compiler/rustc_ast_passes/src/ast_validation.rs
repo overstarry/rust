@@ -11,11 +11,13 @@ use rustc_ast::ptr::P;
 use rustc_ast::visit::{self, AssocCtxt, FnCtxt, FnKind, Visitor};
 use rustc_ast::walk_list;
 use rustc_ast::*;
-use rustc_ast_pretty::pprust;
+use rustc_ast_pretty::pprust::{self, State};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{error_code, pluralize, struct_span_err, Applicability};
 use rustc_parse::validate_attr;
-use rustc_session::lint::builtin::{MISSING_ABI, PATTERNS_IN_FNS_WITHOUT_BODY};
+use rustc_session::lint::builtin::{
+    DEPRECATED_WHERE_CLAUSE_LOCATION, MISSING_ABI, PATTERNS_IN_FNS_WITHOUT_BODY,
+};
 use rustc_session::lint::{BuiltinLintDiagnostics, LintBuffer};
 use rustc_session::Session;
 use rustc_span::source_map::Spanned;
@@ -23,7 +25,7 @@ use rustc_span::symbol::{kw, sym, Ident};
 use rustc_span::Span;
 use rustc_target::spec::abi;
 use std::mem;
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 
 const MORE_EXTERN: &str =
     "for more information, visit https://doc.rust-lang.org/std/keyword.extern.html";
@@ -62,8 +64,8 @@ struct AstValidator<'a> {
     /// certain positions.
     is_assoc_ty_bound_banned: bool,
 
-    /// Used to allow `let` expressions in certain syntactic locations.
-    is_let_allowed: bool,
+    /// See [ForbiddenLetReason]
+    forbidden_let_reason: Option<ForbiddenLetReason>,
 
     lint_buffer: &'a mut LintBuffer,
 }
@@ -101,24 +103,71 @@ impl<'a> AstValidator<'a> {
         self.is_tilde_const_allowed = old;
     }
 
-    fn with_let_allowed(&mut self, allowed: bool, f: impl FnOnce(&mut Self, bool)) {
-        let old = mem::replace(&mut self.is_let_allowed, allowed);
+    fn with_let_management(
+        &mut self,
+        forbidden_let_reason: Option<ForbiddenLetReason>,
+        f: impl FnOnce(&mut Self, Option<ForbiddenLetReason>),
+    ) {
+        let old = mem::replace(&mut self.forbidden_let_reason, forbidden_let_reason);
         f(self, old);
-        self.is_let_allowed = old;
+        self.forbidden_let_reason = old;
     }
 
     /// Emits an error banning the `let` expression provided in the given location.
-    fn ban_let_expr(&self, expr: &'a Expr) {
+    fn ban_let_expr(&self, expr: &'a Expr, forbidden_let_reason: ForbiddenLetReason) {
         let sess = &self.session;
         if sess.opts.unstable_features.is_nightly_build() {
-            sess.struct_span_err(expr.span, "`let` expressions are not supported here")
-                .note("only supported directly in conditions of `if`- and `while`-expressions")
-                .note("as well as when nested within `&&` and parentheses in those conditions")
-                .emit();
+            let err = "`let` expressions are not supported here";
+            let mut diag = sess.struct_span_err(expr.span, err);
+            diag.note("only supported directly in conditions of `if` and `while` expressions");
+            diag.note("as well as when nested within `&&` and parentheses in those conditions");
+            if let ForbiddenLetReason::ForbiddenWithOr(span) = forbidden_let_reason {
+                diag.span_note(
+                    span,
+                    "`||` operators are not currently supported in let chain expressions",
+                );
+            }
+            diag.emit();
         } else {
             sess.struct_span_err(expr.span, "expected expression, found statement (`let`)")
                 .note("variable declaration using `let` is a statement")
                 .emit();
+        }
+    }
+
+    fn check_gat_where(
+        &mut self,
+        id: NodeId,
+        before_predicates: &[WherePredicate],
+        where_clauses: (ast::TyAliasWhereClause, ast::TyAliasWhereClause),
+    ) {
+        if !before_predicates.is_empty() {
+            let mut state = State::new();
+            if !where_clauses.1.0 {
+                state.space();
+                state.word_space("where");
+            } else {
+                state.word_space(",");
+            }
+            let mut first = true;
+            for p in before_predicates.iter() {
+                if !first {
+                    state.word_space(",");
+                }
+                first = false;
+                state.print_where_predicate(p);
+            }
+            let suggestion = state.s.eof();
+            self.lint_buffer.buffer_lint_with_diagnostic(
+                DEPRECATED_WHERE_CLAUSE_LOCATION,
+                id,
+                where_clauses.0.1,
+                "where clause not allowed here",
+                BuiltinLintDiagnostics::DeprecatedWhereclauseLocation(
+                    where_clauses.1.1.shrink_to_hi(),
+                    suggestion,
+                ),
+            );
         }
     }
 
@@ -138,10 +187,10 @@ impl<'a> AstValidator<'a> {
         self.outer_impl_trait = old;
     }
 
-    fn visit_assoc_ty_constraint_from_generic_args(&mut self, constraint: &'a AssocTyConstraint) {
+    fn visit_assoc_constraint_from_generic_args(&mut self, constraint: &'a AssocConstraint) {
         match constraint.kind {
-            AssocTyConstraintKind::Equality { .. } => {}
-            AssocTyConstraintKind::Bound { .. } => {
+            AssocConstraintKind::Equality { .. } => {}
+            AssocConstraintKind::Bound { .. } => {
                 if self.is_assoc_ty_bound_banned {
                     self.err_handler().span_err(
                         constraint.span,
@@ -150,7 +199,7 @@ impl<'a> AstValidator<'a> {
                 }
             }
         }
-        self.visit_assoc_ty_constraint(constraint);
+        self.visit_assoc_constraint(constraint);
     }
 
     // Mirrors `visit::walk_ty`, but tracks relevant state.
@@ -302,34 +351,6 @@ impl<'a> AstValidator<'a> {
         }
     }
 
-    /// Matches `'-' lit | lit (cf. parser::Parser::parse_literal_maybe_minus)`,
-    /// or paths for ranges.
-    //
-    // FIXME: do we want to allow `expr -> pattern` conversion to create path expressions?
-    // That means making this work:
-    //
-    // ```rust,ignore (FIXME)
-    // struct S;
-    // macro_rules! m {
-    //     ($a:expr) => {
-    //         let $a = S;
-    //     }
-    // }
-    // m!(S);
-    // ```
-    fn check_expr_within_pat(&self, expr: &Expr, allow_paths: bool) {
-        match expr.kind {
-            ExprKind::Lit(..) | ExprKind::ConstBlock(..) | ExprKind::Err => {}
-            ExprKind::Path(..) if allow_paths => {}
-            ExprKind::Unary(UnOp::Neg, ref inner) if matches!(inner.kind, ExprKind::Lit(_)) => {}
-            _ => self.err_handler().span_err(
-                expr.span,
-                "arbitrary expressions aren't allowed \
-                                                         in patterns",
-            ),
-        }
-    }
-
     fn check_late_bound_lifetime_defs(&self, params: &[GenericParam]) {
         // Check only lifetime parameters are present and that the lifetime
         // parameters that are present have no bounds.
@@ -422,7 +443,7 @@ impl<'a> AstValidator<'a> {
                         attr.span,
                         "allow, cfg, cfg_attr, deny, \
                 forbid, and warn are the only allowed built-in attributes in function parameters",
-                    )
+                    );
                 }
             });
     }
@@ -453,10 +474,17 @@ impl<'a> AstValidator<'a> {
     }
 
     fn error_item_without_body(&self, sp: Span, ctx: &str, msg: &str, sugg: &str) {
+        let source_map = self.session.source_map();
+        let end = source_map.end_point(sp);
+        let replace_span = if source_map.span_to_snippet(end).map(|s| s == ";").unwrap_or(false) {
+            end
+        } else {
+            sp.shrink_to_hi()
+        };
         self.err_handler()
             .struct_span_err(sp, msg)
             .span_suggestion(
-                self.session.source_map().end_point(sp),
+                replace_span,
                 &format!("provide a definition for the {}", ctx),
                 sugg.to_string(),
                 Applicability::HasPlaceholders,
@@ -482,7 +510,7 @@ impl<'a> AstValidator<'a> {
             .emit();
     }
 
-    fn check_foreign_ty_genericless(&self, generics: &Generics) {
+    fn check_foreign_ty_genericless(&self, generics: &Generics, where_span: Span) {
         let cannot_have = |span, descr, remove_descr| {
             self.err_handler()
                 .struct_span_err(
@@ -505,14 +533,13 @@ impl<'a> AstValidator<'a> {
         }
 
         if !generics.where_clause.predicates.is_empty() {
-            cannot_have(generics.where_clause.span, "`where` clauses", "`where` clause");
+            cannot_have(where_span, "`where` clauses", "`where` clause");
         }
     }
 
     fn check_foreign_kind_bodyless(&self, ident: Ident, kind: &str, body: Option<Span>) {
-        let body = match body {
-            None => return,
-            Some(body) => body,
+        let Some(body) = body else {
+            return;
         };
         self.err_handler()
             .struct_span_err(ident.span, &format!("incorrect `{}` inside `extern` block", kind))
@@ -532,9 +559,8 @@ impl<'a> AstValidator<'a> {
 
     /// An `fn` in `extern { ... }` cannot have a body `{ ... }`.
     fn check_foreign_fn_bodyless(&self, ident: Ident, body: Option<&Block>) {
-        let body = match body {
-            None => return,
-            Some(body) => body,
+        let Some(body) = body else {
+            return;
         };
         self.err_handler()
             .struct_span_err(ident.span, "incorrect function inside `extern` block")
@@ -580,8 +606,7 @@ impl<'a> AstValidator<'a> {
 
     /// An item in `extern { ... }` cannot use non-ascii identifier.
     fn check_foreign_item_ascii_only(&self, ident: Ident) {
-        let symbol_str = ident.as_str();
-        if !symbol_str.is_ascii() {
+        if !ident.as_str().is_ascii() {
             let n = 83942;
             self.err_handler()
                 .struct_span_err(
@@ -597,9 +622,9 @@ impl<'a> AstValidator<'a> {
         }
     }
 
-    /// Reject C-varadic type unless the function is foreign,
+    /// Reject C-variadic type unless the function is foreign,
     /// or free and `unsafe extern "C"` semantically.
-    fn check_c_varadic_type(&self, fk: FnKind<'a>) {
+    fn check_c_variadic_type(&self, fk: FnKind<'a>) {
         match (fk.ctxt(), fk.header()) {
             (Some(FnCtxt::Foreign), _) => return,
             (Some(FnCtxt::Free), Some(header)) => match header.ext {
@@ -894,7 +919,6 @@ impl<'a> AstValidator<'a> {
 /// Checks that generic parameters are in the correct order,
 /// which is lifetimes, then types and then consts. (`<'a, T, const N: usize>`)
 fn validate_generic_param_order(
-    sess: &Session,
     handler: &rustc_errors::Handler,
     generics: &[GenericParam],
     span: Span,
@@ -911,8 +935,7 @@ fn validate_generic_param_order(
             GenericParamKind::Type { default: _ } => (ParamKindOrd::Type, ident.to_string()),
             GenericParamKind::Const { ref ty, kw_span: _, default: _ } => {
                 let ty = pprust::ty_to_string(ty);
-                let unordered = sess.features_untracked().unordered_const_ty_params();
-                (ParamKindOrd::Const { unordered }, format!("const {}: {}", ident, ty))
+                (ParamKindOrd::Const, format!("const {}: {}", ident, ty))
             }
         };
         param_idents.push((kind, ord_kind, bounds, idx, ident));
@@ -968,14 +991,7 @@ fn validate_generic_param_order(
             );
             err.span_suggestion(
                 span,
-                &format!(
-                    "reorder the parameters: lifetimes, {}",
-                    if sess.features_untracked().unordered_const_ty_params() {
-                        "then consts and types"
-                    } else {
-                        "then types, then consts"
-                    }
-                ),
+                "reorder the parameters: lifetimes, then consts and types",
                 ordered_params.clone(),
                 Applicability::MachineApplicable,
             );
@@ -990,48 +1006,48 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
     }
 
     fn visit_expr(&mut self, expr: &'a Expr) {
-        self.with_let_allowed(false, |this, let_allowed| match &expr.kind {
-            ExprKind::If(cond, then, opt_else) => {
-                this.visit_block(then);
-                walk_list!(this, visit_expr, opt_else);
-                this.with_let_allowed(true, |this, _| this.visit_expr(cond));
-                return;
-            }
-            ExprKind::Let(..) if !let_allowed => this.ban_let_expr(expr),
-            ExprKind::LlvmInlineAsm(..) if !this.session.target.allow_asm => {
-                struct_span_err!(
-                    this.session,
-                    expr.span,
-                    E0472,
-                    "llvm_asm! is unsupported on this target"
-                )
-                .emit();
-            }
-            ExprKind::Match(expr, arms) => {
-                this.visit_expr(expr);
-                for arm in arms {
-                    this.visit_expr(&arm.body);
-                    this.visit_pat(&arm.pat);
-                    walk_list!(this, visit_attribute, &arm.attrs);
-                    if let Some(ref guard) = arm.guard {
-                        if let ExprKind::Let(_, ref expr, _) = guard.kind {
-                            this.with_let_allowed(true, |this, _| this.visit_expr(expr));
+        self.with_let_management(Some(ForbiddenLetReason::GenericForbidden), |this, forbidden_let_reason| {
+            match &expr.kind {
+                ExprKind::Binary(Spanned { node: BinOpKind::Or, span }, lhs, rhs) => {
+                    let forbidden_let_reason = Some(ForbiddenLetReason::ForbiddenWithOr(*span));
+                    this.with_let_management(forbidden_let_reason, |this, _| this.visit_expr(lhs));
+                    this.with_let_management(forbidden_let_reason, |this, _| this.visit_expr(rhs));
+                }
+                ExprKind::If(cond, then, opt_else) => {
+                    this.visit_block(then);
+                    walk_list!(this, visit_expr, opt_else);
+                    this.with_let_management(None, |this, _| this.visit_expr(cond));
+                    return;
+                }
+                ExprKind::Let(..) if let Some(elem) = forbidden_let_reason => {
+                    this.ban_let_expr(expr, elem);
+                },
+                ExprKind::Match(scrutinee, arms) => {
+                    this.visit_expr(scrutinee);
+                    for arm in arms {
+                        this.visit_expr(&arm.body);
+                        this.visit_pat(&arm.pat);
+                        walk_list!(this, visit_attribute, &arm.attrs);
+                        if let Some(guard) = &arm.guard && let ExprKind::Let(_, guard_expr, _) = &guard.kind {
+                            this.with_let_management(None, |this, _| {
+                                this.visit_expr(guard_expr)
+                            });
                             return;
                         }
                     }
                 }
+                ExprKind::Paren(_) | ExprKind::Binary(Spanned { node: BinOpKind::And, .. }, ..) => {
+                    this.with_let_management(forbidden_let_reason, |this, _| visit::walk_expr(this, expr));
+                    return;
+                }
+                ExprKind::While(cond, then, opt_label) => {
+                    walk_list!(this, visit_label, opt_label);
+                    this.visit_block(then);
+                    this.with_let_management(None, |this, _| this.visit_expr(cond));
+                    return;
+                }
+                _ => visit::walk_expr(this, expr),
             }
-            ExprKind::Paren(_) | ExprKind::Binary(Spanned { node: BinOpKind::And, .. }, ..) => {
-                this.with_let_allowed(let_allowed, |this, _| visit::walk_expr(this, expr));
-                return;
-            }
-            ExprKind::While(cond, then, opt_label) => {
-                walk_list!(this, visit_label, opt_label);
-                this.visit_block(then);
-                this.with_let_allowed(true, |this, _| this.visit_expr(cond));
-                return;
-            }
-            _ => visit::walk_expr(this, expr),
         });
     }
 
@@ -1272,13 +1288,29 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 let msg = "free static item without body";
                 self.error_item_without_body(item.span, "static", msg, " = <expr>;");
             }
-            ItemKind::TyAlias(box TyAlias { defaultness, ref bounds, ref ty, .. }) => {
+            ItemKind::TyAlias(box TyAlias {
+                defaultness,
+                where_clauses,
+                ref bounds,
+                ref ty,
+                ..
+            }) => {
                 self.check_defaultness(item.span, defaultness);
                 if ty.is_none() {
                     let msg = "free type alias without body";
                     self.error_item_without_body(item.span, "type", msg, " = <type>;");
                 }
                 self.check_type_no_bounds(bounds, "this context");
+                if where_clauses.1.0 {
+                    let mut err = self.err_handler().struct_span_err(
+                        where_clauses.1.1,
+                        "where clauses are not allowed after the type for type aliases",
+                    );
+                    err.note(
+                        "see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information",
+                    );
+                    err.emit();
+                }
             }
             _ => {}
         }
@@ -1294,11 +1326,18 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 self.check_foreign_fn_headerless(fi.ident, fi.span, sig.header);
                 self.check_foreign_item_ascii_only(fi.ident);
             }
-            ForeignItemKind::TyAlias(box TyAlias { defaultness, generics, bounds, ty, .. }) => {
+            ForeignItemKind::TyAlias(box TyAlias {
+                defaultness,
+                generics,
+                where_clauses,
+                bounds,
+                ty,
+                ..
+            }) => {
                 self.check_defaultness(fi.span, *defaultness);
                 self.check_foreign_kind_bodyless(fi.ident, "type", ty.as_ref().map(|b| b.span));
                 self.check_type_no_bounds(bounds, "`extern` blocks");
-                self.check_foreign_ty_genericless(generics);
+                self.check_foreign_ty_genericless(generics, where_clauses.0.1);
                 self.check_foreign_item_ascii_only(fi.ident);
             }
             ForeignItemKind::Static(_, _, body) => {
@@ -1324,7 +1363,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         // are allowed to contain nested `impl Trait`.
                         AngleBracketedArg::Constraint(constraint) => {
                             self.with_impl_trait(None, |this| {
-                                this.visit_assoc_ty_constraint_from_generic_args(constraint);
+                                this.visit_assoc_constraint_from_generic_args(constraint);
                             });
                         }
                     }
@@ -1342,8 +1381,6 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
     }
 
     fn visit_generics(&mut self, generics: &'a Generics) {
-        let cg_defaults = self.session.features_untracked().unordered_const_ty_params();
-
         let mut prev_param_default = None;
         for param in &generics.params {
             match param.kind {
@@ -1358,12 +1395,6 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                             span,
                             "generic parameters with a default must be trailing",
                         );
-                        if matches!(param.kind, GenericParamKind::Const { .. }) && !cg_defaults {
-                            err.note(
-                                "using type defaults and const parameters \
-                                 in the same parameter list is currently not permitted",
-                            );
-                        }
                         err.emit();
                         break;
                     }
@@ -1371,12 +1402,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
             }
         }
 
-        validate_generic_param_order(
-            self.session,
-            self.err_handler(),
-            &generics.params,
-            generics.span,
-        );
+        validate_generic_param_order(self.err_handler(), &generics.params, generics.span);
 
         for predicate in &generics.where_clause.predicates {
             if let WherePredicate::EqPredicate(ref predicate) = *predicate {
@@ -1449,25 +1475,6 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         visit::walk_param_bound(self, bound)
     }
 
-    fn visit_pat(&mut self, pat: &'a Pat) {
-        match &pat.kind {
-            PatKind::Lit(expr) => {
-                self.check_expr_within_pat(expr, false);
-            }
-            PatKind::Range(start, end, _) => {
-                if let Some(expr) = start {
-                    self.check_expr_within_pat(expr, true);
-                }
-                if let Some(expr) = end {
-                    self.check_expr_within_pat(expr, true);
-                }
-            }
-            _ => {}
-        }
-
-        visit::walk_pat(self, pat)
-    }
-
     fn visit_poly_trait_ref(&mut self, t: &'a PolyTraitRef, m: &'a TraitBoundModifier) {
         self.check_late_bound_lifetime_defs(&t.bound_generic_params);
         visit::walk_poly_trait_ref(self, t, m);
@@ -1497,7 +1504,7 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         };
         self.check_fn_decl(fk.decl(), self_semantic);
 
-        self.check_c_varadic_type(fk);
+        self.check_c_variadic_type(fk);
 
         // Functions cannot both be `const async`
         if let Some(FnHeader {
@@ -1584,9 +1591,23 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 AssocItemKind::Fn(box Fn { body, .. }) => {
                     self.check_impl_item_provided(item.span, body, "function", " { <body> }");
                 }
-                AssocItemKind::TyAlias(box TyAlias { bounds, ty, .. }) => {
+                AssocItemKind::TyAlias(box TyAlias {
+                    generics,
+                    where_clauses,
+                    where_predicates_split,
+                    bounds,
+                    ty,
+                    ..
+                }) => {
                     self.check_impl_item_provided(item.span, ty, "type", " = <type>;");
                     self.check_type_no_bounds(bounds, "`impl`s");
+                    if ty.is_some() {
+                        self.check_gat_where(
+                            item.id,
+                            generics.where_clause.predicates.split_at(*where_predicates_split).0,
+                            *where_clauses,
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -1665,12 +1686,12 @@ fn deny_equality_constraints(
                                     let len = assoc_path.segments.len() - 1;
                                     let gen_args = args.as_ref().map(|p| (**p).clone());
                                     // Build `<Bar = RhsTy>`.
-                                    let arg = AngleBracketedArg::Constraint(AssocTyConstraint {
+                                    let arg = AngleBracketedArg::Constraint(AssocConstraint {
                                         id: rustc_ast::node_id::DUMMY_NODE_ID,
                                         ident: *ident,
                                         gen_args,
-                                        kind: AssocTyConstraintKind::Equality {
-                                            ty: predicate.rhs_ty.clone(),
+                                        kind: AssocConstraintKind::Equality {
+                                            term: predicate.rhs_ty.clone().into(),
                                         },
                                         span: ident.span,
                                     });
@@ -1714,6 +1735,53 @@ fn deny_equality_constraints(
             }
         }
     }
+    // Given `A: Foo, A::Bar = RhsTy`, suggest `A: Foo<Bar = RhsTy>`.
+    if let TyKind::Path(None, full_path) = &predicate.lhs_ty.kind {
+        if let [potential_param, potential_assoc] = &full_path.segments[..] {
+            for param in &generics.params {
+                if param.ident == potential_param.ident {
+                    for bound in &param.bounds {
+                        if let ast::GenericBound::Trait(trait_ref, TraitBoundModifier::None) = bound
+                        {
+                            if let [trait_segment] = &trait_ref.trait_ref.path.segments[..] {
+                                let assoc = pprust::path_to_string(&ast::Path::from_ident(
+                                    potential_assoc.ident,
+                                ));
+                                let ty = pprust::ty_to_string(&predicate.rhs_ty);
+                                let (args, span) = match &trait_segment.args {
+                                    Some(args) => match args.deref() {
+                                        ast::GenericArgs::AngleBracketed(args) => {
+                                            let Some(arg) = args.args.last() else {
+                                                continue;
+                                            };
+                                            (
+                                                format!(", {} = {}", assoc, ty),
+                                                arg.span().shrink_to_hi(),
+                                            )
+                                        }
+                                        _ => continue,
+                                    },
+                                    None => (
+                                        format!("<{} = {}>", assoc, ty),
+                                        trait_segment.span().shrink_to_hi(),
+                                    ),
+                                };
+                                err.multipart_suggestion(
+                                    &format!(
+                                        "if `{}::{}` is an associated type you're trying to set, \
+                                        use the associated type binding syntax",
+                                        trait_segment.ident, potential_assoc.ident,
+                                    ),
+                                    vec![(span, args), (predicate.span, String::new())],
+                                    Applicability::MaybeIncorrect,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     err.note(
         "see issue #20041 <https://github.com/rust-lang/rust/issues/20041> for more information",
     );
@@ -1731,10 +1799,19 @@ pub fn check_crate(session: &Session, krate: &Crate, lints: &mut LintBuffer) -> 
         is_tilde_const_allowed: false,
         is_impl_trait_banned: false,
         is_assoc_ty_bound_banned: false,
-        is_let_allowed: false,
+        forbidden_let_reason: Some(ForbiddenLetReason::GenericForbidden),
         lint_buffer: lints,
     };
     visit::walk_crate(&mut validator, krate);
 
     validator.has_proc_macro_decls
+}
+
+/// Used to forbid `let` expressions in certain syntactic locations.
+#[derive(Clone, Copy)]
+enum ForbiddenLetReason {
+    /// A let chain with the `||` operator
+    ForbiddenWithOr(Span),
+    /// `let` is not valid and the source environment is not important
+    GenericForbidden,
 }

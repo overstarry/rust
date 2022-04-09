@@ -4,7 +4,6 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
 use smallvec::{smallvec, SmallVec};
 
-use std::iter;
 use std::mem;
 
 use super::abs_domain::Lift;
@@ -293,16 +292,6 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             StatementKind::FakeRead(box (_, place)) => {
                 self.create_move_path(*place);
             }
-            StatementKind::LlvmInlineAsm(ref asm) => {
-                for (output, kind) in iter::zip(&*asm.outputs, &asm.asm.outputs) {
-                    if !kind.is_indirect {
-                        self.gather_init(output.as_ref(), InitKind::Deep);
-                    }
-                }
-                for (_, input) in asm.inputs.iter() {
-                    self.gather_operand(input);
-                }
-            }
             StatementKind::StorageLive(_) => {}
             StatementKind::StorageDead(local) => {
                 self.gather_move(Place::from(*local));
@@ -343,19 +332,7 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             | Rvalue::AddressOf(..)
             | Rvalue::Discriminant(..)
             | Rvalue::Len(..)
-            | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf, _)
-            | Rvalue::NullaryOp(NullOp::Box, _) => {
-                // This returns an rvalue with uninitialized contents. We can't
-                // move out of it here because it is an rvalue - assignments always
-                // completely initialize their place.
-                //
-                // However, this does not matter - MIR building is careful to
-                // only emit a shallow free for the partially-initialized
-                // temporary.
-                //
-                // In any case, if we want to fix this, we have to register a
-                // special move and change the `statement_effect` functions.
-            }
+            | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf, _) => {}
         }
     }
 
@@ -419,6 +396,7 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
                 options: _,
                 line_spans: _,
                 destination: _,
+                cleanup: _,
             } => {
                 for op in operands {
                     match *op {

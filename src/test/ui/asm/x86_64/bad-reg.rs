@@ -1,7 +1,9 @@
 // only-x86_64
 // compile-flags: -C target-feature=+avx2
 
-#![feature(asm, asm_const, asm_sym)]
+#![feature(asm_const, asm_sym)]
+
+use std::arch::asm;
 
 fn main() {
     let mut foo = 0;
@@ -29,8 +31,6 @@ fn main() {
         //~^ ERROR invalid register `ip`: the instruction pointer cannot be used as an operand
         asm!("", in("k0") foo);
         //~^ ERROR invalid register `k0`: the k0 AVX mask register cannot be used as an operand
-        asm!("", in("ah") foo);
-        //~^ ERROR invalid register `ah`: high byte registers cannot be used as an operand
 
         asm!("", in("st(2)") foo);
         //~^ ERROR register class `x87_reg` can only be used as a clobber, not as an input or output

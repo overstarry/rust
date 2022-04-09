@@ -81,9 +81,9 @@
 //! [`OsStr`] and Rust strings work similarly to those for [`CString`]
 //! and [`CStr`].
 //!
-//! * [`OsString`] represents an owned string in whatever
-//! representation the operating system prefers. In the Rust standard
-//! library, various APIs that transfer strings to/from the operating
+//! * [`OsString`] losslessly represents an owned platform string. However, this
+//! representation is not necessarily in a form native to the platform.
+//! In the Rust standard library, various APIs that transfer strings to/from the operating
 //! system use [`OsString`] instead of plain strings. For example,
 //! [`env::var_os()`] is used to query environment variables; it
 //! returns an <code>[Option]<[OsString]></code>. If the environment variable
@@ -92,9 +92,9 @@
 //! your code can detect errors in case the environment variable did
 //! not in fact contain valid Unicode data.
 //!
-//! * [`OsStr`] represents a borrowed reference to a string in a
-//! format that can be passed to the operating system. It can be
-//! converted into a UTF-8 Rust string slice in a similar way to
+//! * [`OsStr`] losslessly represents a borrowed reference to a platform string.
+//! However, this representation is not necessarily in a form native to the platform.
+//! It can be converted into a UTF-8 Rust string slice in a similar way to
 //! [`OsString`].
 //!
 //! # Conversions
@@ -113,16 +113,19 @@
 //!
 //! ## On Windows
 //!
+//! An [`OsStr`] can be losslessly converted to a native Windows string. And
+//! a native Windows string can be losslessly converted to an [`OsString`].
+//!
 //! On Windows, [`OsStr`] implements the
 //! <code>std::os::windows::ffi::[OsStrExt][windows.OsStrExt]</code> trait,
 //! which provides an [`encode_wide`] method. This provides an
-//! iterator that can be [`collect`]ed into a vector of [`u16`].
+//! iterator that can be [`collect`]ed into a vector of [`u16`]. After a nul
+//! characters is appended, this is the same as a native Windows string.
 //!
 //! Additionally, on Windows [`OsString`] implements the
 //! <code>std::os::windows:ffi::[OsStringExt][windows.OsStringExt]</code>
-//! trait, which provides a [`from_wide`] method. The result of this
-//! method is an [`OsString`] which can be round-tripped to a Windows
-//! string losslessly.
+//! trait, which provides a [`from_wide`] method to convert a native Windows
+//! string (without the terminating nul character) to an [`OsString`].
 //!
 //! [Unicode scalar value]: https://www.unicode.org/glossary/#unicode_scalar_value
 //! [Unicode code point]: https://www.unicode.org/glossary/#code_point
@@ -155,6 +158,15 @@ pub use self::os_str::{OsStr, OsString};
 
 #[stable(feature = "core_c_void", since = "1.30.0")]
 pub use core::ffi::c_void;
+
+#[unstable(feature = "core_ffi_c", issue = "94501")]
+pub use core::ffi::{
+    c_char, c_double, c_float, c_int, c_long, c_longlong, c_schar, c_short, c_uchar, c_uint,
+    c_ulong, c_ulonglong, c_ushort,
+};
+
+#[unstable(feature = "c_size_t", issue = "88345")]
+pub use core::ffi::{c_ptrdiff_t, c_size_t, c_ssize_t};
 
 #[unstable(
     feature = "c_variadic",

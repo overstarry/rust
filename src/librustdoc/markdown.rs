@@ -7,7 +7,7 @@ use rustc_span::source_map::DUMMY_SP;
 use rustc_span::Symbol;
 
 use crate::config::{Options, RenderOptions};
-use crate::doctest::{Collector, TestOptions};
+use crate::doctest::{Collector, GlobalTestOptions};
 use crate::html::escape::Escape;
 use crate::html::markdown;
 use crate::html::markdown::{
@@ -51,7 +51,7 @@ crate fn render<P: AsRef<Path>>(
 
     let mut css = String::new();
     for name in &options.markdown_css {
-        let s = format!("<link rel=\"stylesheet\" type=\"text/css\" href=\"{}\">\n", name);
+        let s = format!("<link rel=\"stylesheet\" type=\"text/css\" href=\"{name}\">\n");
         css.push_str(&s)
     }
 
@@ -129,9 +129,8 @@ crate fn render<P: AsRef<Path>>(
 crate fn test(options: Options) -> Result<(), String> {
     let input_str = read_to_string(&options.input)
         .map_err(|err| format!("{}: {}", options.input.display(), err))?;
-    let mut opts = TestOptions::default();
+    let mut opts = GlobalTestOptions::default();
     opts.no_crate_inject = true;
-    opts.display_doctest_warnings = options.display_doctest_warnings;
     let mut collector = Collector::new(
         Symbol::intern(&options.input.display().to_string()),
         options.clone(),
@@ -146,11 +145,6 @@ crate fn test(options: Options) -> Result<(), String> {
 
     find_testable_code(&input_str, &mut collector, codes, options.enable_per_target_ignores, None);
 
-    crate::doctest::run_tests(
-        options.test_args,
-        options.nocapture,
-        options.display_doctest_warnings,
-        collector.tests,
-    );
+    crate::doctest::run_tests(options.test_args, options.nocapture, collector.tests);
     Ok(())
 }

@@ -10,8 +10,8 @@ use rustc_ast::walk_list;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
-use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
-use rustc_hir::{Arm, Block, Expr, Local, Node, Pat, PatKind, Stmt};
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_hir::{Arm, Block, Expr, Local, Pat, PatKind, Stmt};
 use rustc_index::vec::Idx;
 use rustc_middle::middle::region::*;
 use rustc_middle::ty::query::Providers;
@@ -291,7 +291,7 @@ fn resolve_expr<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, expr: &'tcx h
     // like AddAssign is implemented).
 
     // For primitive types (which, despite having a trait impl, don't actually
-    // end up calling it), the evluation order is right-to-left. For example,
+    // end up calling it), the evaluation order is right-to-left. For example,
     // the following code snippet:
     //
     //    let y = &mut 0;
@@ -366,7 +366,8 @@ fn resolve_expr<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, expr: &'tcx h
             let target_scopes = visitor.fixup_scopes.drain(start_point..);
 
             for scope in target_scopes {
-                let mut yield_data = visitor.scope_tree.yield_in_scope.get_mut(&scope).unwrap();
+                let mut yield_data =
+                    visitor.scope_tree.yield_in_scope.get_mut(&scope).unwrap().last_mut().unwrap();
                 let count = yield_data.expr_and_pat_count;
                 let span = yield_data.span;
 
@@ -421,12 +422,21 @@ fn resolve_expr<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, expr: &'tcx h
         // Mark this expr's scope and all parent scopes as containing `yield`.
         let mut scope = Scope { id: expr.hir_id.local_id, data: ScopeData::Node };
         loop {
-            let data = YieldData {
-                span: expr.span,
-                expr_and_pat_count: visitor.expr_and_pat_count,
-                source: *source,
+            let span = match expr.kind {
+                hir::ExprKind::Yield(expr, hir::YieldSource::Await { .. }) => {
+                    expr.span.shrink_to_hi().to(expr.span)
+                }
+                _ => expr.span,
             };
-            visitor.scope_tree.yield_in_scope.insert(scope, data);
+            let data =
+                YieldData { span, expr_and_pat_count: visitor.expr_and_pat_count, source: *source };
+            match visitor.scope_tree.yield_in_scope.get_mut(&scope) {
+                Some(yields) => yields.push(data),
+                None => {
+                    visitor.scope_tree.yield_in_scope.insert(scope, vec![data]);
+                }
+            }
+
             if visitor.pessimistic_yield {
                 debug!("resolve_expr in pessimistic_yield - marking scope {:?} for fixup", scope);
                 visitor.fixup_scopes.push(scope);
@@ -718,19 +728,13 @@ impl<'tcx> RegionResolutionVisitor<'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for RegionResolutionVisitor<'tcx> {
-    type Map = intravisit::ErasedMap<'tcx>;
-
-    fn nested_visit_map(&mut self) -> NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::None
-    }
-
     fn visit_block(&mut self, b: &'tcx Block<'tcx>) {
         resolve_block(self, b);
     }
 
     fn visit_body(&mut self, body: &'tcx hir::Body<'tcx>) {
         let body_id = body.id();
-        let owner_id = self.tcx.hir().body_owner(body_id);
+        let owner_id = self.tcx.hir().body_owner_def_id(body_id);
 
         debug!(
             "visit_body(id={:?}, span={:?}, body.id={:?}, cx.parent={:?})",
@@ -837,19 +841,7 @@ fn region_scope_tree(tcx: TyCtxt<'_>, def_id: DefId) -> &ScopeTree {
 
         let body = tcx.hir().body(body_id);
         visitor.scope_tree.root_body = Some(body.value.hir_id);
-
-        // If the item is an associated const or a method,
-        // record its impl/trait parent, as it can also have
-        // lifetime parameters free in this body.
-        match tcx.hir().get(id) {
-            Node::ImplItem(_) | Node::TraitItem(_) => {
-                visitor.scope_tree.root_parent = Some(tcx.hir().get_parent_item(id));
-            }
-            _ => {}
-        }
-
         visitor.visit_body(body);
-
         visitor.scope_tree
     } else {
         ScopeTree::default()

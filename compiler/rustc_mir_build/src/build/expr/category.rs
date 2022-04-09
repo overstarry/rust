@@ -67,12 +67,14 @@ impl Category {
             | ExprKind::Repeat { .. }
             | ExprKind::Assign { .. }
             | ExprKind::AssignOp { .. }
-            | ExprKind::ThreadLocalRef(_)
-            | ExprKind::LlvmInlineAsm { .. } => Some(Category::Rvalue(RvalueFunc::AsRvalue)),
+            | ExprKind::ThreadLocalRef(_) => Some(Category::Rvalue(RvalueFunc::AsRvalue)),
 
-            ExprKind::ConstBlock { .. } | ExprKind::Literal { .. } | ExprKind::StaticRef { .. } => {
-                Some(Category::Constant)
-            }
+            ExprKind::ConstBlock { .. }
+            | ExprKind::Literal { .. }
+            | ExprKind::NonHirLiteral { .. }
+            | ExprKind::ConstParam { .. }
+            | ExprKind::StaticRef { .. }
+            | ExprKind::NamedConst { .. } => Some(Category::Constant),
 
             ExprKind::Loop { .. }
             | ExprKind::Block { .. }

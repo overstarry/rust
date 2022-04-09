@@ -100,9 +100,12 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                 // Instead, we generate `impl !Send for Foo<T>`, which better
                 // expresses the fact that `Foo<T>` never implements `Send`,
                 // regardless of the choice of `T`.
-                let params = (tcx.generics_of(item_def_id), ty::GenericPredicates::default())
-                    .clean(self.cx)
-                    .params;
+                let raw_generics = clean_ty_generics(
+                    self.cx,
+                    tcx.generics_of(item_def_id),
+                    ty::GenericPredicates::default(),
+                );
+                let params = raw_generics.params;
 
                 Generics { params, where_predicates: Vec::new() }
             }
@@ -294,7 +297,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                     .get(name)
                     .unwrap_or(&empty)
                     .iter()
-                    .map(|region| GenericBound::Outlives(Self::get_lifetime(region, names_map)))
+                    .map(|region| GenericBound::Outlives(Self::get_lifetime(*region, names_map)))
                     .collect();
 
                 if bounds.is_empty() {
@@ -451,10 +454,12 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
             })
             .map(|p| p.fold_with(&mut replacer));
 
-        let mut generic_params =
-            (tcx.generics_of(item_def_id), tcx.explicit_predicates_of(item_def_id))
-                .clean(self.cx)
-                .params;
+        let raw_generics = clean_ty_generics(
+            self.cx,
+            tcx.generics_of(item_def_id),
+            tcx.explicit_predicates_of(item_def_id),
+        );
+        let mut generic_params = raw_generics.params;
 
         debug!("param_env_to_generics({:?}): generic_params={:?}", item_def_id, generic_params);
 
@@ -500,7 +505,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                         .and_then(|trait_| {
                             ty_to_traits
                                 .get(&ty)
-                                .map(|bounds| bounds.contains(&strip_path_generics(trait_.clone())))
+                                .map(|bounds| bounds.contains(&strip_path_generics(trait_)))
                         })
                         .unwrap_or(false)
                     {
@@ -541,15 +546,17 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                 }
                 WherePredicate::EqPredicate { lhs, rhs } => {
                     match lhs {
-                        Type::QPath { name: left_name, ref self_type, ref trait_, .. } => {
+                        Type::QPath { ref assoc, ref self_type, ref trait_, .. } => {
                             let ty = &*self_type;
                             let mut new_trait = trait_.clone();
 
-                            if self.is_fn_trait(trait_) && left_name == sym::Output {
+                            if self.is_fn_trait(trait_) && assoc.name == sym::Output {
                                 ty_to_fn
                                     .entry(*ty.clone())
-                                    .and_modify(|e| *e = (e.0.clone(), Some(rhs.clone())))
-                                    .or_insert((None, Some(rhs)));
+                                    .and_modify(|e| {
+                                        *e = (e.0.clone(), Some(rhs.ty().unwrap().clone()))
+                                    })
+                                    .or_insert((None, Some(rhs.ty().unwrap().clone())));
                                 continue;
                             }
 
@@ -564,8 +571,8 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                                 // to 'T: Iterator<Item=u8>'
                                 GenericArgs::AngleBracketed { ref mut bindings, .. } => {
                                     bindings.push(TypeBinding {
-                                        name: left_name,
-                                        kind: TypeBindingKind::Equality { ty: rhs },
+                                        assoc: *assoc.clone(),
+                                        kind: TypeBindingKind::Equality { term: rhs },
                                     });
                                 }
                                 GenericArgs::Parenthesized { .. } => {

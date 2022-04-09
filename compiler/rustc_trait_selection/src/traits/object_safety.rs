@@ -14,18 +14,17 @@ use crate::infer::TyCtxtInferExt;
 use crate::traits::const_evaluatable::{self, AbstractConst};
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
 use crate::traits::{self, Obligation, ObligationCause};
-use rustc_errors::FatalError;
+use rustc_errors::{FatalError, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::subst::{GenericArg, InternalSubsts, Subst};
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeVisitor, WithConstness};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeVisitor};
 use rustc_middle::ty::{Predicate, ToPredicate};
 use rustc_session::lint::builtin::WHERE_CLAUSES_OBJECT_SAFETY;
 use rustc_span::symbol::Symbol;
-use rustc_span::{MultiSpan, Span};
+use rustc_span::Span;
 use smallvec::SmallVec;
 
-use std::array;
 use std::iter;
 use std::ops::ControlFlow;
 
@@ -51,10 +50,7 @@ pub fn astconv_object_safety_violations(
     violations
 }
 
-fn object_safety_violations(
-    tcx: TyCtxt<'tcx>,
-    trait_def_id: DefId,
-) -> &'tcx [ObjectSafetyViolation] {
+fn object_safety_violations(tcx: TyCtxt<'_>, trait_def_id: DefId) -> &'_ [ObjectSafetyViolation] {
     debug_assert!(tcx.generics_of(trait_def_id).has_self);
     debug!("object_safety_violations: {:?}", trait_def_id);
 
@@ -93,7 +89,7 @@ fn object_safety_violations_for_trait(
         .filter(|item| item.kind == ty::AssocKind::Fn)
         .filter_map(|item| {
             object_safety_violation_for_method(tcx, trait_def_id, &item)
-                .map(|(code, span)| ObjectSafetyViolation::Method(item.ident.name, code, span))
+                .map(|(code, span)| ObjectSafetyViolation::Method(item.name, code, span))
         })
         .filter(|violation| {
             if let ObjectSafetyViolation::Method(
@@ -129,16 +125,24 @@ fn object_safety_violations_for_trait(
         tcx.associated_items(trait_def_id)
             .in_definition_order()
             .filter(|item| item.kind == ty::AssocKind::Const)
-            .map(|item| ObjectSafetyViolation::AssocConst(item.ident.name, item.ident.span)),
+            .map(|item| {
+                let ident = item.ident(tcx);
+                ObjectSafetyViolation::AssocConst(ident.name, ident.span)
+            }),
     );
 
-    violations.extend(
-        tcx.associated_items(trait_def_id)
-            .in_definition_order()
-            .filter(|item| item.kind == ty::AssocKind::Type)
-            .filter(|item| !tcx.generics_of(item.def_id).params.is_empty())
-            .map(|item| ObjectSafetyViolation::GAT(item.ident.name, item.ident.span)),
-    );
+    if !tcx.features().generic_associated_types_extended {
+        violations.extend(
+            tcx.associated_items(trait_def_id)
+                .in_definition_order()
+                .filter(|item| item.kind == ty::AssocKind::Type)
+                .filter(|item| !tcx.generics_of(item.def_id).params.is_empty())
+                .map(|item| {
+                    let ident = item.ident(tcx);
+                    ObjectSafetyViolation::GAT(ident.name, ident.span)
+                }),
+        );
+    }
 
     debug!(
         "object_safety_violations_for_trait(trait_def_id={:?}) = {:?}",
@@ -165,10 +169,7 @@ fn lint_object_unsafe_trait(
         let node = tcx.hir().get_if_local(trait_def_id);
         let mut spans = MultiSpan::from_span(span);
         if let Some(hir::Node::Item(item)) = node {
-            spans.push_span_label(
-                item.ident.span,
-                "this trait cannot be made into an object...".into(),
-            );
+            spans.push_span_label(item.ident.span, "this trait cannot be made into an object...");
             spans.push_span_label(span, format!("...because {}", violation.error_msg()));
         } else {
             spans.push_span_label(
@@ -273,12 +274,12 @@ fn bounds_reference_self(tcx: TyCtxt<'_>, trait_def_id: DefId) -> SmallVec<[Span
         .collect()
 }
 
-fn predicate_references_self(
+fn predicate_references_self<'tcx>(
     tcx: TyCtxt<'tcx>,
     (predicate, sp): (ty::Predicate<'tcx>, Span),
 ) -> Option<Span> {
     let self_ty = tcx.types.self_param;
-    let has_self_ty = |arg: &GenericArg<'tcx>| arg.walk(tcx).any(|arg| arg == self_ty.into());
+    let has_self_ty = |arg: &GenericArg<'_>| arg.walk().any(|arg| arg == self_ty.into());
     match predicate.kind().skip_binder() {
         ty::PredicateKind::Trait(ref data) => {
             // In the case of a trait predicate, we can skip the "self" type.
@@ -320,11 +321,8 @@ fn trait_has_sized_self(tcx: TyCtxt<'_>, trait_def_id: DefId) -> bool {
 }
 
 fn generics_require_sized_self(tcx: TyCtxt<'_>, def_id: DefId) -> bool {
-    let sized_def_id = match tcx.lang_items().sized_trait() {
-        Some(def_id) => def_id,
-        None => {
-            return false; /* No Sized trait, can't require it! */
-        }
+    let Some(sized_def_id) = tcx.lang_items().sized_trait() else {
+        return false; /* No Sized trait, can't require it! */
     };
 
     // Search for a predicate like `Self : Sized` amongst the trait bounds.
@@ -371,15 +369,15 @@ fn object_safety_violation_for_method(
             (MethodViolationCode::ReferencesSelfInput(arg), Some(node)) => node
                 .fn_decl()
                 .and_then(|decl| decl.inputs.get(arg + 1))
-                .map_or(method.ident.span, |arg| arg.span),
+                .map_or(method.ident(tcx).span, |arg| arg.span),
             (MethodViolationCode::UndispatchableReceiver, Some(node)) => node
                 .fn_decl()
                 .and_then(|decl| decl.inputs.get(0))
-                .map_or(method.ident.span, |arg| arg.span),
+                .map_or(method.ident(tcx).span, |arg| arg.span),
             (MethodViolationCode::ReferencesSelfOutput, Some(node)) => {
-                node.fn_decl().map_or(method.ident.span, |decl| decl.output.span())
+                node.fn_decl().map_or(method.ident(tcx).span, |decl| decl.output.span())
             }
-            _ => method.ident.span,
+            _ => method.ident(tcx).span,
         };
         (v, span)
     })
@@ -408,10 +406,10 @@ fn virtual_call_violation_for_method<'tcx>(
             );
         // Get the span pointing at where the `self` receiver should be.
         let sm = tcx.sess.source_map();
-        let self_span = method.ident.span.to(tcx
+        let self_span = method.ident(tcx).span.to(tcx
             .hir()
             .span_if_local(method.def_id)
-            .unwrap_or_else(|| sm.next_point(method.ident.span))
+            .unwrap_or_else(|| sm.next_point(method.ident(tcx).span))
             .shrink_to_hi());
         let self_span = sm.span_through_char(self_span, '(').shrink_to_hi();
         return Some(MethodViolationCode::StaticMethod(
@@ -575,7 +573,7 @@ fn object_ty_for_trait<'tcx>(
         // `trait MyTrait: for<'s> OtherTrait<&'s T, Output=bool>`.
         super_trait_ref.map_bound(|super_trait_ref| {
             ty::ExistentialPredicate::Projection(ty::ExistentialProjection {
-                ty: tcx.mk_projection(item.def_id, super_trait_ref.substs),
+                term: tcx.mk_projection(item.def_id, super_trait_ref.substs).into(),
                 item_def_id: item.def_id,
                 substs: super_trait_ref.substs,
             })
@@ -692,13 +690,14 @@ fn receiver_is_dispatchable<'tcx>(
                 .to_predicate(tcx)
         };
 
-        let caller_bounds: Vec<Predicate<'tcx>> = param_env
-            .caller_bounds()
-            .iter()
-            .chain(array::IntoIter::new([unsize_predicate, trait_predicate]))
-            .collect();
+        let caller_bounds: Vec<Predicate<'tcx>> =
+            param_env.caller_bounds().iter().chain([unsize_predicate, trait_predicate]).collect();
 
-        ty::ParamEnv::new(tcx.intern_predicates(&caller_bounds), param_env.reveal())
+        ty::ParamEnv::new(
+            tcx.intern_predicates(&caller_bounds),
+            param_env.reveal(),
+            param_env.constness(),
+        )
     };
 
     // Receiver: DispatchFromDyn<Receiver[Self => U]>
@@ -771,9 +770,6 @@ fn contains_illegal_self_type_reference<'tcx, T: TypeFoldable<'tcx>>(
 
     impl<'tcx> TypeVisitor<'tcx> for IllegalSelfTypeVisitor<'tcx> {
         type BreakTy = ();
-        fn tcx_for_anon_const_substs(&self) -> Option<TyCtxt<'tcx>> {
-            Some(self.tcx)
-        }
 
         fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
             match t.kind() {

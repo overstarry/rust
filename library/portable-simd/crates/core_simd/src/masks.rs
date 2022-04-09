@@ -12,9 +12,12 @@
 )]
 mod mask_impl;
 
-use crate::simd::{LaneCount, Simd, SimdElement, SupportedLaneCount};
+mod to_bitmask;
+pub use to_bitmask::ToBitMask;
+
+use crate::simd::{intrinsics, LaneCount, Simd, SimdElement, SupportedLaneCount};
 use core::cmp::Ordering;
-use core::fmt;
+use core::{fmt, mem};
 
 mod sealed {
     use super::*;
@@ -41,6 +44,9 @@ mod sealed {
 use sealed::Sealed;
 
 /// Marker trait for types that may be used as SIMD mask elements.
+///
+/// # Safety
+/// Type must be a signed integer.
 pub unsafe trait MaskElement: SimdElement + Sealed {}
 
 macro_rules! impl_element {
@@ -105,22 +111,39 @@ where
         Self(mask_impl::Mask::splat(value))
     }
 
-    /// Converts an array to a SIMD vector.
+    /// Converts an array of bools to a SIMD mask.
     pub fn from_array(array: [bool; LANES]) -> Self {
-        let mut vector = Self::splat(false);
-        for (i, v) in array.iter().enumerate() {
-            vector.set(i, *v);
+        // SAFETY: Rust's bool has a layout of 1 byte (u8) with a value of
+        //     true:    0b_0000_0001
+        //     false:   0b_0000_0000
+        // Thus, an array of bools is also a valid array of bytes: [u8; N]
+        // This would be hypothetically valid as an "in-place" transmute,
+        // but these are "dependently-sized" types, so copy elision it is!
+        unsafe {
+            let bytes: [u8; LANES] = mem::transmute_copy(&array);
+            let bools: Simd<i8, LANES> =
+                intrinsics::simd_ne(Simd::from_array(bytes), Simd::splat(0u8));
+            Mask::from_int_unchecked(intrinsics::simd_cast(bools))
         }
-        vector
     }
 
-    /// Converts a SIMD vector to an array.
+    /// Converts a SIMD mask to an array of bools.
     pub fn to_array(self) -> [bool; LANES] {
-        let mut array = [false; LANES];
-        for (i, v) in array.iter_mut().enumerate() {
-            *v = self.test(i);
+        // This follows mostly the same logic as from_array.
+        // SAFETY: Rust's bool has a layout of 1 byte (u8) with a value of
+        //     true:    0b_0000_0001
+        //     false:   0b_0000_0000
+        // Thus, an array of bools is also a valid array of bytes: [u8; N]
+        // Since our masks are equal to integers where all bits are set,
+        // we can simply convert them to i8s, and then bitand them by the
+        // bitpattern for Rust's "true" bool.
+        // This would be hypothetically valid as an "in-place" transmute,
+        // but these are "dependently-sized" types, so copy elision it is!
+        unsafe {
+            let mut bytes: Simd<i8, LANES> = intrinsics::simd_cast(self.to_int());
+            bytes &= Simd::splat(1i8);
+            mem::transmute_copy(&bytes)
         }
-        array
     }
 
     /// Converts a vector of integers to a mask, where 0 represents `false` and -1
@@ -129,7 +152,9 @@ where
     /// # Safety
     /// All lanes must be either 0 or -1.
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     pub unsafe fn from_int_unchecked(value: Simd<T, LANES>) -> Self {
+        // Safety: the caller must confirm this invariant
         unsafe { Self(mask_impl::Mask::from_int_unchecked(value)) }
     }
 
@@ -139,14 +164,17 @@ where
     /// # Panics
     /// Panics if any lane is not 0 or -1.
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     pub fn from_int(value: Simd<T, LANES>) -> Self {
         assert!(T::valid(value), "all values must be either 0 or -1",);
+        // Safety: the validity has been checked
         unsafe { Self::from_int_unchecked(value) }
     }
 
     /// Converts the mask to a vector of integers, where 0 represents `false` and -1
     /// represents `true`.
     #[inline]
+    #[must_use = "method returns a new vector and does not mutate the original value"]
     pub fn to_int(self) -> Simd<T, LANES> {
         self.0.to_int()
     }
@@ -156,7 +184,9 @@ where
     /// # Safety
     /// `lane` must be less than `LANES`.
     #[inline]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     pub unsafe fn test_unchecked(&self, lane: usize) -> bool {
+        // Safety: the caller must confirm this invariant
         unsafe { self.0.test_unchecked(lane) }
     }
 
@@ -165,8 +195,10 @@ where
     /// # Panics
     /// Panics if `lane` is greater than or equal to the number of lanes in the vector.
     #[inline]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     pub fn test(&self, lane: usize) -> bool {
         assert!(lane < LANES, "lane index out of range");
+        // Safety: the lane index has been checked
         unsafe { self.test_unchecked(lane) }
     }
 
@@ -176,6 +208,7 @@ where
     /// `lane` must be less than `LANES`.
     #[inline]
     pub unsafe fn set_unchecked(&mut self, lane: usize, value: bool) {
+        // Safety: the caller must confirm this invariant
         unsafe {
             self.0.set_unchecked(lane, value);
         }
@@ -188,31 +221,22 @@ where
     #[inline]
     pub fn set(&mut self, lane: usize, value: bool) {
         assert!(lane < LANES, "lane index out of range");
+        // Safety: the lane index has been checked
         unsafe {
             self.set_unchecked(lane, value);
         }
     }
 
-    /// Convert this mask to a bitmask, with one bit set per lane.
-    #[cfg(feature = "generic_const_exprs")]
-    pub fn to_bitmask(self) -> [u8; LaneCount::<LANES>::BITMASK_LEN] {
-        self.0.to_bitmask()
-    }
-
-    /// Convert a bitmask to a mask.
-    #[cfg(feature = "generic_const_exprs")]
-    pub fn from_bitmask(bitmask: [u8; LaneCount::<LANES>::BITMASK_LEN]) -> Self {
-        Self(mask_impl::Mask::from_bitmask(bitmask))
-    }
-
     /// Returns true if any lane is set, or false otherwise.
     #[inline]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     pub fn any(self) -> bool {
         self.0.any()
     }
 
     /// Returns true if all lanes are set, or false otherwise.
     #[inline]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     pub fn all(self) -> bool {
         self.0.all()
     }
@@ -245,6 +269,7 @@ where
     LaneCount<LANES>: SupportedLaneCount,
 {
     #[inline]
+    #[must_use = "method returns a defaulted mask with all lanes set to false (0)"]
     fn default() -> Self {
         Self::splat(false)
     }
@@ -256,6 +281,7 @@ where
     LaneCount<LANES>: SupportedLaneCount,
 {
     #[inline]
+    #[must_use = "method returns a new bool and does not mutate the original value"]
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
@@ -267,6 +293,7 @@ where
     LaneCount<LANES>: SupportedLaneCount,
 {
     #[inline]
+    #[must_use = "method returns a new Ordering and does not mutate the original value"]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         self.0.partial_cmp(&other.0)
     }
@@ -291,6 +318,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitand(self, rhs: Self) -> Self {
         Self(self.0 & rhs.0)
     }
@@ -303,6 +331,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitand(self, rhs: bool) -> Self {
         self & Self::splat(rhs)
     }
@@ -315,6 +344,7 @@ where
 {
     type Output = Mask<T, LANES>;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitand(self, rhs: Mask<T, LANES>) -> Mask<T, LANES> {
         Mask::splat(self) & rhs
     }
@@ -327,6 +357,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
@@ -339,6 +370,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitor(self, rhs: bool) -> Self {
         self | Self::splat(rhs)
     }
@@ -351,6 +383,7 @@ where
 {
     type Output = Mask<T, LANES>;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitor(self, rhs: Mask<T, LANES>) -> Mask<T, LANES> {
         Mask::splat(self) | rhs
     }
@@ -363,6 +396,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitxor(self, rhs: Self) -> Self::Output {
         Self(self.0 ^ rhs.0)
     }
@@ -375,6 +409,7 @@ where
 {
     type Output = Self;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitxor(self, rhs: bool) -> Self::Output {
         self ^ Self::splat(rhs)
     }
@@ -387,6 +422,7 @@ where
 {
     type Output = Mask<T, LANES>;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn bitxor(self, rhs: Mask<T, LANES>) -> Self::Output {
         Mask::splat(self) ^ rhs
     }
@@ -399,6 +435,7 @@ where
 {
     type Output = Mask<T, LANES>;
     #[inline]
+    #[must_use = "method returns a new mask and does not mutate the original value"]
     fn not(self) -> Self::Output {
         Self(!self.0)
     }
@@ -492,7 +529,7 @@ pub type mask16x8 = Mask<i16, 8>;
 pub type mask16x16 = Mask<i16, 16>;
 
 /// Vector of 32 16-bit masks
-pub type mask16x32 = Mask<i32, 32>;
+pub type mask16x32 = Mask<i16, 32>;
 
 /// Vector of two 32-bit masks
 pub type mask32x2 = Mask<i32, 2>;

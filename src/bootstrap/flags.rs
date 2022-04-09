@@ -3,16 +3,15 @@
 //! This module implements the command-line parsing of the build system which
 //! has various flags to configure how it's run.
 
-use std::env;
 use std::path::PathBuf;
 use std::process;
 
-use build_helper::t;
 use getopts::Options;
 
 use crate::builder::Builder;
 use crate::config::{Config, TargetSelection};
 use crate::setup::Profile;
+use crate::util::t;
 use crate::{Build, DocTests};
 
 pub enum Color {
@@ -208,7 +207,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`",
         let j_msg = format!(
             "number of jobs to run in parallel; \
              defaults to {} (this host's logical CPU count)",
-            num_cpus::get()
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
         );
         opts.optopt("j", "jobs", &j_msg, "JOBS");
         opts.optflag("h", "help", "print this help message");
@@ -401,26 +400,19 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`",
                     "\n
 Arguments:
     This subcommand accepts a number of paths to directories to the crates
-    and/or artifacts to compile. For example:
+    and/or artifacts to compile. For example, for a quick build of a usable
+    compiler:
 
-        ./x.py build library/core
-        ./x.py build library/core library/proc_macro
-        ./x.py build library/std --stage 1
+        ./x.py build --stage 1 library/std
 
-    If no arguments are passed then the complete artifacts for that stage are
-    also compiled.
+    This will build a compiler and standard library from the local source code.
+    Once this is done, build/$ARCH/stage1 contains a usable compiler.
 
-        ./x.py build
-        ./x.py build --stage 1
+    If no arguments are passed then the default artifacts for that stage are
+    compiled. For example:
 
-    For a quick build of a usable compiler, you can pass:
-
-        ./x.py build --stage 1 library/test
-
-    This will first build everything once (like `--stage 0` without further
-    arguments would), and then use the compiler built in stage 0 to build
-    library/test and its dependencies.
-    Once this is done, build/$ARCH/stage1 contains a usable compiler.",
+        ./x.py build --stage 0
+        ./x.py build ",
                 );
             }
             "check" | "c" => {
@@ -430,14 +422,9 @@ Arguments:
     This subcommand accepts a number of paths to directories to the crates
     and/or artifacts to compile. For example:
 
-        ./x.py check library/core
-        ./x.py check library/core library/proc_macro
+        ./x.py check library/std
 
-    If no arguments are passed then the complete artifacts are compiled: std, test, and rustc. Note
-    also that since we use `cargo check`, by default this will automatically enable incremental
-    compilation, so there's no need to pass it separately, though it won't hurt. We also completely
-    ignore the stage passed, as there's no way to compile in non-stage 0 without actually building
-    the compiler.",
+    If no arguments are passed then many artifacts are checked.",
                 );
             }
             "clippy" => {
@@ -553,7 +540,6 @@ Arguments:
         // Get any optional paths which occur after the subcommand
         let mut paths = matches.free[1..].iter().map(|p| p.into()).collect::<Vec<PathBuf>>();
 
-        let cfg_file = env::var_os("BOOTSTRAP_CONFIG").map(PathBuf::from);
         let verbose = matches.opt_present("verbose");
 
         // User passed in -h/--help?
@@ -683,7 +669,7 @@ Arguments:
             } else {
                 None
             },
-            config: cfg_file,
+            config: matches.opt_str("config").map(PathBuf::from),
             jobs: matches.opt_str("jobs").map(|j| j.parse().expect("`jobs` should be a number")),
             cmd,
             incremental: matches.opt_present("incremental"),

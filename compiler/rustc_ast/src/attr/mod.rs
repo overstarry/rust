@@ -75,12 +75,11 @@ impl NestedMetaItem {
     pub fn name_value_literal(&self) -> Option<(Symbol, &Lit)> {
         self.meta_item().and_then(|meta_item| {
             meta_item.meta_item_list().and_then(|meta_item_list| {
-                if meta_item_list.len() == 1 {
-                    if let Some(ident) = meta_item.ident() {
-                        if let Some(lit) = meta_item_list[0].literal() {
-                            return Some((ident.name, lit));
-                        }
-                    }
+                if meta_item_list.len() == 1
+                    && let Some(ident) = meta_item.ident()
+                    && let Some(lit) = meta_item_list[0].literal()
+                {
+                    return Some((ident.name, lit));
                 }
                 None
             })
@@ -136,15 +135,15 @@ impl Attribute {
 
     pub fn value_str(&self) -> Option<Symbol> {
         match self.kind {
-            AttrKind::Normal(ref item, _) => item.meta(self.span).and_then(|meta| meta.value_str()),
+            AttrKind::Normal(ref item, _) => item.meta_kind().and_then(|kind| kind.value_str()),
             AttrKind::DocComment(..) => None,
         }
     }
 
     pub fn meta_item_list(&self) -> Option<Vec<NestedMetaItem>> {
         match self.kind {
-            AttrKind::Normal(ref item, _) => match item.meta(self.span) {
-                Some(MetaItem { kind: MetaItemKind::List(list), .. }) => Some(list),
+            AttrKind::Normal(ref item, _) => match item.meta_kind() {
+                Some(MetaItemKind::List(list)) => Some(list),
                 _ => None,
             },
             AttrKind::DocComment(..) => None,
@@ -228,6 +227,10 @@ impl AttrItem {
             span,
         })
     }
+
+    pub fn meta_kind(&self) -> Option<MetaItemKind> {
+        MetaItemKind::from_mac_args(&self.args)
+    }
 }
 
 impl Attribute {
@@ -238,11 +241,22 @@ impl Attribute {
         }
     }
 
+    pub fn doc_str_and_comment_kind(&self) -> Option<(Symbol, CommentKind)> {
+        match self.kind {
+            AttrKind::DocComment(kind, data) => Some((data, kind)),
+            AttrKind::Normal(ref item, _) if item.path == sym::doc => item
+                .meta_kind()
+                .and_then(|kind| kind.value_str())
+                .map(|data| (data, CommentKind::Line)),
+            _ => None,
+        }
+    }
+
     pub fn doc_str(&self) -> Option<Symbol> {
         match self.kind {
             AttrKind::DocComment(.., data) => Some(data),
             AttrKind::Normal(ref item, _) if item.path == sym::doc => {
-                item.meta(self.span).and_then(|meta| meta.value_str())
+                item.meta_kind().and_then(|kind| kind.value_str())
             }
             _ => None,
         }
@@ -266,6 +280,13 @@ impl Attribute {
     pub fn meta(&self) -> Option<MetaItem> {
         match self.kind {
             AttrKind::Normal(ref item, _) => item.meta(self.span),
+            AttrKind::DocComment(..) => None,
+        }
+    }
+
+    pub fn meta_kind(&self) -> Option<MetaItemKind> {
+        match self.kind {
+            AttrKind::Normal(ref item, _) => item.meta_kind(),
             AttrKind::DocComment(..) => None,
         }
     }
@@ -418,7 +439,7 @@ impl MetaItem {
             }
             Some(TokenTree::Token(Token { kind: token::Interpolated(nt), .. })) => match *nt {
                 token::Nonterminal::NtMeta(ref item) => return item.meta(item.path.span),
-                token::Nonterminal::NtPath(ref path) => path.clone(),
+                token::Nonterminal::NtPath(ref path) => (**path).clone(),
                 _ => return None,
             },
             _ => return None,
@@ -436,6 +457,16 @@ impl MetaItem {
 }
 
 impl MetaItemKind {
+    pub fn value_str(&self) -> Option<Symbol> {
+        match self {
+            MetaItemKind::NameValue(ref v) => match v.kind {
+                LitKind::Str(ref s, _) => Some(*s),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn mac_args(&self, span: Span) -> MacArgs {
         match self {
             MetaItemKind::Word => MacArgs::Empty,

@@ -1,13 +1,17 @@
 //! This lint is used to collect metadata about clippy lints. This metadata is exported as a json
 //! file and then used to generate the [clippy lint list](https://rust-lang.github.io/rust-clippy/master/index.html)
 //!
-//! This module and therefor the entire lint is guarded by a feature flag called
-//! `metadata-collector-lint`
+//! This module and therefore the entire lint is guarded by a feature flag called `internal`
 //!
 //! The module transforms all lint names to ascii lowercase to ensure that we don't have mismatches
 //! during any comparison or mapping. (Please take care of this, it's not fun to spend time on such
 //! a simple mistake)
 
+use crate::utils::internal_lints::{extract_clippy_version_value, is_lint_ref_type};
+
+use clippy_utils::diagnostics::span_lint;
+use clippy_utils::ty::{match_type, walk_ptrs_ty_depth};
+use clippy_utils::{last_path_segment, match_def_path, match_function_call, match_path, paths};
 use if_chain::if_chain;
 use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
@@ -15,8 +19,9 @@ use rustc_hir::{
     self as hir, def::DefKind, intravisit, intravisit::Visitor, ExprKind, Item, ItemKind, Mutability, QPath,
 };
 use rustc_lint::{CheckLintNameResult, LateContext, LateLintPass, LintContext, LintId};
-use rustc_middle::hir::map::Map;
+use rustc_middle::hir::nested_filter;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
+use rustc_span::symbol::Ident;
 use rustc_span::{sym, Loc, Span, Symbol};
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use std::collections::BinaryHeap;
@@ -24,12 +29,6 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::prelude::*;
 use std::path::Path;
-
-use crate::utils::internal_lints::is_lint_ref_type;
-use clippy_utils::{
-    diagnostics::span_lint, last_path_segment, match_def_path, match_function_call, match_path, paths, ty::match_type,
-    ty::walk_ptrs_ty_depth,
-};
 
 /// This is the output file of the lint collector.
 const OUTPUT_FILE: &str = "../util/gh-pages/lints.json";
@@ -86,7 +85,7 @@ macro_rules! CONFIGURATION_VALUE_TEMPLATE {
     };
 }
 
-const LINT_EMISSION_FUNCTIONS: [&[&str]; 7] = [
+const LINT_EMISSION_FUNCTIONS: [&[&str]; 8] = [
     &["clippy_utils", "diagnostics", "span_lint"],
     &["clippy_utils", "diagnostics", "span_lint_and_help"],
     &["clippy_utils", "diagnostics", "span_lint_and_note"],
@@ -94,6 +93,7 @@ const LINT_EMISSION_FUNCTIONS: [&[&str]; 7] = [
     &["clippy_utils", "diagnostics", "span_lint_and_sugg"],
     &["clippy_utils", "diagnostics", "span_lint_and_then"],
     &["clippy_utils", "diagnostics", "span_lint_hir_and_then"],
+    &["clippy_utils", "diagnostics", "span_lint_and_sugg_for_edges"],
 ];
 const SUGGESTION_DIAGNOSTIC_BUILDER_METHODS: [(&str, bool); 9] = [
     ("span_suggestion", false),
@@ -116,6 +116,8 @@ const DEPRECATED_LINT_TYPE: [&str; 3] = ["clippy_lints", "deprecated_lints", "Cl
 const APPLICABILITY_NAME_INDEX: usize = 2;
 /// This applicability will be set for unresolved applicability values.
 const APPLICABILITY_UNRESOLVED_STR: &str = "Unresolved";
+/// The version that will be displayed if none has been defined
+const VERION_DEFAULT_STR: &str = "Unknown";
 
 declare_clippy_lint! {
     /// ### What it does
@@ -144,6 +146,7 @@ declare_clippy_lint! {
     ///     "docs": " ### What it does\nCollects metadata about clippy lints for the website. [...] "
     /// }
     /// ```
+    #[clippy::version = "1.56.0"]
     pub INTERNAL_METADATA_COLLECTOR,
     internal_warn,
     "A busy bee collection metadata about lints"
@@ -215,18 +218,27 @@ struct LintMetadata {
     group: String,
     level: String,
     docs: String,
+    version: String,
     /// This field is only used in the output and will only be
     /// mapped shortly before the actual output.
     applicability: Option<ApplicabilityInfo>,
 }
 
 impl LintMetadata {
-    fn new(id: String, id_span: SerializableSpan, group: String, level: &'static str, docs: String) -> Self {
+    fn new(
+        id: String,
+        id_span: SerializableSpan,
+        group: String,
+        level: &'static str,
+        version: String,
+        docs: String,
+    ) -> Self {
         Self {
             id,
             id_span,
             group,
             level: level.to_string(),
+            version,
             docs,
             applicability: None,
         }
@@ -410,12 +422,14 @@ impl<'hir> LateLintPass<'hir> for MetadataCollector {
                     if let Some(configuration_section) = self.get_lint_configs(&lint_name) {
                         docs.push_str(&configuration_section);
                     }
+                    let version = get_lint_version(cx, item);
 
                     self.lints.push(LintMetadata::new(
                         lint_name,
                         SerializableSpan::from_item(cx, item),
                         group,
                         level,
+                        version,
                         docs,
                     ));
                 }
@@ -429,11 +443,14 @@ impl<'hir> LateLintPass<'hir> for MetadataCollector {
                 // Metadata the little we can get from a deprecated lint
                 if let Some(docs) = extract_attr_docs_or_lint(cx, item);
                 then {
+                    let version = get_lint_version(cx, item);
+
                     self.lints.push(LintMetadata::new(
                         lint_name,
                         SerializableSpan::from_item(cx, item),
                         DEPRECATED_LINT_GROUP_STR.to_string(),
                         DEPRECATED_LINT_LEVEL,
+                        version,
                         docs,
                     ));
                 }
@@ -457,7 +474,7 @@ impl<'hir> LateLintPass<'hir> for MetadataCollector {
     /// ```
     fn check_expr(&mut self, cx: &LateContext<'hir>, expr: &'hir hir::Expr<'_>) {
         if let Some(args) = match_lint_emission(cx, expr) {
-            let mut emission_info = extract_emission_info(cx, args);
+            let emission_info = extract_emission_info(cx, args);
             if emission_info.is_empty() {
                 // See:
                 // - src/misc.rs:734:9
@@ -467,7 +484,7 @@ impl<'hir> LateLintPass<'hir> for MetadataCollector {
                 return;
             }
 
-            for (lint_name, applicability, is_multi_part) in emission_info.drain(..) {
+            for (lint_name, applicability, is_multi_part) in emission_info {
                 let app_info = self.applicability_info.entry(lint_name).or_default();
                 app_info.applicability = applicability;
                 app_info.is_multi_part_suggestion = is_multi_part;
@@ -552,14 +569,23 @@ fn extract_attr_docs(cx: &LateContext<'_>, item: &Item<'_>) -> Option<String> {
     Some(docs)
 }
 
+fn get_lint_version(cx: &LateContext<'_>, item: &Item<'_>) -> String {
+    extract_clippy_version_value(cx, item).map_or_else(
+        || VERION_DEFAULT_STR.to_string(),
+        |version| version.as_str().to_string(),
+    )
+}
+
 fn get_lint_group_and_level_or_lint(
     cx: &LateContext<'_>,
     lint_name: &str,
-    item: &'hir Item<'_>,
+    item: &Item<'_>,
 ) -> Option<(String, &'static str)> {
-    let result = cx
-        .lint_store
-        .check_lint_name(cx.sess(), lint_name, Some(sym::clippy), &[]);
+    let result = cx.lint_store.check_lint_name(
+        lint_name,
+        Some(sym::clippy),
+        &[Ident::with_dummy_span(sym::clippy)].into_iter().collect(),
+    );
     if let CheckLintNameResult::Tool(Ok(lint_lst)) = result {
         if let Some(group) = get_lint_group(cx, lint_lst[0]) {
             if EXCLUDED_LINT_GROUPS.contains(&group.as_str()) {
@@ -587,8 +613,8 @@ fn get_lint_group_and_level_or_lint(
 }
 
 fn get_lint_group(cx: &LateContext<'_>, lint_id: LintId) -> Option<String> {
-    for (group_name, lints, _) in &cx.lint_store.get_lint_groups() {
-        if IGNORED_LINT_GROUPS.contains(group_name) {
+    for (group_name, lints, _) in cx.lint_store.get_lint_groups() {
+        if IGNORED_LINT_GROUPS.contains(&group_name) {
             continue;
         }
 
@@ -663,32 +689,31 @@ fn extract_emission_info<'hir>(
             applicability = resolve_applicability(cx, arg);
         } else if arg_ty.is_closure() {
             multi_part |= check_is_multi_part(cx, arg);
-            // TODO xFrednet 2021-03-01: don't use or_else but rather a comparison
             applicability = applicability.or_else(|| resolve_applicability(cx, arg));
         }
     }
 
     lints
-        .drain(..)
+        .into_iter()
         .map(|lint_name| (lint_name, applicability, multi_part))
         .collect()
 }
 
 /// Resolves the possible lints that this expression could reference
-fn resolve_lints(cx: &LateContext<'hir>, expr: &'hir hir::Expr<'hir>) -> Vec<String> {
+fn resolve_lints<'hir>(cx: &LateContext<'hir>, expr: &'hir hir::Expr<'hir>) -> Vec<String> {
     let mut resolver = LintResolver::new(cx);
     resolver.visit_expr(expr);
     resolver.lints
 }
 
 /// This function tries to resolve the linked applicability to the given expression.
-fn resolve_applicability(cx: &LateContext<'hir>, expr: &'hir hir::Expr<'hir>) -> Option<usize> {
+fn resolve_applicability<'hir>(cx: &LateContext<'hir>, expr: &'hir hir::Expr<'hir>) -> Option<usize> {
     let mut resolver = ApplicabilityResolver::new(cx);
     resolver.visit_expr(expr);
     resolver.complete()
 }
 
-fn check_is_multi_part(cx: &LateContext<'hir>, closure_expr: &'hir hir::Expr<'hir>) -> bool {
+fn check_is_multi_part<'hir>(cx: &LateContext<'hir>, closure_expr: &'hir hir::Expr<'hir>) -> bool {
     if let ExprKind::Closure(_, _, body_id, _, _) = closure_expr.kind {
         let mut scanner = IsMultiSpanScanner::new(cx);
         intravisit::walk_body(&mut scanner, cx.tcx.hir().body(body_id));
@@ -717,10 +742,10 @@ impl<'a, 'hir> LintResolver<'a, 'hir> {
 }
 
 impl<'a, 'hir> intravisit::Visitor<'hir> for LintResolver<'a, 'hir> {
-    type Map = Map<'hir>;
+    type NestedFilter = nested_filter::All;
 
-    fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
-        intravisit::NestedVisitorMap::All(self.cx.tcx.hir())
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.cx.tcx.hir()
     }
 
     fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) {
@@ -731,7 +756,7 @@ impl<'a, 'hir> intravisit::Visitor<'hir> for LintResolver<'a, 'hir> {
             let (expr_ty, _) = walk_ptrs_ty_depth(self.cx.typeck_results().expr_ty(expr));
             if match_type(self.cx, expr_ty, &paths::LINT);
             then {
-                if let hir::def::Res::Def(DefKind::Static, _) = path.res {
+                if let hir::def::Res::Def(DefKind::Static(..), _) = path.res {
                     let lint_name = last_path_segment(qpath).ident.name;
                     self.lints.push(sym_to_string(lint_name).to_ascii_lowercase());
                 } else if let Some(local) = get_parent_local(self.cx, expr) {
@@ -771,10 +796,10 @@ impl<'a, 'hir> ApplicabilityResolver<'a, 'hir> {
 }
 
 impl<'a, 'hir> intravisit::Visitor<'hir> for ApplicabilityResolver<'a, 'hir> {
-    type Map = Map<'hir>;
+    type NestedFilter = nested_filter::All;
 
-    fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
-        intravisit::NestedVisitorMap::All(self.cx.tcx.hir())
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.cx.tcx.hir()
     }
 
     fn visit_path(&mut self, path: &'hir hir::Path<'hir>, _id: hir::HirId) {
@@ -803,7 +828,7 @@ impl<'a, 'hir> intravisit::Visitor<'hir> for ApplicabilityResolver<'a, 'hir> {
 }
 
 /// This returns the parent local node if the expression is a reference one
-fn get_parent_local(cx: &LateContext<'hir>, expr: &'hir hir::Expr<'hir>) -> Option<&'hir hir::Local<'hir>> {
+fn get_parent_local<'hir>(cx: &LateContext<'hir>, expr: &'hir hir::Expr<'hir>) -> Option<&'hir hir::Local<'hir>> {
     if let ExprKind::Path(QPath::Resolved(_, path)) = expr.kind {
         if let hir::def::Res::Local(local_hir) = path.res {
             return get_parent_local_hir_id(cx, local_hir);
@@ -813,7 +838,7 @@ fn get_parent_local(cx: &LateContext<'hir>, expr: &'hir hir::Expr<'hir>) -> Opti
     None
 }
 
-fn get_parent_local_hir_id(cx: &LateContext<'hir>, hir_id: hir::HirId) -> Option<&'hir hir::Local<'hir>> {
+fn get_parent_local_hir_id<'hir>(cx: &LateContext<'hir>, hir_id: hir::HirId) -> Option<&'hir hir::Local<'hir>> {
     let map = cx.tcx.hir();
 
     match map.find(map.get_parent_node(hir_id)) {
@@ -854,10 +879,10 @@ impl<'a, 'hir> IsMultiSpanScanner<'a, 'hir> {
 }
 
 impl<'a, 'hir> intravisit::Visitor<'hir> for IsMultiSpanScanner<'a, 'hir> {
-    type Map = Map<'hir>;
+    type NestedFilter = nested_filter::All;
 
-    fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
-        intravisit::NestedVisitorMap::All(self.cx.tcx.hir())
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.cx.tcx.hir()
     }
 
     fn visit_expr(&mut self, expr: &'hir hir::Expr<'hir>) {
@@ -876,7 +901,7 @@ impl<'a, 'hir> intravisit::Visitor<'hir> for IsMultiSpanScanner<'a, 'hir> {
                     self.add_single_span_suggestion();
                 }
             },
-            ExprKind::MethodCall(path, _path_span, arg, _arg_span) => {
+            ExprKind::MethodCall(path, arg, _arg_span) => {
                 let (self_ty, _) = walk_ptrs_ty_depth(self.cx.typeck_results().expr_ty(&arg[0]));
                 if match_type(self.cx, self_ty, &paths::DIAGNOSTIC_BUILDER) {
                     let called_method = path.ident.name.as_str().to_string();

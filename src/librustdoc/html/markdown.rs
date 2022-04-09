@@ -236,9 +236,7 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for CodeBlocks<'_, 'a, I> {
         let should_panic;
         let ignore;
         let edition;
-        let kind = if let Some(Event::Start(Tag::CodeBlock(kind))) = event {
-            kind
-        } else {
+        let Some(Event::Start(Tag::CodeBlock(kind))) = event else {
             return event;
         };
 
@@ -538,7 +536,7 @@ impl<'a, 'b, 'ids, I: Iterator<Item = SpannedEvent<'a>>> Iterator
         }
 
         let event = self.inner.next();
-        if let Some((Event::Start(Tag::Heading(level)), _)) = event {
+        if let Some((Event::Start(Tag::Heading(level, _, _)), _)) = event {
             let mut id = String::new();
             for event in &mut self.inner {
                 match &event.0 {
@@ -560,11 +558,12 @@ impl<'a, 'b, 'ids, I: Iterator<Item = SpannedEvent<'a>>> Iterator
                 self.buf.push_front((Event::Html(format!("{} ", sec).into()), 0..0));
             }
 
-            let level = std::cmp::min(level + (self.heading_offset as u32), MAX_HEADER_LEVEL);
+            let level =
+                std::cmp::min(level as u32 + (self.heading_offset as u32), MAX_HEADER_LEVEL);
             self.buf.push_back((Event::Html(format!("</a></h{}>", level).into()), 0..0));
 
             let start_tags = format!(
-                "<h{level} id=\"{id}\" class=\"section-header\">\
+                "<h{level} id=\"{id}\">\
                     <a href=\"#{id}\">",
                 id = id,
                 level = level
@@ -773,7 +772,7 @@ crate fn find_testable_code<T: doctest::Tester>(
                 tests.add_test(text, block_info, line);
                 prev_offset = offset.start;
             }
-            Event::Start(Tag::Heading(level)) => {
+            Event::Start(Tag::Heading(level, _, _)) => {
                 register_header = Some(level as u32);
             }
             Event::Text(ref s) if register_header.is_some() => {
@@ -846,7 +845,6 @@ crate struct LangString {
     crate test_harness: bool,
     crate compile_fail: bool,
     crate error_codes: Vec<String>,
-    crate allow_fail: bool,
     crate edition: Option<Edition>,
 }
 
@@ -868,7 +866,6 @@ impl Default for LangString {
             test_harness: false,
             compile_fail: false,
             error_codes: Vec::new(),
-            allow_fail: false,
             edition: None,
         }
     }
@@ -922,9 +919,7 @@ impl LangString {
 
         data.original = string.to_owned();
 
-        let tokens = Self::tokens(string).collect::<Vec<&str>>();
-
-        for token in tokens {
+        for token in Self::tokens(string) {
             match token {
                 "should_panic" => {
                     data.should_panic = true;
@@ -943,10 +938,6 @@ impl LangString {
                         ignores.push(x.trim_start_matches("ignore-").to_owned());
                         seen_rust_tags = !seen_other_tags;
                     }
-                }
-                "allow_fail" => {
-                    data.allow_fail = true;
-                    seen_rust_tags = !seen_other_tags;
                 }
                 "rust" => {
                     data.rust = true;
@@ -992,12 +983,6 @@ impl LangString {
                     } else if s == "no-run" || s == "no_run" || s == "norun" {
                         Some((
                             "no_run",
-                            "the code block will either not be tested if not marked as a rust one \
-                             or will be run (which you might not want)",
-                        ))
-                    } else if s == "allow-fail" || s == "allow_fail" || s == "allowfail" {
-                        Some((
-                            "allow_fail",
                             "the code block will either not be tested if not marked as a rust one \
                              or will be run (which you might not want)",
                         ))
@@ -1053,7 +1038,7 @@ impl Markdown<'_> {
         let mut replacer = |broken_link: BrokenLink<'_>| {
             links
                 .iter()
-                .find(|link| &*link.original_text == broken_link.reference)
+                .find(|link| link.original_text.as_str() == &*broken_link.reference)
                 .map(|link| (link.href.as_str().into(), link.new_text.as_str().into()))
         };
 
@@ -1134,7 +1119,7 @@ impl MarkdownSummaryLine<'_> {
         let mut replacer = |broken_link: BrokenLink<'_>| {
             links
                 .iter()
-                .find(|link| &*link.original_text == broken_link.reference)
+                .find(|link| link.original_text.as_str() == &*broken_link.reference)
                 .map(|link| (link.href.as_str().into(), link.new_text.as_str().into()))
         };
 
@@ -1168,7 +1153,7 @@ fn markdown_summary_with_limit(
     let mut replacer = |broken_link: BrokenLink<'_>| {
         link_names
             .iter()
-            .find(|link| &*link.original_text == broken_link.reference)
+            .find(|link| link.original_text.as_str() == &*broken_link.reference)
             .map(|link| (link.href.as_str().into(), link.new_text.as_str().into()))
     };
 
@@ -1311,10 +1296,10 @@ crate fn markdown_links(md: &str) -> Vec<MarkdownLink> {
     };
 
     let mut push = |link: BrokenLink<'_>| {
-        let span = span_for_link(&CowStr::Borrowed(link.reference), link.span);
+        let span = span_for_link(&link.reference, link.span);
         links.borrow_mut().push(MarkdownLink {
             kind: LinkType::ShortcutUnknown,
-            link: link.reference.to_owned(),
+            link: link.reference.to_string(),
             range: span,
         });
         None
@@ -1329,7 +1314,7 @@ crate fn markdown_links(md: &str) -> Vec<MarkdownLink> {
 
     for ev in iter {
         if let Event::Start(Tag::Link(kind, dest, _)) = ev.0 {
-            debug!("found link: {}", dest);
+            debug!("found link: {dest}");
             let span = span_for_link(&dest, ev.1);
             links.borrow_mut().push(MarkdownLink { kind, link: dest.into_string(), range: span });
         }
@@ -1447,7 +1432,7 @@ fn init_id_map() -> FxHashMap<String, usize> {
     map.insert("theme-choices".to_owned(), 1);
     map.insert("settings-menu".to_owned(), 1);
     map.insert("help-button".to_owned(), 1);
-    map.insert("main".to_owned(), 1);
+    map.insert("main-content".to_owned(), 1);
     map.insert("search".to_owned(), 1);
     map.insert("crate-search".to_owned(), 1);
     map.insert("render-detail".to_owned(), 1);
@@ -1475,6 +1460,7 @@ fn init_id_map() -> FxHashMap<String, usize> {
     map.insert("provided-methods".to_owned(), 1);
     map.insert("implementors".to_owned(), 1);
     map.insert("synthetic-implementors".to_owned(), 1);
+    map.insert("implementations-list".to_owned(), 1);
     map.insert("trait-implementations-list".to_owned(), 1);
     map.insert("synthetic-implementations-list".to_owned(), 1);
     map.insert("blanket-implementations-list".to_owned(), 1);

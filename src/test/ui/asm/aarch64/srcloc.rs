@@ -1,7 +1,9 @@
 // only-aarch64
 // build-fail
+// needs-asm-support
 // compile-flags: -Ccodegen-units=1
-#![feature(asm)]
+
+use std::arch::asm;
 
 // Checks that inline asm errors are mapped to the correct line in the source code.
 

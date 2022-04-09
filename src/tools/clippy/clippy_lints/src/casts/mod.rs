@@ -1,3 +1,5 @@
+mod cast_abs_to_unsigned;
+mod cast_enum_constructor;
 mod cast_lossless;
 mod cast_possible_truncation;
 mod cast_possible_wrap;
@@ -5,6 +7,7 @@ mod cast_precision_loss;
 mod cast_ptr_alignment;
 mod cast_ref_to_mut;
 mod cast_sign_loss;
+mod cast_slice_different_sizes;
 mod char_lit_as_u8;
 mod fn_to_numeric_cast;
 mod fn_to_numeric_cast_any;
@@ -40,6 +43,7 @@ declare_clippy_lint! {
     /// let x = u64::MAX;
     /// x as f64;
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub CAST_PRECISION_LOSS,
     pedantic,
     "casts that cause loss of precision, e.g., `x as f32` where `x: u64`"
@@ -61,6 +65,7 @@ declare_clippy_lint! {
     /// let y: i8 = -1;
     /// y as u128; // will return 18446744073709551615
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub CAST_SIGN_LOSS,
     pedantic,
     "casts from signed types to unsigned types, e.g., `x as u32` where `x: i32`"
@@ -83,6 +88,7 @@ declare_clippy_lint! {
     ///     x as u8
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub CAST_POSSIBLE_TRUNCATION,
     pedantic,
     "casts that may cause truncation of the value, e.g., `x as u8` where `x: u32`, or `x as i32` where `x: f32`"
@@ -106,6 +112,7 @@ declare_clippy_lint! {
     /// ```rust
     /// u32::MAX as i32; // will yield a value of `-1`
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub CAST_POSSIBLE_WRAP,
     pedantic,
     "casts that may cause wrapping around the value, e.g., `x as i32` where `x: u32` and `x > i32::MAX`"
@@ -138,6 +145,7 @@ declare_clippy_lint! {
     ///     u64::from(x)
     /// }
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub CAST_LOSSLESS,
     pedantic,
     "casts using `as` that are known to be lossless, e.g., `x as u64` where `x: u8`"
@@ -163,6 +171,7 @@ declare_clippy_lint! {
     /// let _ = 2_i32;
     /// let _ = 0.5_f32;
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub UNNECESSARY_CAST,
     complexity,
     "cast to the same type, e.g., `x as i32` where `x: i32`"
@@ -190,6 +199,7 @@ declare_clippy_lint! {
     /// (&1u8 as *const u8).cast::<u16>();
     /// (&mut 1u8 as *mut u8).cast::<u16>();
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub CAST_PTR_ALIGNMENT,
     pedantic,
     "cast from a pointer to a more-strictly-aligned pointer"
@@ -217,6 +227,7 @@ declare_clippy_lint! {
     /// fn fun2() -> i32 { 1 }
     /// let a = fun2 as usize;
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub FN_TO_NUMERIC_CAST,
     style,
     "casting a function pointer to a numeric type other than usize"
@@ -247,6 +258,7 @@ declare_clippy_lint! {
     /// let fn_ptr = fn2 as usize;
     /// let fn_ptr_truncated = fn_ptr as i32;
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub FN_TO_NUMERIC_CAST_WITH_TRUNCATION,
     style,
     "casting a function pointer to a numeric type not wide enough to store the address"
@@ -283,6 +295,7 @@ declare_clippy_lint! {
     /// }
     /// let _ = fn3 as fn() -> u16;
     /// ```
+    #[clippy::version = "1.58.0"]
     pub FN_TO_NUMERIC_CAST_ANY,
     restriction,
     "casting a function pointer to any integer type"
@@ -317,6 +330,7 @@ declare_clippy_lint! {
     ///     }
     /// }
     /// ```
+    #[clippy::version = "1.33.0"]
     pub CAST_REF_TO_MUT,
     correctness,
     "a cast of reference to a mutable pointer"
@@ -344,6 +358,7 @@ declare_clippy_lint! {
     /// ```rust,ignore
     /// b'x'
     /// ```
+    #[clippy::version = "pre 1.29.0"]
     pub CHAR_LIT_AS_U8,
     complexity,
     "casting a character literal to `u8` truncates"
@@ -372,9 +387,113 @@ declare_clippy_lint! {
     /// let _ = ptr.cast::<i32>();
     /// let _ = mut_ptr.cast::<i32>();
     /// ```
+    #[clippy::version = "1.51.0"]
     pub PTR_AS_PTR,
     pedantic,
     "casting using `as` from and to raw pointers that doesn't change its mutability, where `pointer::cast` could take the place of `as`"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for casts from an enum type to an integral type which will definitely truncate the
+    /// value.
+    ///
+    /// ### Why is this bad?
+    /// The resulting integral value will not match the value of the variant it came from.
+    ///
+    /// ### Example
+    /// ```rust
+    /// enum E { X = 256 };
+    /// let _ = E::X as u8;
+    /// ```
+    #[clippy::version = "1.60.0"]
+    pub CAST_ENUM_TRUNCATION,
+    suspicious,
+    "casts from an enum type to an integral type which will truncate the value"
+}
+
+declare_clippy_lint! {
+    /// Checks for `as` casts between raw pointers to slices with differently sized elements.
+    ///
+    /// ### Why is this bad?
+    /// The produced raw pointer to a slice does not update its length metadata. The produced
+    /// pointer will point to a different number of bytes than the original pointer because the
+    /// length metadata of a raw slice pointer is in elements rather than bytes.
+    /// Producing a slice reference from the raw pointer will either create a slice with
+    /// less data (which can be surprising) or create a slice with more data and cause Undefined Behavior.
+    ///
+    /// ### Example
+    /// // Missing data
+    /// ```rust
+    /// let a = [1_i32, 2, 3, 4];
+    /// let p = &a as *const [i32] as *const [u8];
+    /// unsafe {
+    ///     println!("{:?}", &*p);
+    /// }
+    /// ```
+    /// // Undefined Behavior (note: also potential alignment issues)
+    /// ```rust
+    /// let a = [1_u8, 2, 3, 4];
+    /// let p = &a as *const [u8] as *const [u32];
+    /// unsafe {
+    ///     println!("{:?}", &*p);
+    /// }
+    /// ```
+    /// Instead use `ptr::slice_from_raw_parts` to construct a slice from a data pointer and the correct length
+    /// ```rust
+    /// let a = [1_i32, 2, 3, 4];
+    /// let old_ptr = &a as *const [i32];
+    /// // The data pointer is cast to a pointer to the target `u8` not `[u8]`
+    /// // The length comes from the known length of 4 i32s times the 4 bytes per i32
+    /// let new_ptr = core::ptr::slice_from_raw_parts(old_ptr as *const u8, 16);
+    /// unsafe {
+    ///     println!("{:?}", &*new_ptr);
+    /// }
+    /// ```
+    #[clippy::version = "1.60.0"]
+    pub CAST_SLICE_DIFFERENT_SIZES,
+    correctness,
+    "casting using `as` between raw pointers to slices of types with different sizes"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for casts from an enum tuple constructor to an integer.
+    ///
+    /// ### Why is this bad?
+    /// The cast is easily confused with casting a c-like enum value to an integer.
+    ///
+    /// ### Example
+    /// ```rust
+    /// enum E { X(i32) };
+    /// let _ = E::X as usize;
+    /// ```
+    #[clippy::version = "1.61.0"]
+    pub CAST_ENUM_CONSTRUCTOR,
+    suspicious,
+    "casts from an enum tuple constructor to an integer"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for uses of the `abs()` method that cast the result to unsigned.
+    ///
+    /// ### Why is this bad?
+    /// The `unsigned_abs()` method avoids panic when called on the MIN value.
+    ///
+    /// ### Example
+    /// ```rust
+    /// let x: i32 = -42;
+    /// let y: u32 = x.abs() as u32;
+    /// ```
+    /// Use instead:
+    /// let x: i32 = -42;
+    /// let y: u32 = x.unsigned_abs();
+    /// ```
+    #[clippy::version = "1.61.0"]
+    pub CAST_ABS_TO_UNSIGNED,
+    suspicious,
+    "casting the result of `abs()` to an unsigned integer can panic"
 }
 
 pub struct Casts {
@@ -396,16 +515,24 @@ impl_lint_pass!(Casts => [
     CAST_LOSSLESS,
     CAST_REF_TO_MUT,
     CAST_PTR_ALIGNMENT,
+    CAST_SLICE_DIFFERENT_SIZES,
     UNNECESSARY_CAST,
     FN_TO_NUMERIC_CAST_ANY,
     FN_TO_NUMERIC_CAST,
     FN_TO_NUMERIC_CAST_WITH_TRUNCATION,
     CHAR_LIT_AS_U8,
     PTR_AS_PTR,
+    CAST_ENUM_TRUNCATION,
+    CAST_ENUM_CONSTRUCTOR,
+    CAST_ABS_TO_UNSIGNED
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Casts {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
+        if !in_external_macro(cx.sess(), expr.span) {
+            ptr_as_ptr::check(cx, expr, &self.msrv);
+        }
+
         if expr.span.from_expansion() {
             return;
         }
@@ -426,12 +553,17 @@ impl<'tcx> LateLintPass<'tcx> for Casts {
             fn_to_numeric_cast_any::check(cx, expr, cast_expr, cast_from, cast_to);
             fn_to_numeric_cast::check(cx, expr, cast_expr, cast_from, cast_to);
             fn_to_numeric_cast_with_truncation::check(cx, expr, cast_expr, cast_from, cast_to);
-            if cast_from.is_numeric() && cast_to.is_numeric() && !in_external_macro(cx.sess(), expr.span) {
+
+            if cast_to.is_numeric() && !in_external_macro(cx.sess(), expr.span) {
                 cast_possible_truncation::check(cx, expr, cast_expr, cast_from, cast_to);
-                cast_possible_wrap::check(cx, expr, cast_from, cast_to);
-                cast_precision_loss::check(cx, expr, cast_from, cast_to);
-                cast_lossless::check(cx, expr, cast_expr, cast_from, cast_to);
-                cast_sign_loss::check(cx, expr, cast_expr, cast_from, cast_to);
+                if cast_from.is_numeric() {
+                    cast_possible_wrap::check(cx, expr, cast_from, cast_to);
+                    cast_precision_loss::check(cx, expr, cast_from, cast_to);
+                    cast_sign_loss::check(cx, expr, cast_expr, cast_from, cast_to);
+                    cast_abs_to_unsigned::check(cx, expr, cast_expr, cast_from, cast_to, &self.msrv);
+                }
+                cast_lossless::check(cx, expr, cast_expr, cast_from, cast_to, &self.msrv);
+                cast_enum_constructor::check(cx, expr, cast_expr, cast_from);
             }
         }
 
@@ -439,6 +571,7 @@ impl<'tcx> LateLintPass<'tcx> for Casts {
         cast_ptr_alignment::check(cx, expr);
         char_lit_as_u8::check(cx, expr);
         ptr_as_ptr::check(cx, expr, &self.msrv);
+        cast_slice_different_sizes::check(cx, expr, &self.msrv);
     }
 
     extract_msrv_attr!(LateContext);

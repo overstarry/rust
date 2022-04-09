@@ -19,13 +19,19 @@ use rustc_middle::ty;
 use rustc_middle::ty::DefIdTree;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::def_id::CRATE_DEF_INDEX;
+use rustc_span::{sym, Symbol};
 use rustc_target::spec::abi::Abi;
 
-use crate::clean::{self, utils::find_nearest_parent_module, ExternalCrate, ItemId, PrimitiveType};
+use crate::clean::{
+    self, types::ExternalLocation, utils::find_nearest_parent_module, ExternalCrate, ItemId,
+    PrimitiveType,
+};
 use crate::formats::item_type::ItemType;
 use crate::html::escape::Escape;
-use crate::html::render::cache::ExternalLocation;
 use crate::html::render::Context;
+
+use super::url_parts_builder::estimate_item_path_byte_length;
+use super::url_parts_builder::UrlPartsBuilder;
 
 crate trait Print {
     fn print(self, buffer: &mut Buffer);
@@ -56,6 +62,23 @@ impl Print for &'_ str {
 crate struct Buffer {
     for_html: bool,
     buffer: String,
+}
+
+impl core::fmt::Write for Buffer {
+    #[inline]
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.buffer.write_str(s)
+    }
+
+    #[inline]
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        self.buffer.write_char(c)
+    }
+
+    #[inline]
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> fmt::Result {
+        self.buffer.write_fmt(args)
+    }
 }
 
 impl Buffer {
@@ -120,11 +143,14 @@ impl Buffer {
     }
 }
 
-fn comma_sep<T: fmt::Display>(items: impl Iterator<Item = T>) -> impl fmt::Display {
+fn comma_sep<T: fmt::Display>(
+    items: impl Iterator<Item = T>,
+    space_after_comma: bool,
+) -> impl fmt::Display {
     display_fn(move |f| {
         for (i, item) in items.enumerate() {
             if i != 0 {
-                write!(f, ", ")?;
+                write!(f, ",{}", if space_after_comma { " " } else { "" })?;
             }
             fmt::Display::fmt(&item, f)?;
         }
@@ -139,9 +165,7 @@ crate fn print_generic_bounds<'a, 'tcx: 'a>(
     display_fn(move |f| {
         let mut bounds_dup = FxHashSet::default();
 
-        for (i, bound) in
-            bounds.iter().filter(|b| bounds_dup.insert(b.print(cx).to_string())).enumerate()
-        {
+        for (i, bound) in bounds.iter().filter(|b| bounds_dup.insert(b.clone())).enumerate() {
             if i > 0 {
                 f.write_str(" + ")?;
             }
@@ -173,7 +197,7 @@ impl clean::GenericParamDef {
                 Ok(())
             }
             clean::GenericParamDefKind::Type { bounds, default, .. } => {
-                f.write_str(&*self.name.as_str())?;
+                f.write_str(self.name.as_str())?;
 
                 if !bounds.is_empty() {
                     if f.alternate() {
@@ -220,15 +244,16 @@ impl clean::Generics {
         cx: &'a Context<'tcx>,
     ) -> impl fmt::Display + 'a + Captures<'tcx> {
         display_fn(move |f| {
-            let real_params =
-                self.params.iter().filter(|p| !p.is_synthetic_type_param()).collect::<Vec<_>>();
-            if real_params.is_empty() {
+            let mut real_params =
+                self.params.iter().filter(|p| !p.is_synthetic_type_param()).peekable();
+            if real_params.peek().is_none() {
                 return Ok(());
             }
+
             if f.alternate() {
-                write!(f, "<{:#}>", comma_sep(real_params.iter().map(|g| g.print(cx))))
+                write!(f, "<{:#}>", comma_sep(real_params.map(|g| g.print(cx)), true))
             } else {
-                write!(f, "&lt;{}&gt;", comma_sep(real_params.iter().map(|g| g.print(cx))))
+                write!(f, "&lt;{}&gt;", comma_sep(real_params.map(|g| g.print(cx)), true))
             }
         })
     }
@@ -244,10 +269,80 @@ crate fn print_where_clause<'a, 'tcx: 'a>(
     end_newline: bool,
 ) -> impl fmt::Display + 'a + Captures<'tcx> {
     display_fn(move |f| {
-        if gens.where_predicates.is_empty() {
+        let mut where_predicates = gens.where_predicates.iter().filter(|pred| {
+            !matches!(pred, clean::WherePredicate::BoundPredicate { bounds, .. } if bounds.is_empty())
+        }).map(|pred| {
+            display_fn(move |f| {
+                if f.alternate() {
+                    f.write_str(" ")?;
+                } else {
+                    f.write_str("<br>")?;
+                }
+
+                match pred {
+                    clean::WherePredicate::BoundPredicate { ty, bounds, bound_params } => {
+                        let bounds = bounds;
+                        let for_prefix = if bound_params.is_empty() {
+                            String::new()
+                        } else if f.alternate() {
+                            format!(
+                                "for&lt;{:#}&gt; ",
+                                comma_sep(bound_params.iter().map(|lt| lt.print()), true)
+                            )
+                        } else {
+                            format!(
+                                "for&lt;{}&gt; ",
+                                comma_sep(bound_params.iter().map(|lt| lt.print()), true)
+                            )
+                        };
+
+                        if f.alternate() {
+                            write!(
+                                f,
+                                "{}{:#}: {:#}",
+                                for_prefix,
+                                ty.print(cx),
+                                print_generic_bounds(bounds, cx)
+                            )
+                        } else {
+                            write!(
+                                f,
+                                "{}{}: {}",
+                                for_prefix,
+                                ty.print(cx),
+                                print_generic_bounds(bounds, cx)
+                            )
+                        }
+                    }
+                    clean::WherePredicate::RegionPredicate { lifetime, bounds } => {
+                        write!(
+                            f,
+                            "{}: {}",
+                            lifetime.print(),
+                            bounds
+                                .iter()
+                                .map(|b| b.print(cx).to_string())
+                                .collect::<Vec<_>>()
+                                .join(" + ")
+                        )
+                    }
+                    clean::WherePredicate::EqPredicate { lhs, rhs } => {
+                        if f.alternate() {
+                            write!(f, "{:#} == {:#}", lhs.print(cx), rhs.print(cx),)
+                        } else {
+                            write!(f, "{} == {}", lhs.print(cx), rhs.print(cx),)
+                        }
+                    }
+                }
+            })
+        }).peekable();
+
+        if where_predicates.peek().is_none() {
             return Ok(());
         }
+
         let mut clause = String::new();
+
         if f.alternate() {
             clause.push_str(" where");
         } else {
@@ -257,72 +352,11 @@ crate fn print_where_clause<'a, 'tcx: 'a>(
                 clause.push_str(" <span class=\"where\">where");
             }
         }
-        for (i, pred) in gens.where_predicates.iter().enumerate() {
-            if f.alternate() {
-                clause.push(' ');
-            } else {
-                clause.push_str("<br>");
-            }
 
-            match pred {
-                clean::WherePredicate::BoundPredicate { ty, bounds, bound_params } => {
-                    let bounds = bounds;
-                    let for_prefix = match bound_params.len() {
-                        0 => String::new(),
-                        _ if f.alternate() => {
-                            format!(
-                                "for&lt;{:#}&gt; ",
-                                comma_sep(bound_params.iter().map(|lt| lt.print()))
-                            )
-                        }
-                        _ => format!(
-                            "for&lt;{}&gt; ",
-                            comma_sep(bound_params.iter().map(|lt| lt.print()))
-                        ),
-                    };
-
-                    if f.alternate() {
-                        clause.push_str(&format!(
-                            "{}{:#}: {:#}",
-                            for_prefix,
-                            ty.print(cx),
-                            print_generic_bounds(bounds, cx)
-                        ));
-                    } else {
-                        clause.push_str(&format!(
-                            "{}{}: {}",
-                            for_prefix,
-                            ty.print(cx),
-                            print_generic_bounds(bounds, cx)
-                        ));
-                    }
-                }
-                clean::WherePredicate::RegionPredicate { lifetime, bounds } => {
-                    clause.push_str(&format!(
-                        "{}: {}",
-                        lifetime.print(),
-                        bounds
-                            .iter()
-                            .map(|b| b.print(cx).to_string())
-                            .collect::<Vec<_>>()
-                            .join(" + ")
-                    ));
-                }
-                clean::WherePredicate::EqPredicate { lhs, rhs } => {
-                    if f.alternate() {
-                        clause.push_str(&format!("{:#} == {:#}", lhs.print(cx), rhs.print(cx),));
-                    } else {
-                        clause.push_str(&format!("{} == {}", lhs.print(cx), rhs.print(cx),));
-                    }
-                }
-            }
-
-            if i < gens.where_predicates.len() - 1 || end_newline {
-                clause.push(',');
-            }
-        }
+        clause.push_str(&comma_sep(where_predicates, false).to_string());
 
         if end_newline {
+            clause.push(',');
             // add a space so stripping <br> tags and breaking spaces still renders properly
             if f.alternate() {
                 clause.push(' ');
@@ -346,7 +380,7 @@ crate fn print_where_clause<'a, 'tcx: 'a>(
 
 impl clean::Lifetime {
     crate fn print(&self) -> impl fmt::Display + '_ {
-        self.get_ref()
+        self.0.as_str()
     }
 }
 
@@ -372,13 +406,13 @@ impl clean::PolyTrait {
                     write!(
                         f,
                         "for<{:#}> ",
-                        comma_sep(self.generic_params.iter().map(|g| g.print(cx)))
+                        comma_sep(self.generic_params.iter().map(|g| g.print(cx)), true)
                     )?;
                 } else {
                     write!(
                         f,
                         "for&lt;{}&gt; ",
-                        comma_sep(self.generic_params.iter().map(|g| g.print(cx)))
+                        comma_sep(self.generic_params.iter().map(|g| g.print(cx)), true)
                     )?;
                 }
             }
@@ -402,7 +436,8 @@ impl clean::GenericBound {
                 let modifier_str = match modifier {
                     hir::TraitBoundModifier::None => "",
                     hir::TraitBoundModifier::Maybe => "?",
-                    hir::TraitBoundModifier::MaybeConst => "~const",
+                    // ~const is experimental; do not display those bounds in rustdoc
+                    hir::TraitBoundModifier::MaybeConst => "",
                 };
                 if f.alternate() {
                     write!(f, "{}{:#}", modifier_str, ty.print(cx))
@@ -499,11 +534,22 @@ crate enum HrefError {
     NotInExternalCache,
 }
 
+// Panics if `syms` is empty.
+crate fn join_with_double_colon(syms: &[Symbol]) -> String {
+    let mut s = String::with_capacity(estimate_item_path_byte_length(syms.len()));
+    s.push_str(&syms[0].as_str());
+    for sym in &syms[1..] {
+        s.push_str("::");
+        s.push_str(&sym.as_str());
+    }
+    s
+}
+
 crate fn href_with_root_path(
     did: DefId,
     cx: &Context<'_>,
     root_path: Option<&str>,
-) -> Result<(String, ItemType, Vec<String>), HrefError> {
+) -> Result<(String, ItemType, Vec<Symbol>), HrefError> {
     let tcx = cx.tcx();
     let def_kind = tcx.def_kind(did);
     let did = match def_kind {
@@ -515,7 +561,7 @@ crate fn href_with_root_path(
     };
     let cache = cx.cache();
     let relative_to = &cx.current;
-    fn to_module_fqp(shortty: ItemType, fqp: &[String]) -> &[String] {
+    fn to_module_fqp(shortty: ItemType, fqp: &[Symbol]) -> &[Symbol] {
         if shortty == ItemType::Module { fqp } else { &fqp[..fqp.len() - 1] }
     }
 
@@ -530,9 +576,9 @@ crate fn href_with_root_path(
     let mut is_remote = false;
     let (fqp, shortty, mut url_parts) = match cache.paths.get(&did) {
         Some(&(ref fqp, shortty)) => (fqp, shortty, {
-            let module_fqp = to_module_fqp(shortty, fqp);
+            let module_fqp = to_module_fqp(shortty, fqp.as_slice());
             debug!(?fqp, ?shortty, ?module_fqp);
-            href_relative_parts(module_fqp, relative_to)
+            href_relative_parts(module_fqp, relative_to).collect()
         }),
         None => {
             if let Some(&(ref fqp, shortty)) = cache.external_paths.get(&did) {
@@ -544,11 +590,13 @@ crate fn href_with_root_path(
                         ExternalLocation::Remote(ref s) => {
                             is_remote = true;
                             let s = s.trim_end_matches('/');
-                            let mut s = vec![s];
-                            s.extend(module_fqp[..].iter().map(String::as_str));
-                            s
+                            let mut builder = UrlPartsBuilder::singleton(s);
+                            builder.extend(module_fqp.iter().copied());
+                            builder
                         }
-                        ExternalLocation::Local => href_relative_parts(module_fqp, relative_to),
+                        ExternalLocation::Local => {
+                            href_relative_parts(module_fqp, relative_to).collect()
+                        }
                         ExternalLocation::Unknown => return Err(HrefError::DocumentationNotBuilt),
                     },
                 )
@@ -560,55 +608,58 @@ crate fn href_with_root_path(
     if !is_remote {
         if let Some(root_path) = root_path {
             let root = root_path.trim_end_matches('/');
-            url_parts.insert(0, root);
+            url_parts.push_front(root);
         }
     }
     debug!(?url_parts);
-    let last = &fqp.last().unwrap()[..];
-    let filename;
     match shortty {
         ItemType::Module => {
             url_parts.push("index.html");
         }
         _ => {
-            filename = format!("{}.{}.html", shortty.as_str(), last);
-            url_parts.push(&filename);
+            let prefix = shortty.as_str();
+            let last = fqp.last().unwrap();
+            url_parts.push_fmt(format_args!("{}.{}.html", prefix, last));
         }
     }
-    Ok((url_parts.join("/"), shortty, fqp.to_vec()))
+    Ok((url_parts.finish(), shortty, fqp.to_vec()))
 }
 
-crate fn href(did: DefId, cx: &Context<'_>) -> Result<(String, ItemType, Vec<String>), HrefError> {
+crate fn href(did: DefId, cx: &Context<'_>) -> Result<(String, ItemType, Vec<Symbol>), HrefError> {
     href_with_root_path(did, cx, None)
 }
 
 /// Both paths should only be modules.
 /// This is because modules get their own directories; that is, `std::vec` and `std::vec::Vec` will
 /// both need `../iter/trait.Iterator.html` to get at the iterator trait.
-crate fn href_relative_parts<'a>(fqp: &'a [String], relative_to_fqp: &'a [String]) -> Vec<&'a str> {
+crate fn href_relative_parts<'fqp>(
+    fqp: &'fqp [Symbol],
+    relative_to_fqp: &[Symbol],
+) -> Box<dyn Iterator<Item = Symbol> + 'fqp> {
     for (i, (f, r)) in fqp.iter().zip(relative_to_fqp.iter()).enumerate() {
         // e.g. linking to std::iter from std::vec (`dissimilar_part_count` will be 1)
         if f != r {
             let dissimilar_part_count = relative_to_fqp.len() - i;
-            let fqp_module = fqp[i..fqp.len()].iter().map(String::as_str);
-            return iter::repeat("..").take(dissimilar_part_count).chain(fqp_module).collect();
+            let fqp_module = &fqp[i..fqp.len()];
+            return box iter::repeat(sym::dotdot)
+                .take(dissimilar_part_count)
+                .chain(fqp_module.iter().copied());
         }
     }
     // e.g. linking to std::sync::atomic from std::sync
     if relative_to_fqp.len() < fqp.len() {
-        fqp[relative_to_fqp.len()..fqp.len()].iter().map(String::as_str).collect()
+        box fqp[relative_to_fqp.len()..fqp.len()].iter().copied()
     // e.g. linking to std::sync from std::sync::atomic
     } else if fqp.len() < relative_to_fqp.len() {
         let dissimilar_part_count = relative_to_fqp.len() - fqp.len();
-        iter::repeat("..").take(dissimilar_part_count).collect()
+        box iter::repeat(sym::dotdot).take(dissimilar_part_count)
     // linking to the same module
     } else {
-        Vec::new()
+        box iter::empty()
     }
 }
 
-/// Used when rendering a `ResolvedPath` structure. This invokes the `path`
-/// rendering function with the necessary arguments for linking to a local path.
+/// Used to render a [`clean::Path`].
 fn resolved_path<'cx>(
     w: &mut fmt::Formatter<'_>,
     did: DefId,
@@ -631,14 +682,14 @@ fn resolved_path<'cx>(
             if let Ok((_, _, fqp)) = href(did, cx) {
                 format!(
                     "{}::{}",
-                    fqp[..fqp.len() - 1].join("::"),
-                    anchor(did, fqp.last().unwrap(), cx)
+                    join_with_double_colon(&fqp[..fqp.len() - 1]),
+                    anchor(did, *fqp.last().unwrap(), cx)
                 )
             } else {
                 last.name.to_string()
             }
         } else {
-            anchor(did, &*last.name.as_str(), cx).to_string()
+            anchor(did, last.name, cx).to_string()
         };
         write!(w, "{}{}", path, last.args.print(cx))?;
     }
@@ -667,32 +718,31 @@ fn primitive_link(
                 needs_termination = true;
             }
             Some(&def_id) => {
-                let cname_str;
                 let loc = match m.extern_locations[&def_id.krate] {
                     ExternalLocation::Remote(ref s) => {
-                        cname_str =
-                            ExternalCrate { crate_num: def_id.krate }.name(cx.tcx()).as_str();
-                        Some(vec![s.trim_end_matches('/'), &cname_str[..]])
+                        let cname_sym = ExternalCrate { crate_num: def_id.krate }.name(cx.tcx());
+                        let builder: UrlPartsBuilder =
+                            [s.as_str().trim_end_matches('/'), cname_sym.as_str()]
+                                .into_iter()
+                                .collect();
+                        Some(builder)
                     }
                     ExternalLocation::Local => {
-                        cname_str =
-                            ExternalCrate { crate_num: def_id.krate }.name(cx.tcx()).as_str();
-                        Some(if cx.current.first().map(|x| &x[..]) == Some(&cname_str[..]) {
-                            iter::repeat("..").take(cx.current.len() - 1).collect()
+                        let cname_sym = ExternalCrate { crate_num: def_id.krate }.name(cx.tcx());
+                        Some(if cx.current.first() == Some(&cname_sym) {
+                            iter::repeat(sym::dotdot).take(cx.current.len() - 1).collect()
                         } else {
-                            let cname = iter::once(&cname_str[..]);
-                            iter::repeat("..").take(cx.current.len()).chain(cname).collect()
+                            iter::repeat(sym::dotdot)
+                                .take(cx.current.len())
+                                .chain(iter::once(cname_sym))
+                                .collect()
                         })
                     }
                     ExternalLocation::Unknown => None,
                 };
-                if let Some(loc) = loc {
-                    write!(
-                        f,
-                        "<a class=\"primitive\" href=\"{}/primitive.{}.html\">",
-                        loc.join("/"),
-                        prim.as_sym()
-                    )?;
+                if let Some(mut loc) = loc {
+                    loc.push_fmt(format_args!("primitive.{}.html", prim.as_sym()));
+                    write!(f, "<a class=\"primitive\" href=\"{}\">", loc.finish())?;
                     needs_termination = true;
                 }
             }
@@ -731,7 +781,7 @@ fn tybounds<'a, 'tcx: 'a>(
 
 crate fn anchor<'a, 'cx: 'a>(
     did: DefId,
-    text: &'a str,
+    text: Symbol,
     cx: &'cx Context<'_>,
 ) -> impl fmt::Display + 'a {
     let parts = href(did, cx);
@@ -743,8 +793,8 @@ crate fn anchor<'a, 'cx: 'a>(
                 short_ty,
                 url,
                 short_ty,
-                fqp.join("::"),
-                text
+                join_with_double_colon(&fqp),
+                text.as_str()
             )
         } else {
             write!(f, "{}", text)
@@ -762,7 +812,7 @@ fn fmt_type<'cx>(
 
     match *t {
         clean::Generic(name) => write!(f, "{}", name),
-        clean::ResolvedPath { ref path } => {
+        clean::Type::Path { ref path } => {
             // Paths like `T::Output` and `Self::Output` should be rendered with all segments.
             let did = path.def_id();
             resolved_path(f, did, path, path.is_assoc_ty(), use_absolute, cx)
@@ -775,7 +825,7 @@ fn fmt_type<'cx>(
         clean::Primitive(clean::PrimitiveType::Never) => {
             primitive_link(f, PrimitiveType::Never, "!", cx)
         }
-        clean::Primitive(prim) => primitive_link(f, prim, &*prim.as_sym().as_str(), cx),
+        clean::Primitive(prim) => primitive_link(f, prim, prim.as_sym().as_str(), cx),
         clean::BareFunction(ref decl) => {
             if f.alternate() {
                 write!(
@@ -924,7 +974,7 @@ fn fmt_type<'cx>(
                 write!(f, "impl {}", print_generic_bounds(bounds, cx))
             }
         }
-        clean::QPath { ref name, ref self_type, ref trait_, ref self_def_id } => {
+        clean::QPath { ref assoc, ref self_type, ref trait_, ref self_def_id } => {
             let should_show_cast = !trait_.segments.is_empty()
                 && self_def_id
                     .zip(Some(trait_.def_id()))
@@ -956,15 +1006,16 @@ fn fmt_type<'cx>(
                 Ok((ref url, _, ref path)) if !f.alternate() => {
                     write!(
                         f,
-                        "<a class=\"type\" href=\"{url}#{shortty}.{name}\" \
-                                    title=\"type {path}::{name}\">{name}</a>",
+                        "<a class=\"associatedtype\" href=\"{url}#{shortty}.{name}\" \
+                                    title=\"type {path}::{name}\">{name}</a>{args}",
                         url = url,
                         shortty = ItemType::AssocType,
-                        name = name,
-                        path = path.join("::")
+                        name = assoc.name,
+                        path = join_with_double_colon(path),
+                        args = assoc.args.print(cx),
                     )?;
                 }
-                _ => write!(f, "{}", name)?,
+                _ => write!(f, "{}{:#}", assoc.name, assoc.args.print(cx))?,
             }
             Ok(())
         }
@@ -1073,7 +1124,7 @@ impl clean::BareFunctionDecl {
                 write!(
                     f,
                     "for&lt;{}&gt; ",
-                    comma_sep(self.generic_params.iter().map(|g| g.print(cx)))
+                    comma_sep(self.generic_params.iter().map(|g| g.print(cx)), true)
                 )
             } else {
                 Ok(())
@@ -1134,8 +1185,8 @@ impl clean::FnDecl {
         cx: &Context<'_>,
     ) -> fmt::Result {
         let amp = if f.alternate() { "&" } else { "&amp;" };
-        let mut args = String::new();
-        let mut args_plain = String::new();
+        let mut args = Buffer::html();
+        let mut args_plain = Buffer::new();
         for (i, input) in self.inputs.values.iter().enumerate() {
             if i == 0 {
                 args.push_str("<br>");
@@ -1148,55 +1199,51 @@ impl clean::FnDecl {
                         args_plain.push_str("self");
                     }
                     clean::SelfBorrowed(Some(ref lt), mtbl) => {
-                        args.push_str(&format!(
-                            "{}{} {}self",
-                            amp,
-                            lt.print(),
-                            mtbl.print_with_space()
-                        ));
-                        args_plain.push_str(&format!(
-                            "&{} {}self",
-                            lt.print(),
-                            mtbl.print_with_space()
-                        ));
+                        write!(args, "{}{} {}self", amp, lt.print(), mtbl.print_with_space());
+                        write!(args_plain, "&{} {}self", lt.print(), mtbl.print_with_space());
                     }
                     clean::SelfBorrowed(None, mtbl) => {
-                        args.push_str(&format!("{}{}self", amp, mtbl.print_with_space()));
-                        args_plain.push_str(&format!("&{}self", mtbl.print_with_space()));
+                        write!(args, "{}{}self", amp, mtbl.print_with_space());
+                        write!(args_plain, "&{}self", mtbl.print_with_space());
                     }
                     clean::SelfExplicit(ref typ) => {
                         if f.alternate() {
-                            args.push_str(&format!("self: {:#}", typ.print(cx)));
+                            write!(args, "self: {:#}", typ.print(cx));
                         } else {
-                            args.push_str(&format!("self: {}", typ.print(cx)));
+                            write!(args, "self: {}", typ.print(cx));
                         }
-                        args_plain.push_str(&format!("self: {:#}", typ.print(cx)));
+                        write!(args_plain, "self: {:#}", typ.print(cx));
                     }
                 }
             } else {
                 if i > 0 {
                     args.push_str(" <br>");
-                    args_plain.push(' ');
+                    args_plain.push_str(" ");
+                }
+                if input.is_const {
+                    args.push_str("const ");
+                    args_plain.push_str("const ");
                 }
                 if !input.name.is_empty() {
-                    args.push_str(&format!("{}: ", input.name));
-                    args_plain.push_str(&format!("{}: ", input.name));
+                    write!(args, "{}: ", input.name);
+                    write!(args_plain, "{}: ", input.name);
                 }
 
                 if f.alternate() {
-                    args.push_str(&format!("{:#}", input.type_.print(cx)));
+                    write!(args, "{:#}", input.type_.print(cx));
                 } else {
-                    args.push_str(&input.type_.print(cx).to_string());
+                    write!(args, "{}", input.type_.print(cx));
                 }
-                args_plain.push_str(&format!("{:#}", input.type_.print(cx)));
+                write!(args_plain, "{:#}", input.type_.print(cx));
             }
             if i + 1 < self.inputs.values.len() {
-                args.push(',');
-                args_plain.push(',');
+                args.push_str(",");
+                args_plain.push_str(",");
             }
         }
 
-        let mut args_plain = format!("({})", args_plain);
+        let mut args_plain = format!("({})", args_plain.into_inner());
+        let mut args = args.into_inner();
 
         if self.c_variadic {
             args.push_str(",<br> ...");
@@ -1267,7 +1314,7 @@ impl clean::Visibility {
                     debug!("path={:?}", path);
                     // modified from `resolved_path()` to work with `DefPathData`
                     let last_name = path.data.last().unwrap().data.get_opt_name().unwrap();
-                    let anchor = anchor(vis_did, &last_name.as_str(), cx).to_string();
+                    let anchor = anchor(vis_did, last_name, cx).to_string();
 
                     let mut s = "pub(in ".to_owned();
                     for seg in &path.data[..path.data.len() - 1] {
@@ -1350,10 +1397,7 @@ impl PrintWithSpace for hir::Mutability {
     }
 }
 
-crate fn print_constness_with_space(
-    c: &hir::Constness,
-    s: Option<&ConstStability>,
-) -> &'static str {
+crate fn print_constness_with_space(c: &hir::Constness, s: Option<ConstStability>) -> &'static str {
     match (c, s) {
         // const stable or when feature(staged_api) is not set
         (
@@ -1401,9 +1445,9 @@ impl clean::ImportSource {
                 for seg in &self.path.segments[..self.path.segments.len() - 1] {
                     write!(f, "{}::", seg.name)?;
                 }
-                let name = self.path.last_name();
+                let name = self.path.last();
                 if let hir::def::Res::PrimTy(p) = self.path.res {
-                    primitive_link(f, PrimitiveType::from(p), &*name, cx)?;
+                    primitive_link(f, PrimitiveType::from(p), name.as_str(), cx)?;
                 } else {
                     write!(f, "{}", name)?;
                 }
@@ -1419,13 +1463,18 @@ impl clean::TypeBinding {
         cx: &'a Context<'tcx>,
     ) -> impl fmt::Display + 'a + Captures<'tcx> {
         display_fn(move |f| {
-            f.write_str(&*self.name.as_str())?;
+            f.write_str(self.assoc.name.as_str())?;
+            if f.alternate() {
+                write!(f, "{:#}", self.assoc.args.print(cx))?;
+            } else {
+                write!(f, "{}", self.assoc.args.print(cx))?;
+            }
             match self.kind {
-                clean::TypeBindingKind::Equality { ref ty } => {
+                clean::TypeBindingKind::Equality { ref term } => {
                     if f.alternate() {
-                        write!(f, " = {:#}", ty.print(cx))?;
+                        write!(f, " = {:#}", term.print(cx))?;
                     } else {
-                        write!(f, " = {}", ty.print(cx))?;
+                        write!(f, " = {}", term.print(cx))?;
                     }
                 }
                 clean::TypeBindingKind::Constraint { ref bounds } => {
@@ -1468,6 +1517,18 @@ impl clean::GenericArg {
             clean::GenericArg::Const(ct) => fmt::Display::fmt(&ct.print(cx.tcx()), f),
             clean::GenericArg::Infer => fmt::Display::fmt("_", f),
         })
+    }
+}
+
+impl clean::types::Term {
+    crate fn print<'a, 'tcx: 'a>(
+        &'a self,
+        cx: &'a Context<'tcx>,
+    ) -> impl fmt::Display + 'a + Captures<'tcx> {
+        match self {
+            clean::types::Term::Type(ty) => ty.print(cx),
+            _ => todo!(),
+        }
     }
 }
 

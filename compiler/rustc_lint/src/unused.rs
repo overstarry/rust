@@ -3,7 +3,7 @@ use crate::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext}
 use rustc_ast as ast;
 use rustc_ast::util::{classify, parser};
 use rustc_ast::{ExprKind, StmtKind};
-use rustc_errors::{pluralize, Applicability};
+use rustc_errors::{pluralize, Applicability, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
@@ -11,7 +11,7 @@ use rustc_middle::ty::adjustment;
 use rustc_middle::ty::{self, Ty};
 use rustc_span::symbol::Symbol;
 use rustc_span::symbol::{kw, sym};
-use rustc_span::{BytePos, MultiSpan, Span, DUMMY_SP};
+use rustc_span::{BytePos, Span, DUMMY_SP};
 
 declare_lint! {
     /// The `unused_must_use` lint detects unused result of a type flagged as
@@ -169,7 +169,9 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
         }
 
         if !(type_permits_lack_of_use || fn_warned || op_warned) {
-            cx.struct_span_lint(UNUSED_RESULTS, s.span, |lint| lint.build("unused result").emit());
+            cx.struct_span_lint(UNUSED_RESULTS, s.span, |lint| {
+                lint.build(&format!("unused result of type `{}`", ty)).emit();
+            });
         }
 
         // Returns whether an error has been emitted (and thus another does not need to be later).
@@ -200,7 +202,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                     let descr_pre = &format!("{}boxed ", descr_pre);
                     check_must_use_ty(cx, boxed_ty, expr, span, descr_pre, descr_post, plural_len)
                 }
-                ty::Adt(def, _) => check_must_use_def(cx, def.did, span, descr_pre, descr_post),
+                ty::Adt(def, _) => check_must_use_def(cx, def.did(), span, descr_pre, descr_post),
                 ty::Opaque(def, _) => {
                     let mut has_emitted = false;
                     for &(predicate, _) in cx.tcx.explicit_item_bounds(def) {
@@ -238,17 +240,17 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                 }
                 ty::Tuple(ref tys) => {
                     let mut has_emitted = false;
-                    let spans = if let hir::ExprKind::Tup(comps) = &expr.kind {
+                    let comps = if let hir::ExprKind::Tup(comps) = expr.kind {
                         debug_assert_eq!(comps.len(), tys.len());
-                        comps.iter().map(|e| e.span).collect()
+                        comps
                     } else {
-                        vec![]
+                        &[]
                     };
-                    for (i, ty) in tys.iter().map(|k| k.expect_ty()).enumerate() {
+                    for (i, ty) in tys.iter().enumerate() {
                         let descr_post = &format!(" in tuple element {}", i);
-                        let span = *spans.get(i).unwrap_or(&span);
-                        if check_must_use_ty(cx, ty, expr, span, descr_pre, descr_post, plural_len)
-                        {
+                        let e = comps.get(i).unwrap_or(expr);
+                        let span = e.span;
+                        if check_must_use_ty(cx, ty, e, span, descr_pre, descr_post, plural_len) {
                             has_emitted = true;
                         }
                     }
@@ -313,7 +315,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedResults {
                         let mut err = lint.build(&msg);
                         // check for #[must_use = "..."]
                         if let Some(note) = attr.value_str() {
-                            err.note(&note.as_str());
+                            err.note(note.as_str());
                         }
                         err.emit();
                     });
@@ -366,9 +368,9 @@ impl<'tcx> LateLintPass<'tcx> for PathStatements {
                         } else {
                             lint.span_help(s.span, "use `drop` to clarify the intent");
                         }
-                        lint.emit()
+                        lint.emit();
                     } else {
-                        lint.build("path statement with no effect").emit()
+                        lint.build("path statement with no effect").emit();
                     }
                 });
             }
@@ -476,8 +478,11 @@ trait UnusedDelimLint {
 
         lhs_needs_parens
             || (followed_by_block
-                && match inner.kind {
+                && match &inner.kind {
                     ExprKind::Ret(_) | ExprKind::Break(..) | ExprKind::Yield(..) => true,
+                    ExprKind::Range(_lhs, Some(rhs), _limits) => {
+                        matches!(rhs.kind, ExprKind::Block(..))
+                    }
                     _ => parser::contains_exterior_struct_lit(&inner),
                 })
     }
@@ -1106,7 +1111,7 @@ impl UnusedImportBraces {
             };
 
             cx.struct_span_lint(UNUSED_IMPORT_BRACES, item.span, |lint| {
-                lint.build(&format!("braces around {} is unnecessary", node_name)).emit()
+                lint.build(&format!("braces around {} is unnecessary", node_name)).emit();
             });
         }
     }
@@ -1165,7 +1170,7 @@ impl<'tcx> LateLintPass<'tcx> for UnusedAllocation {
                             "unnecessary allocation, use `&mut` instead"
                         }
                     };
-                    lint.build(msg).emit()
+                    lint.build(msg).emit();
                 });
             }
         }

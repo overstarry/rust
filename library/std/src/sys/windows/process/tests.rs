@@ -3,11 +3,12 @@ use super::Arg;
 use crate::env;
 use crate::ffi::{OsStr, OsString};
 use crate::process::Command;
+use crate::sys::to_u16s;
 
 #[test]
 fn test_raw_args() {
     let command_line = &make_command_line(
-        OsStr::new("quoted exe"),
+        &to_u16s("quoted exe").unwrap(),
         &[
             Arg::Regular(OsString::from("quote me")),
             Arg::Raw(OsString::from("quote me *not*")),
@@ -15,6 +16,7 @@ fn test_raw_args() {
             Arg::Raw(OsString::from("internal \\\"backslash-\"quote")),
             Arg::Regular(OsString::from("optional-quotes")),
         ],
+        false,
         false,
     )
     .unwrap();
@@ -28,9 +30,10 @@ fn test_raw_args() {
 fn test_make_command_line() {
     fn test_wrapper(prog: &str, args: &[&str], force_quotes: bool) -> String {
         let command_line = &make_command_line(
-            OsStr::new(prog),
+            &to_u16s(prog).unwrap(),
             &args.iter().map(|a| Arg::Regular(OsString::from(a))).collect::<Vec<_>>(),
             force_quotes,
+            false,
         )
         .unwrap();
         String::from_utf16(command_line).unwrap()
@@ -121,9 +124,7 @@ fn windows_env_unicode_case() {
             assert_eq!(
                 env::var(key).ok(),
                 value.map(|s| s.to_string_lossy().into_owned()),
-                "command environment mismatch: {} {}",
-                a,
-                b
+                "command environment mismatch: {a} {b}",
             );
         }
     }
@@ -135,28 +136,35 @@ fn windows_env_unicode_case() {
 fn windows_exe_resolver() {
     use super::resolve_exe;
     use crate::io;
+    use crate::sys::fs::symlink;
+    use crate::sys_common::io::test::tmpdir;
+
+    let env_paths = || env::var_os("PATH");
 
     // Test a full path, with and without the `exe` extension.
     let mut current_exe = env::current_exe().unwrap();
-    assert!(resolve_exe(current_exe.as_ref(), None).is_ok());
+    assert!(resolve_exe(current_exe.as_ref(), env_paths, None).is_ok());
     current_exe.set_extension("");
-    assert!(resolve_exe(current_exe.as_ref(), None).is_ok());
+    assert!(resolve_exe(current_exe.as_ref(), env_paths, None).is_ok());
 
     // Test lone file names.
-    assert!(resolve_exe(OsStr::new("cmd"), None).is_ok());
-    assert!(resolve_exe(OsStr::new("cmd.exe"), None).is_ok());
-    assert!(resolve_exe(OsStr::new("cmd.EXE"), None).is_ok());
-    assert!(resolve_exe(OsStr::new("fc"), None).is_ok());
+    assert!(resolve_exe(OsStr::new("cmd"), env_paths, None).is_ok());
+    assert!(resolve_exe(OsStr::new("cmd.exe"), env_paths, None).is_ok());
+    assert!(resolve_exe(OsStr::new("cmd.EXE"), env_paths, None).is_ok());
+    assert!(resolve_exe(OsStr::new("fc"), env_paths, None).is_ok());
 
     // Invalid file names should return InvalidInput.
-    assert_eq!(resolve_exe(OsStr::new(""), None).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     assert_eq!(
-        resolve_exe(OsStr::new("\0"), None).unwrap_err().kind(),
+        resolve_exe(OsStr::new(""), env_paths, None).unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        resolve_exe(OsStr::new("\0"), env_paths, None).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
     // Trailing slash, therefore there's no file name component.
     assert_eq!(
-        resolve_exe(OsStr::new(r"C:\Path\to\"), None).unwrap_err().kind(),
+        resolve_exe(OsStr::new(r"C:\Path\to\"), env_paths, None).unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
 
@@ -165,18 +173,28 @@ fn windows_exe_resolver() {
     changing the behaviour of `resolve_exe`.
     */
 
-    let paths = env::var_os("PATH").unwrap();
-    env::set_var("PATH", "");
-
-    assert_eq!(resolve_exe(OsStr::new("rustc"), None).unwrap_err().kind(), io::ErrorKind::NotFound);
-
-    let child_paths = Some(paths.as_os_str());
-    assert!(resolve_exe(OsStr::new("rustc"), child_paths).is_ok());
+    let empty_paths = || None;
 
     // The resolver looks in system directories even when `PATH` is empty.
-    assert!(resolve_exe(OsStr::new("cmd.exe"), None).is_ok());
+    assert!(resolve_exe(OsStr::new("cmd.exe"), empty_paths, None).is_ok());
 
     // The application's directory is also searched.
     let current_exe = env::current_exe().unwrap();
-    assert!(resolve_exe(current_exe.file_name().unwrap().as_ref(), None).is_ok());
+    assert!(resolve_exe(current_exe.file_name().unwrap().as_ref(), empty_paths, None).is_ok());
+
+    // Create a temporary path and add a broken symlink.
+    let temp = tmpdir();
+    let mut exe_path = temp.path().to_owned();
+    exe_path.push("exists.exe");
+
+    // A broken symlink should still be resolved.
+    // Skip this check if not in CI and creating symlinks isn't possible.
+    let is_ci = env::var("CI").is_ok();
+    let result = symlink("<DOES NOT EXIST>".as_ref(), &exe_path);
+    if is_ci || result.is_ok() {
+        result.unwrap();
+        assert!(
+            resolve_exe(OsStr::new("exists.exe"), empty_paths, Some(temp.path().as_ref())).is_ok()
+        );
+    }
 }

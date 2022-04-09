@@ -32,7 +32,7 @@ use rustc_session::Session;
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::sym;
 use rustc_span::{BytePos, FileName, InnerSpan, Pos, Span};
-use rustc_target::spec::{MergeFunctions, PanicStrategy, SanitizerSet};
+use rustc_target::spec::{MergeFunctions, SanitizerSet};
 
 use std::any::Any;
 use std::fs;
@@ -113,6 +113,7 @@ pub struct ModuleConfig {
     pub inline_threshold: Option<u32>,
     pub new_llvm_pass_manager: Option<bool>,
     pub emit_lifetime_markers: bool,
+    pub llvm_plugins: Vec<String>,
 }
 
 impl ModuleConfig {
@@ -217,7 +218,7 @@ impl ModuleConfig {
                 false
             ),
             emit_obj,
-            bc_cmdline: sess.target.bitcode_llvm_cmdline.clone(),
+            bc_cmdline: sess.target.bitcode_llvm_cmdline.to_string(),
 
             verify_llvm_ir: sess.verify_llvm_ir(),
             no_prepopulate_passes: sess.opts.cg.no_prepopulate_passes,
@@ -260,6 +261,7 @@ impl ModuleConfig {
             inline_threshold: sess.opts.cg.inline_threshold,
             new_llvm_pass_manager: sess.opts.debugging_opts.new_llvm_pass_manager,
             emit_lifetime_markers: sess.emit_lifetime_markers(),
+            llvm_plugins: if_regular!(sess.opts.debugging_opts.llvm_plugins.clone(), vec![]),
         }
     }
 
@@ -284,7 +286,11 @@ impl TargetMachineFactoryConfig {
         module_name: &str,
     ) -> TargetMachineFactoryConfig {
         let split_dwarf_file = if cgcx.target_can_use_split_dwarf {
-            cgcx.output_filenames.split_dwarf_path(cgcx.split_debuginfo, Some(module_name))
+            cgcx.output_filenames.split_dwarf_path(
+                cgcx.split_debuginfo,
+                cgcx.split_dwarf_kind,
+                Some(module_name),
+            )
         } else {
             None
         };
@@ -307,7 +313,6 @@ pub struct CodegenContext<B: WriteBackendMethods> {
     pub backend: B,
     pub prof: SelfProfilerRef,
     pub lto: Lto,
-    pub no_landing_pads: bool,
     pub save_temps: bool,
     pub fewer_names: bool,
     pub time_trace: bool,
@@ -327,6 +332,7 @@ pub struct CodegenContext<B: WriteBackendMethods> {
     pub target_arch: String,
     pub debuginfo: config::DebugInfo,
     pub split_debuginfo: rustc_target::spec::SplitDebuginfo,
+    pub split_dwarf_kind: rustc_session::config::SplitDwarfKind,
 
     // Number of cgus excluding the allocator/metadata modules
     pub total_cgus: usize,
@@ -397,7 +403,6 @@ fn generate_lto_work<B: ExtraBackendMethods>(
 
 pub struct CompiledModules {
     pub modules: Vec<CompiledModule>,
-    pub metadata_module: Option<CompiledModule>,
     pub allocator_module: Option<CompiledModule>,
 }
 
@@ -425,6 +430,7 @@ pub fn start_async_codegen<B: ExtraBackendMethods>(
     tcx: TyCtxt<'_>,
     target_cpu: String,
     metadata: EncodedMetadata,
+    metadata_module: Option<CompiledModule>,
     total_cgus: usize,
 ) -> OngoingCodegen<B> {
     let (coordinator_send, coordinator_receive) = channel();
@@ -464,13 +470,14 @@ pub fn start_async_codegen<B: ExtraBackendMethods>(
     OngoingCodegen {
         backend,
         metadata,
+        metadata_module,
         crate_info,
 
         coordinator_send,
         codegen_worker_receive,
         shared_emitter_main,
         future: coordinator_thread,
-        output_filenames: tcx.output_filenames(()),
+        output_filenames: tcx.output_filenames(()).clone(),
     }
 }
 
@@ -640,12 +647,6 @@ fn produce_final_output_artifacts(
         }
 
         if !user_wants_bitcode {
-            if let Some(ref metadata_module) = compiled_modules.metadata_module {
-                if let Some(ref path) = metadata_module.bytecode {
-                    ensure_removed(sess.diagnostic(), &path);
-                }
-            }
-
             if let Some(ref allocator_module) = compiled_modules.allocator_module {
                 if let Some(ref path) = allocator_module.bytecode {
                     ensure_removed(sess.diagnostic(), path);
@@ -682,11 +683,11 @@ impl<B: WriteBackendMethods> WorkItem<B> {
     fn start_profiling<'a>(&self, cgcx: &'a CodegenContext<B>) -> TimingGuard<'a> {
         match *self {
             WorkItem::Optimize(ref m) => {
-                cgcx.prof.generic_activity_with_arg("codegen_module_optimize", &m.name[..])
+                cgcx.prof.generic_activity_with_arg("codegen_module_optimize", &*m.name)
             }
             WorkItem::CopyPostLtoArtifacts(ref m) => cgcx
                 .prof
-                .generic_activity_with_arg("codegen_copy_artifacts_from_incr_cache", &m.name[..]),
+                .generic_activity_with_arg("codegen_copy_artifacts_from_incr_cache", &*m.name),
             WorkItem::LTO(ref m) => {
                 cgcx.prof.generic_activity_with_arg("codegen_module_perform_lto", m.name())
             }
@@ -778,7 +779,7 @@ pub fn compute_per_cgu_lto_type(
     // we'll encounter later.
     let is_allocator = module_kind == ModuleKind::Allocator;
 
-    // We ignore a request for full crate grath LTO if the cate type
+    // We ignore a request for full crate graph LTO if the crate type
     // is only an rlib, as there is no full crate graph to process,
     // that'll happen later.
     //
@@ -1032,12 +1033,12 @@ fn start_executing_work<B: ExtraBackendMethods>(
     } else {
         tcx.backend_optimization_level(())
     };
+    let backend_features = tcx.global_backend_features(());
     let cgcx = CodegenContext::<B> {
         backend: backend.clone(),
         crate_types: sess.crate_types().to_vec(),
         each_linked_rlib_for_lto,
         lto: sess.lto(),
-        no_landing_pads: sess.panic_strategy() == PanicStrategy::Abort,
         fewer_names: sess.fewer_names(),
         save_temps: sess.opts.cg.save_temps,
         time_trace: sess.opts.debugging_opts.llvm_time_trace,
@@ -1050,19 +1051,20 @@ fn start_executing_work<B: ExtraBackendMethods>(
         cgu_reuse_tracker: sess.cgu_reuse_tracker.clone(),
         coordinator_send,
         diag_emitter: shared_emitter.clone(),
-        output_filenames: tcx.output_filenames(()),
+        output_filenames: tcx.output_filenames(()).clone(),
         regular_module_config: regular_config,
         metadata_module_config: metadata_config,
         allocator_module_config: allocator_config,
-        tm_factory: backend.target_machine_factory(tcx.sess, ol),
+        tm_factory: backend.target_machine_factory(tcx.sess, ol, backend_features),
         total_cgus,
         msvc_imps_needed: msvc_imps_needed(tcx),
         is_pe_coff: tcx.sess.target.is_like_windows,
         target_can_use_split_dwarf: tcx.sess.target_can_use_split_dwarf(),
         target_pointer_width: tcx.sess.target.pointer_width,
-        target_arch: tcx.sess.target.arch.clone(),
+        target_arch: tcx.sess.target.arch.to_string(),
         debuginfo: tcx.sess.opts.debuginfo,
         split_debuginfo: tcx.sess.split_debuginfo(),
+        split_dwarf_kind: tcx.sess.opts.debugging_opts.split_dwarf_kind,
     };
 
     // This is the "main loop" of parallel work happening for parallel codegen.
@@ -1216,7 +1218,6 @@ fn start_executing_work<B: ExtraBackendMethods>(
         // This is where we collect codegen units that have gone all the way
         // through codegen and LLVM.
         let mut compiled_modules = vec![];
-        let mut compiled_metadata_module = None;
         let mut compiled_allocator_module = None;
         let mut needs_link = Vec::new();
         let mut needs_fat_lto = Vec::new();
@@ -1475,14 +1476,11 @@ fn start_executing_work<B: ExtraBackendMethods>(
                         ModuleKind::Regular => {
                             compiled_modules.push(compiled_module);
                         }
-                        ModuleKind::Metadata => {
-                            assert!(compiled_metadata_module.is_none());
-                            compiled_metadata_module = Some(compiled_module);
-                        }
                         ModuleKind::Allocator => {
                             assert!(compiled_allocator_module.is_none());
                             compiled_allocator_module = Some(compiled_module);
                         }
+                        ModuleKind::Metadata => bug!("Should be handled separately"),
                     }
                 }
                 Message::NeedsLink { module, worker_id } => {
@@ -1539,7 +1537,6 @@ fn start_executing_work<B: ExtraBackendMethods>(
 
         Ok(CompiledModules {
             modules: compiled_modules,
-            metadata_module: compiled_metadata_module,
             allocator_module: compiled_allocator_module,
         })
     });
@@ -1710,22 +1707,32 @@ impl SharedEmitter {
 
 impl Emitter for SharedEmitter {
     fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
+        let fluent_args = self.to_fluent_args(diag.args());
         drop(self.sender.send(SharedEmitterMessage::Diagnostic(Diagnostic {
-            msg: diag.message(),
+            msg: self.translate_messages(&diag.message, &fluent_args).to_string(),
             code: diag.code.clone(),
-            lvl: diag.level,
+            lvl: diag.level(),
         })));
         for child in &diag.children {
             drop(self.sender.send(SharedEmitterMessage::Diagnostic(Diagnostic {
-                msg: child.message(),
+                msg: self.translate_messages(&child.message, &fluent_args).to_string(),
                 code: None,
                 lvl: child.level,
             })));
         }
         drop(self.sender.send(SharedEmitterMessage::AbortIfErrors));
     }
+
     fn source_map(&self) -> Option<&Lrc<SourceMap>> {
         None
+    }
+
+    fn fluent_bundle(&self) -> Option<&Lrc<rustc_errors::FluentBundle>> {
+        None
+    }
+
+    fn fallback_fluent_bundle(&self) -> &Lrc<rustc_errors::FluentBundle> {
+        panic!("shared emitter attempted to translate a diagnostic");
     }
 }
 
@@ -1751,15 +1758,15 @@ impl SharedEmitterMain {
                     if let Some(code) = diag.code {
                         d.code(code);
                     }
-                    handler.emit_diagnostic(&d);
+                    handler.emit_diagnostic(&mut d);
                 }
                 Ok(SharedEmitterMessage::InlineAsmError(cookie, msg, level, source)) => {
                     let msg = msg.strip_prefix("error: ").unwrap_or(&msg);
 
                     let mut err = match level {
-                        Level::Error { lint: false } => sess.struct_err(&msg),
-                        Level::Warning => sess.struct_warn(&msg),
-                        Level::Note => sess.struct_note_without_error(&msg),
+                        Level::Error { lint: false } => sess.struct_err(msg).forget_guarantee(),
+                        Level::Warning => sess.struct_warn(msg),
+                        Level::Note => sess.struct_note_without_error(msg),
                         _ => bug!("Invalid inline asm diagnostic level"),
                     };
 
@@ -1800,6 +1807,7 @@ impl SharedEmitterMain {
 pub struct OngoingCodegen<B: ExtraBackendMethods> {
     pub backend: B,
     pub metadata: EncodedMetadata,
+    pub metadata_module: Option<CompiledModule>,
     pub crate_info: CrateInfo,
     pub coordinator_send: Sender<Box<dyn Any + Send>>,
     pub codegen_worker_receive: Receiver<Message<B>>,
@@ -1846,7 +1854,7 @@ impl<B: ExtraBackendMethods> OngoingCodegen<B> {
 
                 modules: compiled_modules.modules,
                 allocator_module: compiled_modules.allocator_module,
-                metadata_module: compiled_modules.metadata_module,
+                metadata_module: self.metadata_module,
             },
             work_products,
         )

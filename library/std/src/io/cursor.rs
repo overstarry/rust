@@ -3,8 +3,9 @@ mod tests;
 
 use crate::io::prelude::*;
 
+use crate::alloc::Allocator;
 use crate::cmp;
-use crate::io::{self, Error, ErrorKind, Initializer, IoSlice, IoSliceMut, SeekFrom};
+use crate::io::{self, ErrorKind, IoSlice, IoSliceMut, ReadBuf, SeekFrom};
 
 use core::convert::TryInto;
 
@@ -297,9 +298,9 @@ where
                 self.pos = n;
                 Ok(self.pos)
             }
-            None => Err(Error::new_const(
+            None => Err(io::const_io_error!(
                 ErrorKind::InvalidInput,
-                &"invalid seek to a negative or overflowing position",
+                "invalid seek to a negative or overflowing position",
             )),
         }
     }
@@ -324,6 +325,16 @@ where
         Ok(n)
     }
 
+    fn read_buf(&mut self, buf: &mut ReadBuf<'_>) -> io::Result<()> {
+        let prev_filled = buf.filled_len();
+
+        Read::read_buf(&mut self.fill_buf()?, buf)?;
+
+        self.pos += (buf.filled_len() - prev_filled) as u64;
+
+        Ok(())
+    }
+
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         let mut nread = 0;
         for buf in bufs {
@@ -345,11 +356,6 @@ where
         Read::read_exact(&mut self.remaining_slice(), buf)?;
         self.pos += n as u64;
         Ok(())
-    }
-
-    #[inline]
-    unsafe fn initializer(&self) -> Initializer {
-        Initializer::nop()
     }
 }
 
@@ -393,11 +399,14 @@ fn slice_write_vectored(
 }
 
 // Resizing write implementation
-fn vec_write(pos_mut: &mut u64, vec: &mut Vec<u8>, buf: &[u8]) -> io::Result<usize> {
+fn vec_write<A>(pos_mut: &mut u64, vec: &mut Vec<u8, A>, buf: &[u8]) -> io::Result<usize>
+where
+    A: Allocator,
+{
     let pos: usize = (*pos_mut).try_into().map_err(|_| {
-        Error::new_const(
+        io::const_io_error!(
             ErrorKind::InvalidInput,
-            &"cursor position exceeds maximum possible vector length",
+            "cursor position exceeds maximum possible vector length",
         )
     })?;
     // Make sure the internal buffer is as least as big as where we
@@ -421,11 +430,14 @@ fn vec_write(pos_mut: &mut u64, vec: &mut Vec<u8>, buf: &[u8]) -> io::Result<usi
     Ok(buf.len())
 }
 
-fn vec_write_vectored(
+fn vec_write_vectored<A>(
     pos_mut: &mut u64,
-    vec: &mut Vec<u8>,
+    vec: &mut Vec<u8, A>,
     bufs: &[IoSlice<'_>],
-) -> io::Result<usize> {
+) -> io::Result<usize>
+where
+    A: Allocator,
+{
     let mut nwritten = 0;
     for buf in bufs {
         nwritten += vec_write(pos_mut, vec, buf)?;
@@ -457,7 +469,10 @@ impl Write for Cursor<&mut [u8]> {
 }
 
 #[stable(feature = "cursor_mut_vec", since = "1.25.0")]
-impl Write for Cursor<&mut Vec<u8>> {
+impl<A> Write for Cursor<&mut Vec<u8, A>>
+where
+    A: Allocator,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         vec_write(&mut self.pos, self.inner, buf)
     }
@@ -478,7 +493,10 @@ impl Write for Cursor<&mut Vec<u8>> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl Write for Cursor<Vec<u8>> {
+impl<A> Write for Cursor<Vec<u8, A>>
+where
+    A: Allocator,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         vec_write(&mut self.pos, &mut self.inner, buf)
     }
@@ -499,7 +517,33 @@ impl Write for Cursor<Vec<u8>> {
 }
 
 #[stable(feature = "cursor_box_slice", since = "1.5.0")]
-impl Write for Cursor<Box<[u8]>> {
+impl<A> Write for Cursor<Box<[u8], A>>
+where
+    A: Allocator,
+{
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        slice_write(&mut self.pos, &mut self.inner, buf)
+    }
+
+    #[inline]
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        slice_write_vectored(&mut self.pos, &mut self.inner, bufs)
+    }
+
+    #[inline]
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[stable(feature = "cursor_array", since = "1.61.0")]
+impl<const N: usize> Write for Cursor<[u8; N]> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         slice_write(&mut self.pos, &mut self.inner, buf)

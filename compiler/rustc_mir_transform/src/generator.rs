@@ -210,7 +210,7 @@ struct SuspensionPoint<'tcx> {
 
 struct TransformVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    state_adt_ref: &'tcx AdtDef,
+    state_adt_ref: AdtDef<'tcx>,
     state_substs: SubstsRef<'tcx>,
 
     // The type of the discriminant in the generator struct
@@ -233,7 +233,7 @@ struct TransformVisitor<'tcx> {
     new_ret_local: Local,
 }
 
-impl TransformVisitor<'tcx> {
+impl<'tcx> TransformVisitor<'tcx> {
     // Make a GeneratorState variant assignment. `core::ops::GeneratorState` only has single
     // element tuple variants, so we can just write to the downcasted first field and then set the
     // discriminant to the appropriate variant.
@@ -243,11 +243,11 @@ impl TransformVisitor<'tcx> {
         val: Operand<'tcx>,
         source_info: SourceInfo,
     ) -> impl Iterator<Item = Statement<'tcx>> {
-        let kind = AggregateKind::Adt(self.state_adt_ref, idx, self.state_substs, None, None);
-        assert_eq!(self.state_adt_ref.variants[idx].fields.len(), 1);
+        let kind = AggregateKind::Adt(self.state_adt_ref.did(), idx, self.state_substs, None, None);
+        assert_eq!(self.state_adt_ref.variant(idx).fields.len(), 1);
         let ty = self
             .tcx
-            .type_of(self.state_adt_ref.variants[idx].fields[0].did)
+            .type_of(self.state_adt_ref.variant(idx).fields[0].did)
             .subst(self.tcx, self.state_substs);
         expand_aggregate(
             Place::return_place(),
@@ -295,7 +295,7 @@ impl TransformVisitor<'tcx> {
     }
 }
 
-impl MutVisitor<'tcx> for TransformVisitor<'tcx> {
+impl<'tcx> MutVisitor<'tcx> for TransformVisitor<'tcx> {
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -446,7 +446,7 @@ struct LivenessInfo {
     storage_liveness: IndexVec<BasicBlock, Option<BitSet<Local>>>,
 }
 
-fn locals_live_across_suspend_points(
+fn locals_live_across_suspend_points<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     always_live_locals: &storage::AlwaysLiveLocals,
@@ -463,10 +463,8 @@ fn locals_live_across_suspend_points(
 
     // Calculate the MIR locals which have been previously
     // borrowed (even if they are still active).
-    let borrowed_locals_results = MaybeBorrowedLocals::all_borrows()
-        .into_engine(tcx, body_ref)
-        .pass_name("generator")
-        .iterate_to_fixpoint();
+    let borrowed_locals_results =
+        MaybeBorrowedLocals.into_engine(tcx, body_ref).pass_name("generator").iterate_to_fixpoint();
 
     let mut borrowed_locals_cursor =
         rustc_mir_dataflow::ResultsCursor::new(body_ref, &borrowed_locals_results);
@@ -502,7 +500,7 @@ fn locals_live_across_suspend_points(
                 // The `liveness` variable contains the liveness of MIR locals ignoring borrows.
                 // This is correct for movable generators since borrows cannot live across
                 // suspension points. However for immovable generators we need to account for
-                // borrows, so we conseratively assume that all borrowed locals are live until
+                // borrows, so we conservatively assume that all borrowed locals are live until
                 // we find a StorageDead statement referencing the locals.
                 // To do this we just union our `liveness` result with `borrowed_locals`, which
                 // contains all the locals which has been borrowed before this suspension point.
@@ -613,7 +611,7 @@ impl ops::Deref for GeneratorSavedLocals {
 /// time. Generates a bitset for every local of all the other locals that may be
 /// StorageLive simultaneously with that local. This is used in the layout
 /// computation; see `GeneratorLayout` for more.
-fn compute_storage_conflicts(
+fn compute_storage_conflicts<'mir, 'tcx>(
     body: &'mir Body<'tcx>,
     saved_locals: &GeneratorSavedLocals,
     always_live_locals: storage::AlwaysLiveLocals,
@@ -672,7 +670,9 @@ struct StorageConflictVisitor<'mir, 'tcx, 's> {
     local_conflicts: BitMatrix<Local, Local>,
 }
 
-impl rustc_mir_dataflow::ResultsVisitor<'mir, 'tcx> for StorageConflictVisitor<'mir, 'tcx, '_> {
+impl<'mir, 'tcx> rustc_mir_dataflow::ResultsVisitor<'mir, 'tcx>
+    for StorageConflictVisitor<'mir, 'tcx, '_>
+{
     type FlowState = BitSet<Local>;
 
     fn visit_statement_before_primary_effect(
@@ -694,7 +694,7 @@ impl rustc_mir_dataflow::ResultsVisitor<'mir, 'tcx> for StorageConflictVisitor<'
     }
 }
 
-impl<'body, 'tcx, 's> StorageConflictVisitor<'body, 'tcx, 's> {
+impl StorageConflictVisitor<'_, '_, '_> {
     fn apply_state(&mut self, flow_state: &BitSet<Local>, loc: Location) {
         // Ignore unreachable blocks.
         if self.body.basic_blocks()[loc.block].terminator().kind == TerminatorKind::Unreachable {
@@ -724,9 +724,13 @@ fn sanitize_witness<'tcx>(
     saved_locals: &GeneratorSavedLocals,
 ) {
     let did = body.source.def_id();
-    let allowed_upvars = tcx.erase_regions(upvars);
+    let param_env = tcx.param_env(did);
+
+    let allowed_upvars = tcx.normalize_erasing_regions(param_env, upvars);
     let allowed = match witness.kind() {
-        &ty::GeneratorWitness(s) => tcx.erase_late_bound_regions(s),
+        &ty::GeneratorWitness(interior_tys) => {
+            tcx.normalize_erasing_late_bound_regions(param_env, interior_tys)
+        }
         _ => {
             tcx.sess.delay_span_bug(
                 body.span,
@@ -735,8 +739,6 @@ fn sanitize_witness<'tcx>(
             return;
         }
     };
-
-    let param_env = tcx.param_env(did);
 
     for (local, decl) in body.local_decls.iter_enumerated() {
         // Ignore locals which are internal or not saved between yields.
@@ -1232,10 +1234,12 @@ fn create_cases<'tcx>(
 }
 
 impl<'tcx> MirPass<'tcx> for StateTransform {
+    fn phase_change(&self) -> Option<MirPhase> {
+        Some(MirPhase::GeneratorsLowered)
+    }
+
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        let yield_ty = if let Some(yield_ty) = body.yield_ty() {
-            yield_ty
-        } else {
+        let Some(yield_ty) = body.yield_ty() else {
             // This only applies to generators
             return;
         };
@@ -1394,7 +1398,7 @@ impl EnsureGeneratorFieldAssignmentsNeverAlias<'_> {
         self.saved_locals.get(place.local)
     }
 
-    fn check_assigned_place(&mut self, place: Place<'tcx>, f: impl FnOnce(&mut Self)) {
+    fn check_assigned_place(&mut self, place: Place<'_>, f: impl FnOnce(&mut Self)) {
         if let Some(assigned_local) = self.saved_local_for_direct_place(place) {
             assert!(self.assigned_local.is_none(), "`check_assigned_place` must not recurse");
 
@@ -1405,24 +1409,18 @@ impl EnsureGeneratorFieldAssignmentsNeverAlias<'_> {
     }
 }
 
-impl Visitor<'tcx> for EnsureGeneratorFieldAssignmentsNeverAlias<'_> {
+impl<'tcx> Visitor<'tcx> for EnsureGeneratorFieldAssignmentsNeverAlias<'_> {
     fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
-        let lhs = match self.assigned_local {
-            Some(l) => l,
-            None => {
-                // This visitor only invokes `visit_place` for the right-hand side of an assignment
-                // and only after setting `self.assigned_local`. However, the default impl of
-                // `Visitor::super_body` may call `visit_place` with a `NonUseContext` for places
-                // with debuginfo. Ignore them here.
-                assert!(!context.is_use());
-                return;
-            }
+        let Some(lhs) = self.assigned_local else {
+            // This visitor only invokes `visit_place` for the right-hand side of an assignment
+            // and only after setting `self.assigned_local`. However, the default impl of
+            // `Visitor::super_body` may call `visit_place` with a `NonUseContext` for places
+            // with debuginfo. Ignore them here.
+            assert!(!context.is_use());
+            return;
         };
 
-        let rhs = match self.saved_local_for_direct_place(*place) {
-            Some(l) => l,
-            None => return,
-        };
+        let Some(rhs) = self.saved_local_for_direct_place(*place) else { return };
 
         if !self.storage_conflicts.contains(lhs, rhs) {
             bug!(
@@ -1440,9 +1438,6 @@ impl Visitor<'tcx> for EnsureGeneratorFieldAssignmentsNeverAlias<'_> {
             StatementKind::Assign(box (lhs, rhs)) => {
                 self.check_assigned_place(*lhs, |this| this.visit_rvalue(rhs, location));
             }
-
-            // FIXME: Does `llvm_asm!` have any aliasing requirements?
-            StatementKind::LlvmInlineAsm(_) => {}
 
             StatementKind::FakeRead(..)
             | StatementKind::SetDiscriminant { .. }

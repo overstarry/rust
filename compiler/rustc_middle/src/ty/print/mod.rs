@@ -37,7 +37,7 @@ pub trait Printer<'tcx>: Sized {
     type DynExistential;
     type Const;
 
-    fn tcx(&'a self) -> TyCtxt<'tcx>;
+    fn tcx<'a>(&'a self) -> TyCtxt<'tcx>;
 
     fn print_def_path(
         self,
@@ -66,7 +66,7 @@ pub trait Printer<'tcx>: Sized {
         predicates: &'tcx ty::List<ty::Binder<'tcx, ty::ExistentialPredicate<'tcx>>>,
     ) -> Result<Self::DynExistential, Self::Error>;
 
-    fn print_const(self, ct: &'tcx ty::Const<'tcx>) -> Result<Self::Const, Self::Error>;
+    fn print_const(self, ct: ty::Const<'tcx>) -> Result<Self::Const, Self::Error>;
 
     fn path_crate(self, cnum: CrateNum) -> Result<Self::Path, Self::Error>;
 
@@ -274,7 +274,7 @@ fn characteristic_def_id_of_type_cached<'a>(
     visited: &mut SsoHashSet<Ty<'a>>,
 ) -> Option<DefId> {
     match *ty.kind() {
-        ty::Adt(adt_def, _) => Some(adt_def.did),
+        ty::Adt(adt_def, _) => Some(adt_def.did()),
 
         ty::Dynamic(data, ..) => data.principal_def_id(),
 
@@ -287,7 +287,6 @@ fn characteristic_def_id_of_type_cached<'a>(
         ty::Ref(_, ty, _) => characteristic_def_id_of_type_cached(ty, visited),
 
         ty::Tuple(ref tys) => tys.iter().find_map(|ty| {
-            let ty = ty.expect_ty();
             if visited.insert(ty) {
                 return characteristic_def_id_of_type_cached(ty, visited);
             }
@@ -321,19 +320,11 @@ pub fn characteristic_def_id_of_type(ty: Ty<'_>) -> Option<DefId> {
     characteristic_def_id_of_type_cached(ty, &mut SsoHashSet::new())
 }
 
-impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for ty::RegionKind {
-    type Output = P::Region;
-    type Error = P::Error;
-    fn print(&self, cx: P) -> Result<Self::Output, Self::Error> {
-        cx.print_region(self)
-    }
-}
-
 impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for ty::Region<'_> {
     type Output = P::Region;
     type Error = P::Error;
     fn print(&self, cx: P) -> Result<Self::Output, Self::Error> {
-        cx.print_region(self)
+        cx.print_region(*self)
     }
 }
 
@@ -341,7 +332,7 @@ impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for Ty<'tcx> {
     type Output = P::Type;
     type Error = P::Error;
     fn print(&self, cx: P) -> Result<Self::Output, Self::Error> {
-        cx.print_type(self)
+        cx.print_type(*self)
     }
 }
 
@@ -355,10 +346,10 @@ impl<'tcx, P: Printer<'tcx>> Print<'tcx, P>
     }
 }
 
-impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for &'tcx ty::Const<'tcx> {
+impl<'tcx, P: Printer<'tcx>> Print<'tcx, P> for ty::Const<'tcx> {
     type Output = P::Const;
     type Error = P::Error;
     fn print(&self, cx: P) -> Result<Self::Output, Self::Error> {
-        cx.print_const(self)
+        cx.print_const(*self)
     }
 }

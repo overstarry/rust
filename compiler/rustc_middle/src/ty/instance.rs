@@ -2,11 +2,12 @@ use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::ty::print::{FmtPrinter, Printer};
 use crate::ty::subst::{InternalSubsts, Subst};
 use crate::ty::{self, SubstsRef, Ty, TyCtxt, TypeFoldable};
-use rustc_errors::ErrorReported;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::lang_items::LangItem;
 use rustc_macros::HashStable;
+use rustc_middle::ty::normalize_erasing_regions::NormalizationError;
 
 use std::fmt;
 
@@ -100,7 +101,7 @@ impl<'tcx> Instance<'tcx> {
     /// lifetimes erased, allowing a `ParamEnv` to be specified for use during normalization.
     pub fn ty(&self, tcx: TyCtxt<'tcx>, param_env: ty::ParamEnv<'tcx>) -> Ty<'tcx> {
         let ty = tcx.type_of(self.def.def_id());
-        tcx.subst_and_normalize_erasing_regions(self.substs, param_env, &ty)
+        tcx.subst_and_normalize_erasing_regions(self.substs, param_env, ty)
     }
 
     /// Finds a crate that contains a monomorphization of this instance that
@@ -278,9 +279,10 @@ impl<'tcx> fmt::Display for Instance<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         ty::tls::with(|tcx| {
             let substs = tcx.lift(self.substs).expect("could not lift for printing");
-            FmtPrinter::new(tcx, &mut *f, Namespace::ValueNS)
-                .print_def_path(self.def_id(), substs)?;
-            Ok(())
+            let s = FmtPrinter::new(tcx, Namespace::ValueNS)
+                .print_def_path(self.def_id(), substs)?
+                .into_buffer();
+            f.write_str(&s)
         })?;
 
         match self.def {
@@ -347,7 +349,7 @@ impl<'tcx> Instance<'tcx> {
     /// in a monomorphic context (i.e., like during codegen), then it is guaranteed to return
     /// `Ok(Some(instance))`.
     ///
-    /// Returns `Err(ErrorReported)` when the `Instance` resolution process
+    /// Returns `Err(ErrorGuaranteed)` when the `Instance` resolution process
     /// couldn't complete due to errors elsewhere - this is distinct
     /// from `Ok(None)` to avoid misleading diagnostics when an error
     /// has already been/will be emitted, for the original cause
@@ -356,7 +358,7 @@ impl<'tcx> Instance<'tcx> {
         param_env: ty::ParamEnv<'tcx>,
         def_id: DefId,
         substs: SubstsRef<'tcx>,
-    ) -> Result<Option<Instance<'tcx>>, ErrorReported> {
+    ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
         Instance::resolve_opt_const_arg(
             tcx,
             param_env,
@@ -372,7 +374,7 @@ impl<'tcx> Instance<'tcx> {
         param_env: ty::ParamEnv<'tcx>,
         def: ty::WithOptConstParam<DefId>,
         substs: SubstsRef<'tcx>,
-    ) -> Result<Option<Instance<'tcx>>, ErrorReported> {
+    ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
         // All regions in the result of this query are erased, so it's
         // fine to erase all of the input regions.
 
@@ -575,6 +577,23 @@ impl<'tcx> Instance<'tcx> {
         }
     }
 
+    #[inline(always)]
+    pub fn try_subst_mir_and_normalize_erasing_regions<T>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+        v: T,
+    ) -> Result<T, NormalizationError<'tcx>>
+    where
+        T: TypeFoldable<'tcx> + Clone,
+    {
+        if let Some(substs) = self.substs_for_mir_body() {
+            tcx.try_subst_and_normalize_erasing_regions(substs, param_env, v)
+        } else {
+            tcx.try_normalize_erasing_regions(param_env, v)
+        }
+    }
+
     /// Returns a new `Instance` where generic parameters in `instance.substs` are replaced by
     /// identity parameters if they are determined to be unused in `instance.def`.
     pub fn polymorphize(self, tcx: TyCtxt<'tcx>) -> Self {
@@ -610,21 +629,21 @@ fn polymorphize<'tcx>(
     } else {
         None
     };
-    let has_upvars = upvars_ty.map_or(false, |ty| ty.tuple_fields().count() > 0);
+    let has_upvars = upvars_ty.map_or(false, |ty| !ty.tuple_fields().is_empty());
     debug!("polymorphize: upvars_ty={:?} has_upvars={:?}", upvars_ty, has_upvars);
 
     struct PolymorphizationFolder<'tcx> {
         tcx: TyCtxt<'tcx>,
     }
 
-    impl ty::TypeFolder<'tcx> for PolymorphizationFolder<'tcx> {
+    impl<'tcx> ty::TypeFolder<'tcx> for PolymorphizationFolder<'tcx> {
         fn tcx<'a>(&'a self) -> TyCtxt<'tcx> {
             self.tcx
         }
 
         fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
             debug!("fold_ty: ty={:?}", ty);
-            match ty.kind {
+            match *ty.kind() {
                 ty::Closure(def_id, substs) => {
                     let polymorphized_substs = polymorphize(
                         self.tcx,

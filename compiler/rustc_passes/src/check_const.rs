@@ -11,8 +11,8 @@ use rustc_attr as attr;
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::intravisit::{self, NestedVisitorMap, Visitor};
-use rustc_middle::hir::map::Map;
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_middle::hir::nested_filter;
 use rustc_middle::ty;
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::TyCtxt;
@@ -78,10 +78,9 @@ impl<'tcx> CheckConstTraitVisitor<'tcx> {
 impl<'tcx> hir::itemlikevisit::ItemLikeVisitor<'tcx> for CheckConstTraitVisitor<'tcx> {
     /// check for const trait impls, and errors if the impl uses provided/default functions
     /// of the trait being implemented; as those provided functions can be non-const.
-    fn visit_item(&mut self, item: &'hir hir::Item<'hir>) {
+    fn visit_item<'hir>(&mut self, item: &'hir hir::Item<'hir>) {
         let _: Option<_> = try {
-            if let hir::ItemKind::Impl(ref imp) = item.kind {
-                if let hir::Constness::Const = imp.constness {
+            if let hir::ItemKind::Impl(ref imp) = item.kind && let hir::Constness::Const = imp.constness {
                     let trait_def_id = imp.of_trait.as_ref()?.trait_def_id()?;
                     let ancestors = self
                         .tcx
@@ -93,26 +92,29 @@ impl<'tcx> hir::itemlikevisit::ItemLikeVisitor<'tcx> for CheckConstTraitVisitor<
                     for trait_item in self.tcx.associated_items(trait_def_id).in_definition_order()
                     {
                         if let ty::AssocItem {
-                            kind: ty::AssocKind::Fn, ident, defaultness, ..
-                        } = trait_item
+                            kind: ty::AssocKind::Fn,
+                            defaultness,
+                            def_id: trait_item_id,
+                            ..
+                        } = *trait_item
                         {
                             // we can ignore functions that do not have default bodies:
-                            // if those are unimplemented it will be catched by typeck.
+                            // if those are unimplemented it will be caught by typeck.
                             if !defaultness.has_value()
                                 || self
                                     .tcx
-                                    .has_attr(trait_item.def_id, sym::default_method_body_is_const)
+                                    .has_attr(trait_item_id, sym::default_method_body_is_const)
                             {
                                 continue;
                             }
 
                             let is_implemented = ancestors
-                                .leaf_def(self.tcx, trait_item.ident, trait_item.kind)
+                                .leaf_def(self.tcx, trait_item_id)
                                 .map(|node_item| !node_item.defining_node.is_from_trait())
                                 .unwrap_or(false);
 
                             if !is_implemented {
-                                to_implement.push(ident.to_string());
+                                to_implement.push(self.tcx.item_name(trait_item_id).to_string());
                             }
                         }
                     }
@@ -129,16 +131,15 @@ impl<'tcx> hir::itemlikevisit::ItemLikeVisitor<'tcx> for CheckConstTraitVisitor<
                             .note(&format!("`{}` not implemented", to_implement.join("`, `")))
                             .emit();
                     }
-                }
             }
         };
     }
 
-    fn visit_trait_item(&mut self, _: &'hir hir::TraitItem<'hir>) {}
+    fn visit_trait_item<'hir>(&mut self, _: &'hir hir::TraitItem<'hir>) {}
 
-    fn visit_impl_item(&mut self, _: &'hir hir::ImplItem<'hir>) {}
+    fn visit_impl_item<'hir>(&mut self, _: &'hir hir::ImplItem<'hir>) {}
 
-    fn visit_foreign_item(&mut self, _: &'hir hir::ForeignItem<'hir>) {}
+    fn visit_foreign_item<'hir>(&mut self, _: &'hir hir::ForeignItem<'hir>) {}
 }
 
 #[derive(Copy, Clone)]
@@ -216,7 +217,9 @@ impl<'tcx> CheckConstVisitor<'tcx> {
             required_gates.iter().copied().filter(|&g| !features.enabled(g)).collect();
 
         match missing_gates.as_slice() {
-            [] => struct_span_err!(tcx.sess, span, E0744, "{}", msg).emit(),
+            [] => {
+                struct_span_err!(tcx.sess, span, E0744, "{}", msg).emit();
+            }
 
             [missing_primary, ref missing_secondary @ ..] => {
                 let mut err = feature_err(&tcx.sess.parse_sess, *missing_primary, span, &msg);
@@ -259,10 +262,10 @@ impl<'tcx> CheckConstVisitor<'tcx> {
 }
 
 impl<'tcx> Visitor<'tcx> for CheckConstVisitor<'tcx> {
-    type Map = Map<'tcx>;
+    type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> intravisit::NestedVisitorMap<Self::Map> {
-        NestedVisitorMap::OnlyBodies(self.tcx.hir())
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
     }
 
     fn visit_anon_const(&mut self, anon: &'tcx hir::AnonConst) {

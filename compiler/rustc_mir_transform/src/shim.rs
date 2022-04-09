@@ -17,8 +17,8 @@ use std::iter;
 
 use crate::util::expand_aggregate;
 use crate::{
-    abort_unwinding_calls, add_call_guards, add_moves_for_packed_drops, remove_noop_landing_pads,
-    run_passes, simplify,
+    abort_unwinding_calls, add_call_guards, add_moves_for_packed_drops, marker, pass_manager as pm,
+    remove_noop_landing_pads, simplify,
 };
 use rustc_middle::mir::patch::MirPatch;
 use rustc_mir_dataflow::elaborate_drops::{self, DropElaborator, DropFlagMode, DropStyle};
@@ -64,7 +64,19 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
 
             build_call_shim(tcx, instance, Some(Adjustment::RefMut), CallKind::Direct(call_mut))
         }
-        ty::InstanceDef::DropGlue(def_id, ty) => build_drop_shim(tcx, def_id, ty),
+
+        ty::InstanceDef::DropGlue(def_id, ty) => {
+            // FIXME(#91576): Drop shims for generators aren't subject to the MIR passes at the end
+            // of this function. Is this intentional?
+            if let Some(ty::Generator(gen_def_id, substs, _)) = ty.map(Ty::kind) {
+                let body = tcx.optimized_mir(*gen_def_id).generator_drop().unwrap();
+                let body = body.clone().subst(tcx, substs);
+                debug!("make_shim({:?}) = {:?}", instance, body);
+                return body;
+            }
+
+            build_drop_shim(tcx, def_id, ty)
+        }
         ty::InstanceDef::CloneShim(def_id, ty) => build_clone_shim(tcx, def_id, ty),
         ty::InstanceDef::Virtual(..) => {
             bug!("InstanceDef::Virtual ({:?}) is for direct calls only", instance)
@@ -75,17 +87,17 @@ fn make_shim<'tcx>(tcx: TyCtxt<'tcx>, instance: ty::InstanceDef<'tcx>) -> Body<'
     };
     debug!("make_shim({:?}) = untransformed {:?}", instance, result);
 
-    run_passes(
+    pm::run_passes(
         tcx,
         &mut result,
-        MirPhase::Const,
-        &[&[
+        &[
             &add_moves_for_packed_drops::AddMovesForPackedDrops,
             &remove_noop_landing_pads::RemoveNoopLandingPads,
             &simplify::SimplifyCfg::new("make_shim"),
             &add_call_guards::CriticalCallEdges,
             &abort_unwinding_calls::AbortUnwindingCalls,
-        ]],
+            &marker::PhaseChange(MirPhase::Const),
+        ],
     );
 
     debug!("make_shim({:?}) = {:?}", instance, result);
@@ -125,18 +137,14 @@ fn local_decls_for_sig<'tcx>(
     span: Span,
 ) -> IndexVec<Local, LocalDecl<'tcx>> {
     iter::once(LocalDecl::new(sig.output(), span))
-        .chain(sig.inputs().iter().map(|ity| LocalDecl::new(ity, span).immutable()))
+        .chain(sig.inputs().iter().map(|ity| LocalDecl::new(*ity, span).immutable()))
         .collect()
 }
 
 fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>) -> Body<'tcx> {
     debug!("build_drop_shim(def_id={:?}, ty={:?})", def_id, ty);
 
-    // Check if this is a generator, if so, return the drop glue for it
-    if let Some(&ty::Generator(gen_def_id, substs, _)) = ty.map(|ty| ty.kind()) {
-        let body = tcx.optimized_mir(gen_def_id).generator_drop().unwrap();
-        return body.clone().subst(tcx, substs);
-    }
+    assert!(!matches!(ty, Some(ty) if ty.is_generator()));
 
     let substs = if let Some(ty) = ty {
         tcx.intern_substs(&[ty.into()])
@@ -163,7 +171,7 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
 
     let source = MirSource::from_instance(ty::InstanceDef::DropGlue(def_id, ty));
     let mut body =
-        new_body(tcx, source, blocks, local_decls_for_sig(&sig, span), sig.inputs().len(), span);
+        new_body(source, blocks, local_decls_for_sig(&sig, span), sig.inputs().len(), span);
 
     if ty.is_some() {
         // The first argument (index 0), but add 1 for the return value.
@@ -202,7 +210,6 @@ fn build_drop_shim<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, ty: Option<Ty<'tcx>>)
 }
 
 fn new_body<'tcx>(
-    tcx: TyCtxt<'tcx>,
     source: MirSource<'tcx>,
     basic_blocks: IndexVec<BasicBlock, BasicBlockData<'tcx>>,
     local_decls: IndexVec<Local, LocalDecl<'tcx>>,
@@ -210,7 +217,6 @@ fn new_body<'tcx>(
     span: Span,
 ) -> Body<'tcx> {
     Body::new(
-        tcx,
         source,
         basic_blocks,
         IndexVec::from_elem_n(
@@ -229,6 +235,8 @@ fn new_body<'tcx>(
         vec![],
         span,
         None,
+        // FIXME(compiler-errors): is this correct?
+        None,
     )
 }
 
@@ -239,7 +247,7 @@ pub struct DropShimElaborator<'a, 'tcx> {
     pub param_env: ty::ParamEnv<'tcx>,
 }
 
-impl<'a, 'tcx> fmt::Debug for DropShimElaborator<'a, 'tcx> {
+impl fmt::Debug for DropShimElaborator<'_, '_> {
     fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         Ok(())
     }
@@ -329,7 +337,7 @@ struct CloneShimBuilder<'tcx> {
     sig: ty::FnSig<'tcx>,
 }
 
-impl CloneShimBuilder<'tcx> {
+impl<'tcx> CloneShimBuilder<'tcx> {
     fn new(tcx: TyCtxt<'tcx>, def_id: DefId, self_ty: Ty<'tcx>) -> Self {
         // we must subst the self_ty because it's
         // otherwise going to be TySelf and we can't index
@@ -354,14 +362,7 @@ impl CloneShimBuilder<'tcx> {
             self.def_id,
             self.sig.inputs_and_output[0],
         ));
-        new_body(
-            self.tcx,
-            source,
-            self.blocks,
-            self.local_decls,
-            self.sig.inputs().len(),
-            self.span,
-        )
+        new_body(source, self.blocks, self.local_decls, self.sig.inputs().len(), self.span)
     }
 
     fn source_info(&self) -> SourceInfo {
@@ -460,10 +461,10 @@ impl CloneShimBuilder<'tcx> {
 
     fn tuple_like_shim<I>(&mut self, dest: Place<'tcx>, src: Place<'tcx>, tys: I)
     where
-        I: Iterator<Item = Ty<'tcx>>,
+        I: IntoIterator<Item = Ty<'tcx>>,
     {
         let mut previous_field = None;
-        for (i, ity) in tys.enumerate() {
+        for (i, ity) in tys.into_iter().enumerate() {
             let field = Field::new(i);
             let src_field = self.tcx.mk_place_field(src, field, ity);
 
@@ -711,14 +712,8 @@ fn build_call_shim<'tcx>(
         block(&mut blocks, vec![], TerminatorKind::Resume, true);
     }
 
-    let mut body = new_body(
-        tcx,
-        MirSource::from_instance(instance),
-        blocks,
-        local_decls,
-        sig.inputs().len(),
-        span,
-    );
+    let mut body =
+        new_body(MirSource::from_instance(instance), blocks, local_decls, sig.inputs().len(), span);
 
     if let Abi::RustCall = sig.abi {
         body.spread_arg = Some(Local::new(sig.inputs().len()));
@@ -739,9 +734,8 @@ pub fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
     let sig = tcx.fn_sig(ctor_id).no_bound_vars().expect("LBR in ADT constructor signature");
     let sig = tcx.normalize_erasing_regions(param_env, sig);
 
-    let (adt_def, substs) = match sig.output().kind() {
-        ty::Adt(adt_def, substs) => (adt_def, substs),
-        _ => bug!("unexpected type for ADT ctor {:?}", sig.output()),
+    let ty::Adt(adt_def, substs) = sig.output().kind() else {
+        bug!("unexpected type for ADT ctor {:?}", sig.output());
     };
 
     debug!("build_ctor: ctor_id={:?} sig={:?}", ctor_id, sig);
@@ -766,10 +760,10 @@ pub fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
 
     let statements = expand_aggregate(
         Place::return_place(),
-        adt_def.variants[variant_index].fields.iter().enumerate().map(|(idx, field_def)| {
+        adt_def.variant(variant_index).fields.iter().enumerate().map(|(idx, field_def)| {
             (Operand::Move(Place::from(Local::new(idx + 1))), field_def.ty(tcx, substs))
         }),
-        AggregateKind::Adt(adt_def, variant_index, substs, None, None),
+        AggregateKind::Adt(adt_def.did(), variant_index, substs, None, None),
         source_info,
         tcx,
     )
@@ -783,7 +777,6 @@ pub fn build_adt_ctor(tcx: TyCtxt<'_>, ctor_id: DefId) -> Body<'_> {
 
     let source = MirSource::item(ctor_id);
     let body = new_body(
-        tcx,
         source,
         IndexVec::from_elem_n(start_block, 1),
         local_decls,

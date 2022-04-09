@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 crate fn render(cx: &mut Context<'_>, krate: &clean::Crate) -> Result<(), Error> {
     info!("emitting source files");
 
-    let dst = cx.dst.join("src").join(&*krate.name(cx.tcx()).as_str());
+    let dst = cx.dst.join("src").join(krate.name(cx.tcx()).as_str());
     cx.shared.ensure_dir(&dst)?;
 
     let mut collector = SourceCollector { dst, cx, emitted_local_sources: FxHashSet::default() };
@@ -142,7 +142,7 @@ impl DocVisitor for SourceCollector<'_, '_> {
     }
 }
 
-impl SourceCollector<'_, 'tcx> {
+impl SourceCollector<'_, '_> {
     /// Renders the given filename into its corresponding HTML source file.
     fn emit_source(
         &mut self,
@@ -203,7 +203,6 @@ impl SourceCollector<'_, 'tcx> {
             static_extra_scripts: &[&format!("source-script{}", self.cx.shared.resource_suffix)],
         };
         let v = layout::render(
-            &self.cx.shared.templates,
             &self.cx.shared.layout,
             &page,
             "",
@@ -273,20 +272,16 @@ crate fn print_src(
 ) {
     let lines = s.lines().count();
     let mut line_numbers = Buffer::empty_from(buf);
-    let mut cols = 0;
-    let mut tmp = lines;
-    while tmp > 0 {
-        cols += 1;
-        tmp /= 10;
-    }
     line_numbers.write_str("<pre class=\"line-numbers\">");
-    for i in 1..=lines {
-        match source_context {
-            SourceContext::Standalone => {
-                writeln!(line_numbers, "<span id=\"{0}\">{0:1$}</span>", i, cols)
+    match source_context {
+        SourceContext::Standalone => {
+            for line in 1..=lines {
+                writeln!(line_numbers, "<span id=\"{0}\">{0}</span>", line)
             }
-            SourceContext::Embedded { offset } => {
-                writeln!(line_numbers, "<span>{0:1$}</span>", i + offset, cols)
+        }
+        SourceContext::Embedded { offset } => {
+            for line in 1..=lines {
+                writeln!(line_numbers, "<span>{0}</span>", line + offset)
             }
         }
     }

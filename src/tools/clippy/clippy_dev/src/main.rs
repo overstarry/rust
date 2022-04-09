@@ -3,7 +3,8 @@
 #![warn(rust_2018_idioms, unused_lifetimes)]
 
 use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
-use clippy_dev::{bless, fmt, new_lint, serve, setup, update_lints};
+use clippy_dev::{bless, fmt, lint, new_lint, serve, setup, update_lints};
+use indoc::indoc;
 fn main() {
     let matches = get_clap_config();
 
@@ -54,6 +55,10 @@ fn main() {
             let port = matches.value_of("port").unwrap().parse().unwrap();
             let lint = matches.value_of("lint");
             serve::run(port, lint);
+        },
+        ("lint", Some(matches)) => {
+            let path = matches.value_of("path").unwrap();
+            lint::run(path);
         },
         _ => {},
     }
@@ -218,6 +223,24 @@ fn get_clap_config<'a>() -> ArgMatches<'a> {
                         .validator_os(serve::validate_port),
                 )
                 .arg(Arg::with_name("lint").help("Which lint's page to load initially (optional)")),
+        )
+        .subcommand(
+            SubCommand::with_name("lint")
+                .about("Manually run clippy on a file or package")
+                .after_help(indoc! {"
+                    EXAMPLES
+                        Lint a single file:
+                            cargo dev lint tests/ui/attrs.rs
+
+                        Lint a package directory:
+                            cargo dev lint tests/ui-cargo/wildcard_dependencies/fail
+                            cargo dev lint ~/my-project
+                "})
+                .arg(
+                    Arg::with_name("path")
+                        .required(true)
+                        .help("The path to a file or package directory to lint"),
+                ),
         )
         .get_matches()
 }

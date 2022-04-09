@@ -45,11 +45,11 @@ use smallvec::SmallVec;
 pub struct SeparateConstSwitch;
 
 impl<'tcx> MirPass<'tcx> for SeparateConstSwitch {
-    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        if tcx.sess.mir_opt_level() < 4 {
-            return;
-        }
+    fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
+        sess.mir_opt_level() >= 4
+    }
 
+    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         // If execution did something, applying a simplification layer
         // helps later passes optimize the copy away.
         if separate_const_switch(body) > 0 {
@@ -59,7 +59,7 @@ impl<'tcx> MirPass<'tcx> for SeparateConstSwitch {
 }
 
 /// Returns the amount of blocks that were duplicated
-pub fn separate_const_switch<'tcx>(body: &mut Body<'tcx>) -> usize {
+pub fn separate_const_switch(body: &mut Body<'_>) -> usize {
     let mut new_blocks: SmallVec<[(BasicBlock, BasicBlock); 6]> = SmallVec::new();
     let predecessors = body.predecessors();
     'block_iter: for (block_id, block) in body.basic_blocks().iter_enumerated() {
@@ -239,10 +239,6 @@ fn is_likely_const<'tcx>(mut tracked_place: Place<'tcx>, block: &BasicBlockData<
                 }
             }
 
-            // If inline assembly is found, we probably should
-            // not try to analyze the code
-            StatementKind::LlvmInlineAsm(_) => return false,
-
             // These statements have no influence on the place
             // we are interested in
             StatementKind::FakeRead(_)
@@ -319,10 +315,6 @@ fn find_determining_place<'tcx>(
             | StatementKind::Coverage(_)
             | StatementKind::CopyNonOverlapping(_)
             | StatementKind::Nop => {}
-
-            // If inline assembly is found, we probably should
-            // not try to analyze the code
-            StatementKind::LlvmInlineAsm(_) => return None,
 
             // If the discriminant is set, it is always set
             // as a constant, so the job is already done.

@@ -1,5 +1,6 @@
-// This test is to ensure that the anchors (`§`) have the expected color.
+// This test is to ensure that the anchors (`§`) have the expected color and position.
 goto: file://|DOC_PATH|/test_docs/struct.HeavilyDocumentedStruct.html
+show-text: true
 
 // This is needed to ensure that the text color is computed.
 show-text: true
@@ -11,13 +12,15 @@ reload:
 
 assert-css: ("#toggle-all-docs", {"color": "rgb(0, 0, 0)"})
 assert-css: (".fqn .in-band a:nth-of-type(1)", {"color": "rgb(0, 0, 0)"})
-assert-css: (".fqn .in-band a:nth-of-type(2)", {"color": "rgb(173, 68, 142)"})
-assert-css: (".srclink", {"color": "rgb(0, 0, 0)"})
-assert-css: (".srclink", {"color": "rgb(0, 0, 0)"})
+assert-css: (".fqn .in-band a:nth-of-type(2)", {"color": "rgb(173, 55, 138)"})
+assert-css: (".srclink", {"color": "rgb(56, 115, 173)"})
+
+move-cursor-to: ".main-heading .srclink"
+assert-css: (".srclink", {"text-decoration": "underline solid rgb(56, 115, 173)"})
 
 assert-css: ("#top-doc-prose-title", {"color": "rgb(0, 0, 0)"})
 
-assert-css: (".sidebar a", {"color": "rgb(0, 0, 0)"})
+assert-css: (".sidebar a", {"color": "rgb(53, 109, 164)"})
 assert-css: (".in-band a", {"color": "rgb(0, 0, 0)"})
 
 // We move the cursor over the "Implementations" title so the anchor is displayed.
@@ -27,3 +30,5 @@ assert-css: ("h2#implementations a.anchor", {"color": "rgb(0, 0, 0)"})
 // Same thing with the impl block title.
 move-cursor-to: "#impl"
 assert-css: ("#impl a.anchor", {"color": "rgb(0, 0, 0)"})
+
+assert-css: ("#title-for-struct-impl-item-doc", {"margin-left": "0px"})

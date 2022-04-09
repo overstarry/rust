@@ -67,17 +67,14 @@
     issue_tracker_base_url = "https://github.com/rust-lang/rust/issues/",
     test(no_crate_inject, attr(allow(unused_variables), deny(warnings)))
 )]
-#![cfg_attr(
-    not(bootstrap),
-    doc(cfg_hide(
-        not(test),
-        not(any(test, bootstrap)),
-        any(not(feature = "miri-test-libstd"), test, doctest),
-        no_global_oom_handling,
-        not(no_global_oom_handling),
-        target_has_atomic = "ptr"
-    ))
-)]
+#![doc(cfg_hide(
+    not(test),
+    not(any(test, bootstrap)),
+    any(not(feature = "miri-test-libstd"), test, doctest),
+    no_global_oom_handling,
+    not(no_global_oom_handling),
+    target_has_atomic = "ptr"
+))]
 #![no_std]
 #![needs_allocator]
 //
@@ -94,23 +91,30 @@
 #![feature(array_chunks)]
 #![feature(array_methods)]
 #![feature(array_windows)]
-#![feature(async_stream)]
+#![feature(async_iterator)]
 #![feature(coerce_unsized)]
+#![cfg_attr(not(no_global_oom_handling), feature(const_alloc_error))]
+#![feature(const_box)]
 #![cfg_attr(not(no_global_oom_handling), feature(const_btree_new))]
 #![feature(const_cow_is_borrowed)]
+#![feature(const_convert)]
+#![feature(const_size_of_val)]
+#![feature(const_align_of_val)]
+#![feature(const_ptr_read)]
+#![feature(const_maybe_uninit_write)]
+#![feature(const_maybe_uninit_as_mut_ptr)]
+#![feature(const_refs_to_cell)]
 #![feature(core_intrinsics)]
+#![feature(const_eval_select)]
+#![feature(const_pin)]
 #![feature(dispatch_from_dyn)]
 #![feature(exact_size_is_empty)]
 #![feature(extend_one)]
 #![feature(fmt_internals)]
 #![feature(fn_traits)]
-#![feature(inherent_ascii_escape)]
-#![cfg_attr(bootstrap, feature(format_args_capture))]
 #![feature(inplace_iteration)]
 #![feature(iter_advance_by)]
-#![feature(iter_zip)]
 #![feature(layout_for_ptr)]
-#![feature(maybe_uninit_extra)]
 #![feature(maybe_uninit_slice)]
 #![cfg_attr(test, feature(new_uninit))]
 #![feature(nonnull_slice_from_raw_parts)]
@@ -123,9 +127,11 @@
 #![feature(slice_ptr_len)]
 #![feature(slice_range)]
 #![feature(str_internals)]
+#![feature(strict_provenance)]
 #![feature(trusted_len)]
 #![feature(trusted_random_access)]
 #![feature(try_trait_v2)]
+#![feature(unchecked_math)]
 #![feature(unicode_internals)]
 #![feature(unsize)]
 //
@@ -135,10 +141,12 @@
 #![feature(associated_type_bounds)]
 #![feature(box_syntax)]
 #![feature(cfg_sanitize)]
-#![feature(cfg_target_has_atomic)]
-#![feature(const_fn_trait_bound)]
+#![feature(const_deref)]
+#![feature(const_mut_refs)]
+#![feature(const_ptr_write)]
+#![feature(const_precise_live_drops)]
 #![feature(const_trait_impl)]
-#![feature(destructuring_assignment)]
+#![feature(const_try)]
 #![feature(dropck_eyepatch)]
 #![feature(exclusive_range_pattern)]
 #![feature(fundamental)]
@@ -154,6 +162,7 @@
 #![cfg_attr(test, feature(test))]
 #![feature(unboxed_closures)]
 #![feature(unsized_fn_params)]
+#![feature(c_unwind)]
 //
 // Rustdoc features:
 #![feature(doc_cfg)]
