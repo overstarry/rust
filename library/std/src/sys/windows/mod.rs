@@ -7,7 +7,6 @@ use crate::path::PathBuf;
 use crate::time::Duration;
 
 pub use self::rand::hashmap_random_keys;
-pub use libc::strlen;
 
 #[macro_use]
 pub mod compat;
@@ -289,6 +288,7 @@ pub fn dur2timeout(dur: Duration) -> c::DWORD {
 /// that function for more information on `__fastfail`
 #[allow(unreachable_code)]
 pub fn abort_internal() -> ! {
+    #[allow(unused)]
     const FAST_FAIL_FATAL_APP_EXIT: usize = 7;
     #[cfg(not(miri))] // inline assembly does not work in Miri
     unsafe {

@@ -140,7 +140,6 @@ pub struct ParseSess {
     pub config: CrateConfig,
     pub check_config: CrateCheckConfig,
     pub edition: Edition,
-    pub missing_fragment_specifiers: Lock<FxHashMap<Span, NodeId>>,
     /// Places where raw identifiers were used. This is used to avoid complaining about idents
     /// clashing with keywords in new editions.
     pub raw_identifier_spans: Lock<Vec<Span>>,
@@ -174,8 +173,7 @@ pub struct ParseSess {
 impl ParseSess {
     /// Used for testing.
     pub fn new(file_path_mapping: FilePathMapping) -> Self {
-        let fallback_bundle =
-            fallback_fluent_bundle(false).expect("failed to load fallback fluent bundle");
+        let fallback_bundle = fallback_fluent_bundle(rustc_errors::DEFAULT_LOCALE_RESOURCES, false);
         let sm = Lrc::new(SourceMap::new(file_path_mapping));
         let handler = Handler::with_tty_emitter(
             ColorConfig::Auto,
@@ -195,7 +193,6 @@ impl ParseSess {
             config: FxHashSet::default(),
             check_config: CrateCheckConfig::default(),
             edition: ExpnId::root().expn_data().edition,
-            missing_fragment_specifiers: Default::default(),
             raw_identifier_spans: Lock::new(Vec::new()),
             bad_unicode_identifiers: Lock::new(Default::default()),
             source_map,
@@ -213,8 +210,7 @@ impl ParseSess {
     }
 
     pub fn with_silent_emitter(fatal_note: Option<String>) -> Self {
-        let fallback_bundle =
-            fallback_fluent_bundle(false).expect("failed to load fallback fluent bundle");
+        let fallback_bundle = fallback_fluent_bundle(rustc_errors::DEFAULT_LOCALE_RESOURCES, false);
         let sm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
         let fatal_handler =
             Handler::with_tty_emitter(ColorConfig::Auto, false, None, None, None, fallback_bundle);

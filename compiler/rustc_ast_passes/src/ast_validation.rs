@@ -91,16 +91,18 @@ impl<'a> AstValidator<'a> {
         self.is_impl_trait_banned = old;
     }
 
-    fn with_tilde_const_allowed(&mut self, f: impl FnOnce(&mut Self)) {
-        let old = mem::replace(&mut self.is_tilde_const_allowed, true);
+    fn with_tilde_const(&mut self, allowed: bool, f: impl FnOnce(&mut Self)) {
+        let old = mem::replace(&mut self.is_tilde_const_allowed, allowed);
         f(self);
         self.is_tilde_const_allowed = old;
     }
 
+    fn with_tilde_const_allowed(&mut self, f: impl FnOnce(&mut Self)) {
+        self.with_tilde_const(true, f)
+    }
+
     fn with_banned_tilde_const(&mut self, f: impl FnOnce(&mut Self)) {
-        let old = mem::replace(&mut self.is_tilde_const_allowed, false);
-        f(self);
-        self.is_tilde_const_allowed = old;
+        self.with_tilde_const(false, f)
     }
 
     fn with_let_management(
@@ -120,12 +122,21 @@ impl<'a> AstValidator<'a> {
             let err = "`let` expressions are not supported here";
             let mut diag = sess.struct_span_err(expr.span, err);
             diag.note("only supported directly in conditions of `if` and `while` expressions");
-            diag.note("as well as when nested within `&&` and parentheses in those conditions");
-            if let ForbiddenLetReason::ForbiddenWithOr(span) = forbidden_let_reason {
-                diag.span_note(
-                    span,
-                    "`||` operators are not currently supported in let chain expressions",
-                );
+            match forbidden_let_reason {
+                ForbiddenLetReason::GenericForbidden => {}
+                ForbiddenLetReason::NotSupportedOr(span) => {
+                    diag.span_note(
+                        span,
+                        "`||` operators are not supported in let chain expressions",
+                    );
+                }
+                ForbiddenLetReason::NotSupportedParentheses(span) => {
+                    diag.span_note(
+                        span,
+                        "`let`s wrapped in parentheses are not supported in a context with let \
+                        chains",
+                    );
+                }
             }
             diag.emit();
         } else {
@@ -1009,9 +1020,9 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         self.with_let_management(Some(ForbiddenLetReason::GenericForbidden), |this, forbidden_let_reason| {
             match &expr.kind {
                 ExprKind::Binary(Spanned { node: BinOpKind::Or, span }, lhs, rhs) => {
-                    let forbidden_let_reason = Some(ForbiddenLetReason::ForbiddenWithOr(*span));
-                    this.with_let_management(forbidden_let_reason, |this, _| this.visit_expr(lhs));
-                    this.with_let_management(forbidden_let_reason, |this, _| this.visit_expr(rhs));
+                    let local_reason = Some(ForbiddenLetReason::NotSupportedOr(*span));
+                    this.with_let_management(local_reason, |this, _| this.visit_expr(lhs));
+                    this.with_let_management(local_reason, |this, _| this.visit_expr(rhs));
                 }
                 ExprKind::If(cond, then, opt_else) => {
                     this.visit_block(then);
@@ -1036,7 +1047,23 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                         }
                     }
                 }
-                ExprKind::Paren(_) | ExprKind::Binary(Spanned { node: BinOpKind::And, .. }, ..) => {
+                ExprKind::Paren(local_expr) => {
+                    fn has_let_expr(expr: &Expr) -> bool {
+                        match expr.kind {
+                            ExprKind::Binary(_, ref lhs, ref rhs) => has_let_expr(lhs) || has_let_expr(rhs),
+                            ExprKind::Let(..) => true,
+                            _ => false,
+                        }
+                    }
+                    let local_reason = if has_let_expr(local_expr) {
+                        Some(ForbiddenLetReason::NotSupportedParentheses(local_expr.span))
+                    }
+                    else {
+                        forbidden_let_reason
+                    };
+                    this.with_let_management(local_reason, |this, _| this.visit_expr(local_expr));
+                }
+                ExprKind::Binary(Spanned { node: BinOpKind::And, .. }, ..) => {
                     this.with_let_management(forbidden_let_reason, |this, _| visit::walk_expr(this, expr));
                     return;
                 }
@@ -1177,12 +1204,8 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 }
                 self.visit_vis(&item.vis);
                 self.visit_ident(item.ident);
-                if let Const::Yes(_) = sig.header.constness {
-                    self.with_tilde_const_allowed(|this| this.visit_generics(generics));
-                } else {
-                    self.visit_generics(generics);
-                }
-                let kind = FnKind::Fn(FnCtxt::Free, item.ident, sig, &item.vis, body.as_deref());
+                let kind =
+                    FnKind::Fn(FnCtxt::Free, item.ident, sig, &item.vis, generics, body.as_deref());
                 self.visit_fn(kind, item.span, item.id);
                 walk_list!(self, visit_attribute, &item.attrs);
                 return; // Avoid visiting again.
@@ -1530,13 +1553,14 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
             FnSig { span: sig_span, header: FnHeader { ext: Extern::Implicit, .. }, .. },
             _,
             _,
+            _,
         ) = fk
         {
             self.maybe_lint_missing_abi(*sig_span, id);
         }
 
         // Functions without bodies cannot have patterns.
-        if let FnKind::Fn(ctxt, _, sig, _, None) = fk {
+        if let FnKind::Fn(ctxt, _, sig, _, _, None) = fk {
             Self::check_decl_no_pat(&sig.decl, |span, ident, mut_ident| {
                 let (code, msg, label) = match ctxt {
                     FnCtxt::Foreign => (
@@ -1571,7 +1595,11 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
             });
         }
 
-        visit::walk_fn(self, fk, span);
+        let tilde_const_allowed =
+            matches!(fk.header(), Some(FnHeader { constness: Const::Yes(_), .. }))
+                || matches!(fk.ctxt(), Some(FnCtxt::Assoc(_)));
+
+        self.with_tilde_const(tilde_const_allowed, |this| visit::walk_fn(this, fk, span));
     }
 
     fn visit_assoc_item(&mut self, item: &'a AssocItem, ctxt: AssocCtxt) {
@@ -1645,9 +1673,14 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
             {
                 self.visit_vis(&item.vis);
                 self.visit_ident(item.ident);
-                self.with_tilde_const_allowed(|this| this.visit_generics(generics));
-                let kind =
-                    FnKind::Fn(FnCtxt::Assoc(ctxt), item.ident, sig, &item.vis, body.as_deref());
+                let kind = FnKind::Fn(
+                    FnCtxt::Assoc(ctxt),
+                    item.ident,
+                    sig,
+                    &item.vis,
+                    generics,
+                    body.as_deref(),
+                );
                 self.visit_fn(kind, item.span, item.id);
             }
             _ => self
@@ -1810,8 +1843,13 @@ pub fn check_crate(session: &Session, krate: &Crate, lints: &mut LintBuffer) -> 
 /// Used to forbid `let` expressions in certain syntactic locations.
 #[derive(Clone, Copy)]
 enum ForbiddenLetReason {
-    /// A let chain with the `||` operator
-    ForbiddenWithOr(Span),
     /// `let` is not valid and the source environment is not important
     GenericForbidden,
+    /// A let chain with the `||` operator
+    NotSupportedOr(Span),
+    /// A let chain with invalid parentheses
+    ///
+    /// For exemple, `let 1 = 1 && (expr && expr)` is allowed
+    /// but `(let 1 = 1 && (let 1 = 1 && (let 1 = 1))) && let a = 1` is not
+    NotSupportedParentheses(Span),
 }

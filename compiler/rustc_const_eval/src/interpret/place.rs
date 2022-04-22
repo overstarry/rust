@@ -191,7 +191,7 @@ impl<'tcx, Tag: Provenance> MPlaceTy<'tcx, Tag> {
     }
 
     #[inline]
-    pub(super) fn len(&self, cx: &impl HasDataLayout) -> InterpResult<'tcx, u64> {
+    pub(crate) fn len(&self, cx: &impl HasDataLayout) -> InterpResult<'tcx, u64> {
         if self.layout.is_unsized() {
             // We need to consult `meta` metadata
             match self.layout.ty.kind() {
@@ -281,7 +281,7 @@ where
         };
 
         let mplace = MemPlace {
-            ptr: self.scalar_to_ptr(ptr.check_init()?),
+            ptr: self.scalar_to_ptr(ptr.check_init()?)?,
             // We could use the run-time alignment here. For now, we do not, because
             // the point of tracking the alignment here is to make sure that the *static*
             // alignment information emitted with the loads is correct. The run-time
@@ -791,6 +791,42 @@ where
         }
     }
 
+    pub fn write_uninit(&mut self, dest: &PlaceTy<'tcx, M::PointerTag>) -> InterpResult<'tcx> {
+        let mplace = match dest.place {
+            Place::Ptr(mplace) => MPlaceTy { mplace, layout: dest.layout },
+            Place::Local { frame, local } => {
+                match M::access_local_mut(self, frame, local)? {
+                    Ok(local) => match dest.layout.abi {
+                        Abi::Scalar(_) => {
+                            *local = LocalValue::Live(Operand::Immediate(Immediate::Scalar(
+                                ScalarMaybeUninit::Uninit,
+                            )));
+                            return Ok(());
+                        }
+                        Abi::ScalarPair(..) => {
+                            *local = LocalValue::Live(Operand::Immediate(Immediate::ScalarPair(
+                                ScalarMaybeUninit::Uninit,
+                                ScalarMaybeUninit::Uninit,
+                            )));
+                            return Ok(());
+                        }
+                        _ => self.force_allocation(dest)?,
+                    },
+                    Err(mplace) => {
+                        // The local is in memory, go on below.
+                        MPlaceTy { mplace, layout: dest.layout }
+                    }
+                }
+            }
+        };
+        let Some(mut alloc) = self.get_place_alloc_mut(&mplace)? else {
+            // Zero-sized access
+            return Ok(());
+        };
+        alloc.write_uninit()?;
+        Ok(())
+    }
+
     /// Copies the data from an operand to a place. This does not support transmuting!
     /// Use `copy_op_transmute` if the layouts could disagree.
     #[inline(always)]
@@ -1104,7 +1140,7 @@ where
         &self,
         mplace: &MPlaceTy<'tcx, M::PointerTag>,
     ) -> InterpResult<'tcx, (ty::Instance<'tcx>, MPlaceTy<'tcx, M::PointerTag>)> {
-        let vtable = self.scalar_to_ptr(mplace.vtable()); // also sanity checks the type
+        let vtable = self.scalar_to_ptr(mplace.vtable())?; // also sanity checks the type
         let (instance, ty) = self.read_drop_type_from_vtable(vtable)?;
         let layout = self.layout_of(ty)?;
 

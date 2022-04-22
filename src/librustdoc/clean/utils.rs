@@ -44,9 +44,9 @@ crate fn krate(cx: &mut DocContext<'_>) -> Crate {
                 // `#[doc(masked)]` to the injected `extern crate` because it's unstable.
                 if it.is_extern_crate()
                     && (it.attrs.has_doc_flag(sym::masked)
-                        || cx.tcx.is_compiler_builtins(it.def_id.krate()))
+                        || cx.tcx.is_compiler_builtins(it.item_id.krate()))
                 {
-                    cx.cache.masked_crates.insert(it.def_id.krate());
+                    cx.cache.masked_crates.insert(it.item_id.krate());
                 }
             }
         }
@@ -178,7 +178,7 @@ crate fn build_deref_target_impls(cx: &mut DocContext<'_>, items: &[Item], ret: 
 
     for item in items {
         let target = match *item.kind {
-            ItemKind::TypedefItem(ref t, true) => &t.type_,
+            ItemKind::AssocTypeItem(ref t, _) => &t.type_,
             _ => continue,
         };
 
