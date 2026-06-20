@@ -129,7 +129,7 @@ fn issue3117() {
 fn issue3139() {
     assert_eq!(
         to_json_value(&None::<i32>).unwrap(),
-        json!({ "test": None::<i32> })
+        json!(  { "test": None  ::  <i32> }  )
     );
 }
 
@@ -147,29 +147,23 @@ type MyFn = fn(
 
 // Const bound
 
-trait T: ~const Super {}
+trait T: [const] Super {}
 
-const fn not_quite_const<S: ~const T>() -> i32 {
+const fn not_quite_const<S: [const] T>() -> i32 {
     <S as T>::CONST
 }
 
-struct S<T: ~const ?Sized>(std::marker::PhantomData<T>);
+const impl T for U {}
 
-impl ~const T {}
+fn apit(_: impl [const] T) {}
 
-fn apit(_: impl ~const T) {}
-
-fn rpit() -> impl ~const T {
+fn rpit() -> impl [const] T {
     S
 }
 
 pub struct Foo<T: Trait>(T);
-impl<T: ~const Trait> Foo<T> {
+impl<T: [const] Trait> Foo<T> {
     fn new(t: T) -> Self {
         Self(t)
     }
 }
-
-// #4357
-type T = typeof(1);
-impl T for .. {}

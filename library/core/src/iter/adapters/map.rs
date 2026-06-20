@@ -1,8 +1,8 @@
 use crate::fmt;
-use crate::iter::adapters::{
-    zip::try_get_unchecked, SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce,
-};
-use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen};
+use crate::iter::adapters::zip::try_get_unchecked;
+use crate::iter::adapters::{SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedFused, TrustedLen};
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that maps the values of `iter` with `f`.
@@ -65,8 +65,12 @@ pub struct Map<I, F> {
 }
 
 impl<I, F> Map<I, F> {
-    pub(in crate::iter) fn new(iter: I, f: F) -> Map<I, F> {
+    pub(in crate::iter) const fn new(iter: I, f: F) -> Map<I, F> {
         Map { iter, f }
+    }
+
+    pub(crate) fn into_inner(self) -> I {
+        self.iter
     }
 }
 
@@ -124,7 +128,7 @@ where
         self.iter.fold(init, map_fold(self.f, g))
     }
 
-    #[doc(hidden)]
+    #[inline]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> B
     where
         Self: TrustedRandomAccessNoCoerce,
@@ -179,6 +183,9 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<B, I: FusedIterator, F> FusedIterator for Map<I, F> where F: FnMut(I::Item) -> B {}
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused, F> TrustedFused for Map<I, F> {}
+
 #[unstable(feature = "trusted_len", issue = "37572")]
 unsafe impl<B, I, F> TrustedLen for Map<I, F>
 where
@@ -215,4 +222,7 @@ where
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<B, I: InPlaceIterable, F> InPlaceIterable for Map<I, F> where F: FnMut(I::Item) -> B {}
+unsafe impl<I: InPlaceIterable, F> InPlaceIterable for Map<I, F> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
+}

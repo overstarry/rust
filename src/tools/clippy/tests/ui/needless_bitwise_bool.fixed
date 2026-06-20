@@ -1,6 +1,5 @@
-// run-rustfix
-
 #![warn(clippy::needless_bitwise_bool)]
+#![allow(clippy::const_is_empty)]
 
 fn returns_bool() -> bool {
     true
@@ -22,6 +21,7 @@ fn main() {
         println!("true")
     }
     if y && !x {
+        //~^ needless_bitwise_bool
         println!("true")
     }
 
@@ -34,7 +34,22 @@ fn main() {
         println!("true") // This is a const method call
     }
 
-    if y & (0 < 1) {
+    // Resolved
+    if y && (0 < 1) {
+        //~^ needless_bitwise_bool
         println!("true") // This is a BinOp with no side effects
+    }
+}
+
+fn wrongly_unmangled_macros() {
+    let (x, y) = (false, true);
+    macro_rules! inverse {
+        ($e:expr) => {
+            !$e
+        };
+    }
+    if inverse!(y) && inverse!(x) {
+        //~^ needless_bitwise_bool
+        println!("true")
     }
 }

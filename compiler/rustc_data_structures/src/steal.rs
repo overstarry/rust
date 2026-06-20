@@ -1,5 +1,5 @@
-use crate::stable_hasher::{HashStable, StableHasher};
-use crate::sync::{MappedReadGuard, ReadGuard, RwLock};
+use crate::stable_hash::{StableHash, StableHashCtxt, StableHasher};
+use crate::sync::{MappedReadGuard, MappedWriteGuard, ReadGuard, RwLock, WriteGuard};
 
 /// The `Steal` struct is intended to used as the value for a query.
 /// Specifically, we sometimes have queries (*cough* MIR *cough*)
@@ -40,16 +40,39 @@ impl<T> Steal<T> {
         ReadGuard::map(borrow, |opt| opt.as_ref().unwrap())
     }
 
+    /// An escape hatch for rustc drivers to mutate `Steal` caches.
+    ///
+    /// Use at your own risk. This can badly break incremental compilation
+    /// and anything else that relies on the immutability of query caches.
+    #[track_caller]
+    pub fn risky_hack_borrow_mut(&self) -> MappedWriteGuard<'_, T> {
+        let borrow = self.value.borrow_mut();
+        if borrow.is_none() {
+            panic!("attempted to read from stolen value: {}", std::any::type_name::<T>());
+        }
+        WriteGuard::map(borrow, |opt| opt.as_mut().unwrap())
+    }
+
     #[track_caller]
     pub fn steal(&self) -> T {
         let value_ref = &mut *self.value.try_write().expect("stealing value which is locked");
         let value = value_ref.take();
         value.expect("attempt to steal from stolen value")
     }
+
+    /// Writers of rustc drivers often encounter stealing issues. This function makes it possible to
+    /// handle these errors gracefully.
+    ///
+    /// This should not be used within rustc as it leaks information not tracked
+    /// by the query system, breaking incremental compilation.
+    #[rustc_lint_untracked_query_information]
+    pub fn is_stolen(&self) -> bool {
+        self.value.borrow().is_none()
+    }
 }
 
-impl<CTX, T: HashStable<CTX>> HashStable<CTX> for Steal<T> {
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
-        self.borrow().hash_stable(hcx, hasher);
+impl<T: StableHash> StableHash for Steal<T> {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        self.borrow().stable_hash(hcx, hasher);
     }
 }

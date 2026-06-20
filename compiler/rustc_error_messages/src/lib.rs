@@ -1,281 +1,69 @@
-#![feature(let_chains)]
-#![feature(once_cell)]
-#![feature(path_try_exists)]
-#![feature(type_alias_impl_trait)]
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![feature(rustc_attrs)]
+// tidy-alphabetical-end
 
-use fluent_bundle::FluentResource;
-use fluent_syntax::parser::ParserError;
-use rustc_data_structures::sync::Lrc;
-use rustc_macros::{Decodable, Encodable};
-use rustc_span::Span;
 use std::borrow::Cow;
-use std::error::Error;
-use std::fmt;
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use tracing::{instrument, trace};
 
-#[cfg(not(parallel_compiler))]
-use std::lazy::Lazy;
-#[cfg(parallel_compiler)]
-use std::lazy::SyncLazy as Lazy;
+pub use fluent_bundle::types::FluentType;
+pub use fluent_bundle::{self, FluentArgs, FluentError, FluentValue};
+use rustc_macros::{Decodable, Encodable, StableHash};
+use rustc_span::Span;
+pub use unic_langid::{LanguageIdentifier, langid};
 
-#[cfg(parallel_compiler)]
-use intl_memoizer::concurrent::IntlLangMemoizer;
-#[cfg(not(parallel_compiler))]
-use intl_memoizer::IntlLangMemoizer;
+mod diagnostic_impls;
+pub use diagnostic_impls::DiagArgFromDisplay;
+use rustc_data_structures::fx::FxIndexMap;
 
-pub use fluent_bundle::{FluentArgs, FluentError, FluentValue};
-pub use unic_langid::{langid, LanguageIdentifier};
-
-pub static DEFAULT_LOCALE_RESOURCES: &'static [&'static str] =
-    &[include_str!("../locales/en-US/typeck.ftl"), include_str!("../locales/en-US/parser.ftl")];
-
-pub type FluentBundle = fluent_bundle::bundle::FluentBundle<FluentResource, IntlLangMemoizer>;
-
-#[cfg(parallel_compiler)]
-fn new_bundle(locales: Vec<LanguageIdentifier>) -> FluentBundle {
-    FluentBundle::new_concurrent(locales)
+pub fn register_functions<R, M>(bundle: &mut fluent_bundle::bundle::FluentBundle<R, M>) {
+    bundle
+        .add_function("STREQ", |positional, _named| match positional {
+            [FluentValue::String(a), FluentValue::String(b)] => format!("{}", (a == b)).into(),
+            _ => FluentValue::Error,
+        })
+        .expect("Failed to add a function to the bundle.");
 }
-
-#[cfg(not(parallel_compiler))]
-fn new_bundle(locales: Vec<LanguageIdentifier>) -> FluentBundle {
-    FluentBundle::new(locales)
-}
-
-#[derive(Debug)]
-pub enum TranslationBundleError {
-    /// Failed to read from `.ftl` file.
-    ReadFtl(io::Error),
-    /// Failed to parse contents of `.ftl` file.
-    ParseFtl(ParserError),
-    /// Failed to add `FluentResource` to `FluentBundle`.
-    AddResource(FluentError),
-    /// `$sysroot/share/locale/$locale` does not exist.
-    MissingLocale,
-    /// Cannot read directory entries of `$sysroot/share/locale/$locale`.
-    ReadLocalesDir(io::Error),
-    /// Cannot read directory entry of `$sysroot/share/locale/$locale`.
-    ReadLocalesDirEntry(io::Error),
-    /// `$sysroot/share/locale/$locale` is not a directory.
-    LocaleIsNotDir,
-}
-
-impl fmt::Display for TranslationBundleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TranslationBundleError::ReadFtl(e) => write!(f, "could not read ftl file: {}", e),
-            TranslationBundleError::ParseFtl(e) => {
-                write!(f, "could not parse ftl file: {}", e)
-            }
-            TranslationBundleError::AddResource(e) => write!(f, "failed to add resource: {}", e),
-            TranslationBundleError::MissingLocale => write!(f, "missing locale directory"),
-            TranslationBundleError::ReadLocalesDir(e) => {
-                write!(f, "could not read locales dir: {}", e)
-            }
-            TranslationBundleError::ReadLocalesDirEntry(e) => {
-                write!(f, "could not read locales dir entry: {}", e)
-            }
-            TranslationBundleError::LocaleIsNotDir => {
-                write!(f, "`$sysroot/share/locales/$locale` is not a directory")
-            }
-        }
-    }
-}
-
-impl Error for TranslationBundleError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            TranslationBundleError::ReadFtl(e) => Some(e),
-            TranslationBundleError::ParseFtl(e) => Some(e),
-            TranslationBundleError::AddResource(e) => Some(e),
-            TranslationBundleError::MissingLocale => None,
-            TranslationBundleError::ReadLocalesDir(e) => Some(e),
-            TranslationBundleError::ReadLocalesDirEntry(e) => Some(e),
-            TranslationBundleError::LocaleIsNotDir => None,
-        }
-    }
-}
-
-impl From<(FluentResource, Vec<ParserError>)> for TranslationBundleError {
-    fn from((_, mut errs): (FluentResource, Vec<ParserError>)) -> Self {
-        TranslationBundleError::ParseFtl(errs.pop().expect("failed ftl parse with no errors"))
-    }
-}
-
-impl From<Vec<FluentError>> for TranslationBundleError {
-    fn from(mut errs: Vec<FluentError>) -> Self {
-        TranslationBundleError::AddResource(
-            errs.pop().expect("failed adding resource to bundle with no errors"),
-        )
-    }
-}
-
-/// Returns Fluent bundle with the user's locale resources from
-/// `$sysroot/share/locale/$requested_locale/*.ftl`.
-///
-/// If `-Z additional-ftl-path` was provided, load that resource and add it  to the bundle
-/// (overriding any conflicting messages).
-#[instrument(level = "trace")]
-pub fn fluent_bundle(
-    mut user_provided_sysroot: Option<PathBuf>,
-    mut sysroot_candidates: Vec<PathBuf>,
-    requested_locale: Option<LanguageIdentifier>,
-    additional_ftl_path: Option<&Path>,
-    with_directionality_markers: bool,
-) -> Result<Option<Lrc<FluentBundle>>, TranslationBundleError> {
-    if requested_locale.is_none() && additional_ftl_path.is_none() {
-        return Ok(None);
-    }
-
-    let fallback_locale = langid!("en-US");
-    let requested_fallback_locale = requested_locale.as_ref() == Some(&fallback_locale);
-
-    // If there is only `-Z additional-ftl-path`, assume locale is "en-US", otherwise use user
-    // provided locale.
-    let locale = requested_locale.clone().unwrap_or(fallback_locale);
-    trace!(?locale);
-    let mut bundle = new_bundle(vec![locale]);
-
-    // Fluent diagnostics can insert directionality isolation markers around interpolated variables
-    // indicating that there may be a shift from right-to-left to left-to-right text (or
-    // vice-versa). These are disabled because they are sometimes visible in the error output, but
-    // may be worth investigating in future (for example: if type names are left-to-right and the
-    // surrounding diagnostic messages are right-to-left, then these might be helpful).
-    bundle.set_use_isolating(with_directionality_markers);
-
-    // If the user requests the default locale then don't try to load anything.
-    if !requested_fallback_locale && let Some(requested_locale) = requested_locale {
-        let mut found_resources = false;
-        for sysroot in user_provided_sysroot.iter_mut().chain(sysroot_candidates.iter_mut()) {
-            sysroot.push("share");
-            sysroot.push("locale");
-            sysroot.push(requested_locale.to_string());
-            trace!(?sysroot);
-
-            if !sysroot.exists() {
-                trace!("skipping");
-                continue;
-            }
-
-            if !sysroot.is_dir() {
-                return Err(TranslationBundleError::LocaleIsNotDir);
-            }
-
-            for entry in sysroot.read_dir().map_err(TranslationBundleError::ReadLocalesDir)? {
-                let entry = entry.map_err(TranslationBundleError::ReadLocalesDirEntry)?;
-                let path = entry.path();
-                trace!(?path);
-                if path.extension().and_then(|s| s.to_str()) != Some("ftl") {
-                    trace!("skipping");
-                    continue;
-                }
-
-                let resource_str =
-                    fs::read_to_string(path).map_err(TranslationBundleError::ReadFtl)?;
-                let resource =
-                    FluentResource::try_new(resource_str).map_err(TranslationBundleError::from)?;
-                trace!(?resource);
-                bundle.add_resource(resource).map_err(TranslationBundleError::from)?;
-                found_resources = true;
-            }
-        }
-
-        if !found_resources {
-            return Err(TranslationBundleError::MissingLocale);
-        }
-    }
-
-    if let Some(additional_ftl_path) = additional_ftl_path {
-        let resource_str =
-            fs::read_to_string(additional_ftl_path).map_err(TranslationBundleError::ReadFtl)?;
-        let resource =
-            FluentResource::try_new(resource_str).map_err(TranslationBundleError::from)?;
-        trace!(?resource);
-        bundle.add_resource_overriding(resource);
-    }
-
-    let bundle = Lrc::new(bundle);
-    Ok(Some(bundle))
-}
-
-/// Type alias for the result of `fallback_fluent_bundle` - a reference-counted pointer to a lazily
-/// evaluated fluent bundle.
-pub type LazyFallbackBundle = Lrc<Lazy<FluentBundle, impl FnOnce() -> FluentBundle>>;
-
-/// Return the default `FluentBundle` with standard "en-US" diagnostic messages.
-#[instrument(level = "trace")]
-pub fn fallback_fluent_bundle(
-    resources: &'static [&'static str],
-    with_directionality_markers: bool,
-) -> LazyFallbackBundle {
-    Lrc::new(Lazy::new(move || {
-        let mut fallback_bundle = new_bundle(vec![langid!("en-US")]);
-        // See comment in `fluent_bundle`.
-        fallback_bundle.set_use_isolating(with_directionality_markers);
-
-        for resource in resources {
-            let resource = FluentResource::try_new(resource.to_string())
-                .expect("failed to parse fallback fluent resource");
-            trace!(?resource);
-            fallback_bundle.add_resource_overriding(resource);
-        }
-
-        fallback_bundle
-    }))
-}
-
-/// Identifier for the Fluent message/attribute corresponding to a diagnostic message.
-type FluentId = Cow<'static, str>;
 
 /// Abstraction over a message in a diagnostic to support both translatable and non-translatable
 /// diagnostic messages.
 ///
 /// Intended to be removed once diagnostics are entirely translatable.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable)]
-pub enum DiagnosticMessage {
-    /// Non-translatable diagnostic message.
-    // FIXME(davidtwco): can a `Cow<'static, str>` be used here?
-    Str(String),
-    /// Identifier for a Fluent message (with optional attribute) corresponding to the diagnostic
-    /// message.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable, StableHash)]
+#[rustc_diagnostic_item = "DiagMessage"]
+pub enum DiagMessage {
+    /// Non-translatable diagnostic message or a message that has been translated eagerly.
     ///
-    /// <https://projectfluent.org/fluent/guide/hello.html>
-    /// <https://projectfluent.org/fluent/guide/attributes.html>
-    FluentIdentifier(FluentId, Option<FluentId>),
+    /// Some diagnostics have repeated subdiagnostics where the same interpolated variables would
+    /// be instantiated multiple times with different values. These subdiagnostics' messages
+    /// are translated when they are added to the parent diagnostic. This is one of the ways
+    /// this variant of `DiagMessage` is produced.
+    Str(Cow<'static, str>),
+    /// An inline Fluent message, containing the to be translated diagnostic message.
+    Inline(Cow<'static, str>),
 }
 
-impl DiagnosticMessage {
-    /// Returns the `String` contained within the `DiagnosticMessage::Str` variant, assuming that
-    /// this diagnostic message is of the legacy, non-translatable variety. Panics if this
-    /// assumption does not hold.
-    ///
-    /// Don't use this - it exists to support some places that do comparison with diagnostic
-    /// strings.
-    pub fn expect_str(&self) -> &str {
+impl DiagMessage {
+    pub fn as_str(&self) -> Option<&str> {
         match self {
-            DiagnosticMessage::Str(s) => s,
-            _ => panic!("expected non-translatable diagnostic message"),
+            DiagMessage::Str(s) => Some(s),
+            DiagMessage::Inline(_) => None,
         }
     }
-
-    /// Create a `DiagnosticMessage` for the provided Fluent identifier.
-    pub fn fluent(id: impl Into<FluentId>) -> Self {
-        DiagnosticMessage::FluentIdentifier(id.into(), None)
-    }
-
-    /// Create a `DiagnosticMessage` for the provided Fluent identifier and attribute.
-    pub fn fluent_attr(id: impl Into<FluentId>, attr: impl Into<FluentId>) -> Self {
-        DiagnosticMessage::FluentIdentifier(id.into(), Some(attr.into()))
-    }
 }
 
-/// `From` impl that enables existing diagnostic calls to functions which now take
-/// `impl Into<DiagnosticMessage>` to continue to work as before.
-impl<S: Into<String>> From<S> for DiagnosticMessage {
-    fn from(s: S) -> Self {
-        DiagnosticMessage::Str(s.into())
+impl From<String> for DiagMessage {
+    fn from(s: String) -> Self {
+        DiagMessage::Str(Cow::Owned(s))
+    }
+}
+impl From<&'static str> for DiagMessage {
+    fn from(s: &'static str) -> Self {
+        DiagMessage::Str(Cow::Borrowed(s))
+    }
+}
+impl From<Cow<'static, str>> for DiagMessage {
+    fn from(s: Cow<'static, str>) -> Self {
+        DiagMessage::Str(s)
     }
 }
 
@@ -290,7 +78,7 @@ pub struct SpanLabel {
     pub is_primary: bool,
 
     /// What label should we attach to this span (if any)?
-    pub label: Option<DiagnosticMessage>,
+    pub label: Option<DiagMessage>,
 }
 
 /// A collection of `Span`s.
@@ -301,10 +89,10 @@ pub struct SpanLabel {
 ///   the error, and would be rendered with `^^^`.
 /// - They can have a *label*. In this case, the label is written next
 ///   to the mark in the snippet when we render.
-#[derive(Clone, Debug, Hash, PartialEq, Eq, Encodable, Decodable)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Encodable, Decodable, StableHash)]
 pub struct MultiSpan {
     primary_spans: Vec<Span>,
-    span_labels: Vec<(Span, DiagnosticMessage)>,
+    span_labels: Vec<(Span, DiagMessage)>,
 }
 
 impl MultiSpan {
@@ -322,8 +110,16 @@ impl MultiSpan {
         MultiSpan { primary_spans: vec, span_labels: vec![] }
     }
 
-    pub fn push_span_label(&mut self, span: Span, label: impl Into<DiagnosticMessage>) {
+    pub fn push_primary_span(&mut self, primary_span: Span) {
+        self.primary_spans.push(primary_span);
+    }
+
+    pub fn push_span_label(&mut self, span: Span, label: impl Into<DiagMessage>) {
         self.span_labels.push((span, label.into()));
+    }
+
+    pub fn push_span_diag(&mut self, span: Span, diag: DiagMessage) {
+        self.span_labels.push((span, diag));
     }
 
     /// Selects the first primary span (if any).
@@ -392,9 +188,22 @@ impl MultiSpan {
         span_labels
     }
 
+    /// Returns the span labels as contained by `MultiSpan`.
+    pub fn span_labels_raw(&self) -> &[(Span, DiagMessage)] {
+        &self.span_labels
+    }
+
     /// Returns `true` if any of the span labels is displayable.
     pub fn has_span_labels(&self) -> bool {
         self.span_labels.iter().any(|(sp, _)| !sp.is_dummy())
+    }
+
+    /// Clone this `MultiSpan` without keeping any of the span labels - sometimes a `MultiSpan` is
+    /// to be re-used in another diagnostic, but includes `span_labels` which have translated
+    /// messages. These translated messages would fail to translate without their diagnostic
+    /// arguments which are unlikely to be cloned alongside the `Span`.
+    pub fn clone_ignoring_labels(&self) -> Self {
+        Self { primary_spans: self.primary_spans.clone(), ..MultiSpan::new() }
     }
 }
 
@@ -407,5 +216,128 @@ impl From<Span> for MultiSpan {
 impl From<Vec<Span>> for MultiSpan {
     fn from(spans: Vec<Span>) -> MultiSpan {
         MultiSpan::from_spans(spans)
+    }
+}
+
+fn icu_locale_from_unic_langid(lang: LanguageIdentifier) -> Option<icu_locale::Locale> {
+    icu_locale::Locale::try_from_str(&lang.to_string()).ok()
+}
+
+pub fn fluent_value_from_str_list_sep_by_and(l: Vec<Cow<'_, str>>) -> FluentValue<'_> {
+    // Fluent requires 'static value here for its AnyEq usages.
+    #[derive(Clone, PartialEq, Debug)]
+    struct FluentStrListSepByAnd(Vec<String>);
+
+    impl FluentType for FluentStrListSepByAnd {
+        fn duplicate(&self) -> Box<dyn FluentType + Send> {
+            Box::new(self.clone())
+        }
+
+        fn as_string(&self, intls: &intl_memoizer::IntlLangMemoizer) -> Cow<'static, str> {
+            let result = intls
+                .with_try_get::<MemoizableListFormatter, _, _>((), |list_formatter| {
+                    list_formatter.format_to_string(self.0.iter())
+                })
+                .unwrap();
+            Cow::Owned(result)
+        }
+
+        fn as_string_threadsafe(
+            &self,
+            intls: &intl_memoizer::concurrent::IntlLangMemoizer,
+        ) -> Cow<'static, str> {
+            let result = intls
+                .with_try_get::<MemoizableListFormatter, _, _>((), |list_formatter| {
+                    list_formatter.format_to_string(self.0.iter())
+                })
+                .unwrap();
+            Cow::Owned(result)
+        }
+    }
+
+    struct MemoizableListFormatter(icu_list::ListFormatter);
+
+    impl std::ops::Deref for MemoizableListFormatter {
+        type Target = icu_list::ListFormatter;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl intl_memoizer::Memoizable for MemoizableListFormatter {
+        type Args = ();
+        type Error = ();
+
+        fn construct(lang: LanguageIdentifier, _args: Self::Args) -> Result<Self, Self::Error> {
+            let locale = icu_locale_from_unic_langid(lang)
+                .unwrap_or_else(|| rustc_baked_icu_data::supported_locales::EN);
+            let list_formatter = icu_list::ListFormatter::try_new_and_unstable(
+                &rustc_baked_icu_data::BakedDataProvider,
+                locale.into(),
+                icu_list::options::ListFormatterOptions::default()
+                    .with_length(icu_list::options::ListLength::Wide),
+            )
+            .expect("Failed to create list formatter");
+
+            Ok(MemoizableListFormatter(list_formatter))
+        }
+    }
+
+    let l = l.into_iter().map(|x| x.into_owned()).collect();
+
+    FluentValue::Custom(Box::new(FluentStrListSepByAnd(l)))
+}
+
+/// Simplified version of `FluentArg` that can implement `Encodable` and `Decodable`. Collection of
+/// `DiagArg` are converted to `FluentArgs` (consuming the collection) at the start of diagnostic
+/// emission.
+pub type DiagArg<'iter> = (&'iter DiagArgName, &'iter DiagArgValue);
+
+/// Name of a diagnostic argument.
+pub type DiagArgName = Cow<'static, str>;
+
+/// Simplified version of `FluentValue` that can implement `Encodable` and `Decodable`. Converted
+/// to a `FluentValue` by the emitter to be used in diagnostic translation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Encodable, Decodable)]
+pub enum DiagArgValue {
+    Str(Cow<'static, str>),
+    // This gets converted to a `FluentNumber`, which is an `f64`. An `i32`
+    // safely fits in an `f64`. Any integers bigger than that will be converted
+    // to strings in `into_diag_arg` and stored using the `Str` variant.
+    Number(i32),
+    StrListSepByAnd(Vec<Cow<'static, str>>),
+}
+
+/// A mapping from diagnostic argument names to their values.
+/// This contains all the arguments necessary to format a diagnostic message.
+pub type DiagArgMap = FxIndexMap<DiagArgName, DiagArgValue>;
+
+/// Converts a value of a type into a `DiagArg` (typically a field of an `Diag` struct).
+/// Implemented as a custom trait rather than `From` so that it is implemented on the type being
+/// converted rather than on `DiagArgValue`, which enables types from other `rustc_*` crates to
+/// implement this.
+pub trait IntoDiagArg {
+    /// Convert `Self` into a `DiagArgValue` suitable for rendering in a diagnostic.
+    ///
+    /// It takes a `path` where "long values" could be written to, if the `DiagArgValue` is too big
+    /// for displaying on the terminal. This path comes from the `Diag` itself. When rendering
+    /// values that come from `TyCtxt`, like `Ty<'_>`, they can use `TyCtxt::short_string`. If a
+    /// value has no shortening logic that could be used, the argument can be safely ignored.
+    fn into_diag_arg(self, path: &mut Option<std::path::PathBuf>) -> DiagArgValue;
+}
+
+impl IntoDiagArg for DiagArgValue {
+    fn into_diag_arg(self, _: &mut Option<std::path::PathBuf>) -> DiagArgValue {
+        self
+    }
+}
+
+impl From<DiagArgValue> for FluentValue<'static> {
+    fn from(val: DiagArgValue) -> Self {
+        match val {
+            DiagArgValue::Str(s) => From::from(s),
+            DiagArgValue::Number(n) => From::from(n),
+            DiagArgValue::StrListSepByAnd(l) => fluent_value_from_str_list_sep_by_and(l),
+        }
     }
 }

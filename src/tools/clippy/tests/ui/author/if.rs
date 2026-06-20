@@ -1,4 +1,7 @@
-#[allow(clippy::all)]
+//@ check-pass
+
+// We are only checking `clippy::author` here, we do not care if other lints trigger
+#![allow(clippy::all)]
 
 fn main() {
     #[clippy::author]

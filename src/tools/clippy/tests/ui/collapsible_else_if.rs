@@ -1,10 +1,6 @@
-// run-rustfix
-#![allow(clippy::assertions_on_constants, clippy::equatable_if_let)]
+#![warn(clippy::collapsible_else_if)]
 
 #[rustfmt::skip]
-#[warn(clippy::collapsible_if)]
-#[warn(clippy::collapsible_else_if)]
-
 fn main() {
     let x = "hello";
     let y = "world";
@@ -16,6 +12,7 @@ fn main() {
             println!("world!")
         }
     }
+    //~^^^^^ collapsible_else_if
 
     if x == "hello" {
         print!("Hello ");
@@ -24,6 +21,7 @@ fn main() {
             println!("world!")
         }
     }
+    //~^^^^^ collapsible_else_if
 
     if x == "hello" {
         print!("Hello ");
@@ -35,6 +33,7 @@ fn main() {
             println!("!")
         }
     }
+    //~^^^^^^^^ collapsible_else_if
 
     if x == "hello" {
         print!("Hello ");
@@ -46,6 +45,7 @@ fn main() {
             println!("!")
         }
     }
+    //~^^^^^^^^ collapsible_else_if
 
     if let Some(42) = Some(42) {
         print!("Hello ");
@@ -57,6 +57,7 @@ fn main() {
             println!("!")
         }
     }
+    //~^^^^^^^^ collapsible_else_if
 
     if let Some(42) = Some(42) {
         print!("Hello ");
@@ -68,6 +69,7 @@ fn main() {
             println!("!")
         }
     }
+    //~^^^^^^^^ collapsible_else_if
 
     if let Some(42) = Some(42) {
         print!("Hello ");
@@ -79,6 +81,20 @@ fn main() {
             println!("!")
         }
     }
+    //~^^^^^^^^ collapsible_else_if
+
+    if x == "hello" {
+        if y == "world" {
+            print!("Hello ");
+        } else {
+            println!("world");
+        }
+    } else {
+        if let Some(42) = Some(42) {
+            println!("42");
+        }
+    }
+    //~^^^^^ collapsible_else_if
 
     if x == "hello" {
         print!("Hello ");
@@ -88,4 +104,112 @@ fn main() {
             println!("world!")
         }
     }
+
+    if x == "hello" {
+        if y == "world" {
+            print!("Hello ");
+        } else {
+            println!("world");
+        }
+    } else {
+        if let Some(42) = Some(42) {
+            println!("42");
+        } else {
+            println!("!");
+        }
+    }
+
+}
+
+#[rustfmt::skip]
+fn issue_7318() {
+    if true { println!("I've been resolved!")
+    }else{
+        if false {}
+    }
+    //~^^^ collapsible_else_if
+}
+
+fn issue_13365() {
+    // ensure we fulfill `#[expect]`
+    if true {
+    } else {
+        #[expect(clippy::collapsible_else_if)]
+        if false {}
+    }
+}
+
+fn issue14799() {
+    use std::ops::ControlFlow;
+
+    let c: ControlFlow<_, ()> = ControlFlow::Break(Some(42));
+    if let ControlFlow::Break(Some(_)) = c {
+        todo!();
+    } else {
+        #[cfg(target_os = "freebsd")]
+        todo!();
+
+        if let ControlFlow::Break(None) = c {
+            todo!();
+        } else {
+            todo!();
+        }
+    }
+}
+
+fn in_parens() {
+    let x = "hello";
+    let y = "world";
+
+    if x == "hello" {
+        print!("Hello ");
+    } else {
+        (if y == "world" { println!("world") } else { println!("!") })
+    }
+    //~^^^ collapsible_else_if
+}
+
+fn in_brackets() {
+    let x = "hello";
+    let y = "world";
+
+    // There is no lint when the inner `if` is in a block.
+    if x == "hello" {
+        print!("Hello ");
+    } else {
+        { if y == "world" { println!("world") } else { println!("!") } }
+    }
+}
+
+#[rustfmt::skip]
+fn ends_with_zero_width_whitespace() {
+    // Test out snippets ending with the 2 zero-width characters recognized as whitespaces by the lexer,
+    // but not by char::is_whitespace
+    // Behaviour shows a whitespace is inserted between else and if here which is desirable in this case
+
+    let x = "hello";
+    let y = "world";
+
+
+    // LRM (U+200E)
+    if x == "hello" {
+        println!("hello LRM");
+    } else‎{
+        if y == "world" {
+            println!("LRM world");
+        }
+    }
+    //~^^^^^ collapsible_else_if
+
+    // RLM (U+200F)
+    if x == "hello" {
+        println!("hello RLM");
+    } else‏{
+        if y == "world" {
+            println!("RLM world");
+        }
+    }
+    //~^^^^^ collapsible_else_if
+
+
 }

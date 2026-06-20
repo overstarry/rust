@@ -2,10 +2,8 @@
 
 #![feature(arbitrary_self_types, unsize, coerce_unsized, dispatch_from_dyn)]
 
-use std::{
-    ops::{Deref, CoerceUnsized, DispatchFromDyn},
-    marker::Unsize,
-};
+use std::marker::Unsize;
+use std::ops::{CoerceUnsized, Deref, DispatchFromDyn};
 
 struct Ptr<T: ?Sized>(Box<T>);
 
@@ -33,12 +31,7 @@ impl<T: ?Sized> Deref for Wrapper<T> {
 impl<T: CoerceUnsized<U>, U> CoerceUnsized<Wrapper<U>> for Wrapper<T> {}
 impl<T: DispatchFromDyn<U>, U> DispatchFromDyn<Wrapper<U>> for Wrapper<T> {}
 
-
 trait Trait {
-    // This method isn't object-safe yet. Unsized by-value `self` is object-safe (but not callable
-    // without unsized_locals), but wrappers around `Self` currently are not.
-    // FIXME (mikeyhew) uncomment this when unsized rvalues object-safety is implemented
-    // fn wrapper(self: Wrapper<Self>) -> i32;
     fn ptr_wrapper(self: Ptr<Wrapper<Self>>) -> i32;
     fn wrapper_ptr(self: Wrapper<Ptr<Self>>) -> i32;
     fn wrapper_ptr_wrapper(self: Wrapper<Ptr<Wrapper<Self>>>) -> i32;

@@ -53,21 +53,17 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::ffi::{OsStr, OsString};
-use crate::sealed::Sealed;
-use crate::sys::os_str::Buf;
-use crate::sys_common::wtf8::Wtf8Buf;
-use crate::sys_common::{AsInner, FromInner};
+use alloc::wtf8::Wtf8Buf;
 
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use crate::sys_common::wtf8::EncodeWide;
+use crate::ffi::{OsStr, OsString};
+use crate::fmt;
+use crate::iter::FusedIterator;
+use crate::sys::os_str::Buf;
+use crate::sys::{AsInner, FromInner};
 
 /// Windows-specific extensions to [`OsString`].
-///
-/// This trait is sealed: it cannot be implemented outside the standard library.
-/// This is so that future additional methods are not breaking changes.
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait OsStringExt: Sealed {
+pub impl(self) trait OsStringExt {
     /// Creates an `OsString` from a potentially ill-formed UTF-16 slice of
     /// 16-bit code units.
     ///
@@ -97,11 +93,8 @@ impl OsStringExt for OsString {
 }
 
 /// Windows-specific extensions to [`OsStr`].
-///
-/// This trait is sealed: it cannot be implemented outside the standard library.
-/// This is so that future additional methods are not breaking changes.
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait OsStrExt: Sealed {
+pub impl(self) trait OsStrExt {
     /// Re-encodes an `OsStr` as a wide character sequence, i.e., potentially
     /// ill-formed UTF-16.
     ///
@@ -129,7 +122,37 @@ pub trait OsStrExt: Sealed {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl OsStrExt for OsStr {
+    #[inline]
     fn encode_wide(&self) -> EncodeWide<'_> {
-        self.as_inner().inner.encode_wide()
+        EncodeWide { inner: self.as_inner().inner.encode_wide() }
     }
 }
+
+/// Iterator returned by [`OsStrExt::encode_wide`].
+#[stable(feature = "rust1", since = "1.0.0")]
+#[derive(Clone)]
+pub struct EncodeWide<'a> {
+    inner: alloc::wtf8::EncodeWide<'a>,
+}
+#[stable(feature = "encode_wide_debug", since = "1.91.0")]
+impl fmt::Debug for EncodeWide<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, f)
+    }
+}
+#[stable(feature = "rust1", since = "1.0.0")]
+impl Iterator for EncodeWide<'_> {
+    type Item = u16;
+
+    #[inline]
+    fn next(&mut self) -> Option<u16> {
+        self.inner.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+#[stable(feature = "encode_wide_fused_iterator", since = "1.62.0")]
+impl FusedIterator for EncodeWide<'_> {}

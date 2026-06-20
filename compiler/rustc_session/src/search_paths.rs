@@ -1,14 +1,53 @@
-use crate::filesearch::make_target_lib_path;
-use crate::{config, early_error};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rustc_macros::{Decodable, Encodable, StableHash};
+use rustc_target::spec::TargetTuple;
+
+use crate::EarlyDiagCtxt;
+use crate::filesearch::make_target_lib_path;
 
 #[derive(Clone, Debug)]
 pub struct SearchPath {
     pub kind: PathKind,
     pub dir: PathBuf,
-    pub files: Vec<SearchPathFile>,
+    pub files: FilesIndex,
 }
 
+/// [FilesIndex] contains paths that can be efficiently looked up with (prefix, suffix) pairs.
+#[derive(Clone, Debug)]
+pub struct FilesIndex(Vec<SearchPathFile>);
+
+impl FilesIndex {
+    /// Look up [SearchPathFile] by (prefix, suffix) pair.
+    pub fn query<'s>(
+        &'s self,
+        prefix: &str,
+        suffix: &str,
+    ) -> Option<impl Iterator<Item = (String, &'s SearchPathFile)>> {
+        let start = self.0.partition_point(|v| *v.file_name_str < *prefix);
+        if start == self.0.len() {
+            return None;
+        }
+        let end = self.0[start..].partition_point(|v| v.file_name_str.starts_with(prefix));
+        let prefixed_items = &self.0[start..][..end];
+
+        let ret = prefixed_items.into_iter().filter_map(move |v| {
+            v.file_name_str.ends_with(suffix).then(|| {
+                (
+                    String::from(
+                        &v.file_name_str[prefix.len()..v.file_name_str.len() - suffix.len()],
+                    ),
+                    v,
+                )
+            })
+        });
+        Some(ret)
+    }
+    pub fn retain(&mut self, prefixes: &[&str]) {
+        self.0.retain(|v| prefixes.iter().any(|prefix| v.file_name_str.starts_with(prefix)));
+    }
+}
 /// The obvious implementation of `SearchPath::files` is a `Vec<PathBuf>`. But
 /// it is searched repeatedly by `find_library_crate`, and the searches involve
 /// checking the prefix and suffix of the filename of each `PathBuf`. This is
@@ -22,17 +61,22 @@ pub struct SearchPath {
 /// UTF-8, and so a non-UTF-8 filename couldn't be one we're looking for.)
 #[derive(Clone, Debug)]
 pub struct SearchPathFile {
-    pub path: PathBuf,
-    pub file_name_str: String,
+    file_name_str: Arc<str>,
 }
 
-#[derive(PartialEq, Clone, Copy, Debug, Hash, Eq, Encodable, Decodable, HashStable_Generic)]
+impl SearchPathFile {
+    /// Constructs the full path to the file.
+    pub fn path(&self, dir: &Path) -> PathBuf {
+        dir.join(&*self.file_name_str)
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug, Hash, Eq, Encodable, Decodable, StableHash)]
 pub enum PathKind {
     Native,
     Crate,
     Dependency,
     Framework,
-    ExternFlag,
     All,
 }
 
@@ -46,7 +90,13 @@ impl PathKind {
 }
 
 impl SearchPath {
-    pub fn from_cli_opt(path: &str, output: config::ErrorOutputType) -> Self {
+    pub fn from_cli_opt(
+        sysroot: &Path,
+        triple: &TargetTuple,
+        early_dcx: &EarlyDiagCtxt,
+        path: &str,
+        is_unstable_enabled: bool,
+    ) -> Self {
         let (kind, path) = if let Some(stripped) = path.strip_prefix("native=") {
             (PathKind::Native, stripped)
         } else if let Some(stripped) = path.strip_prefix("crate=") {
@@ -60,11 +110,23 @@ impl SearchPath {
         } else {
             (PathKind::All, path)
         };
-        if path.is_empty() {
-            early_error(output, "empty search path given via `-L`");
+        let dir = match path.strip_prefix("@RUSTC_BUILTIN") {
+            Some(stripped) => {
+                if !is_unstable_enabled {
+                    early_dcx.early_fatal(
+                        "the `-Z unstable-options` flag must also be passed to \
+                         enable the use of `@RUSTC_BUILTIN`",
+                    );
+                }
+
+                make_target_lib_path(sysroot, triple.tuple()).join("builtin").join(stripped)
+            }
+            None => PathBuf::from(path),
+        };
+        if dir.as_os_str().is_empty() {
+            early_dcx.early_fatal("empty search path given via `-L`");
         }
 
-        let dir = PathBuf::from(path);
         Self::new(kind, dir)
     }
 
@@ -72,22 +134,21 @@ impl SearchPath {
         Self::new(PathKind::All, make_target_lib_path(sysroot, triple))
     }
 
-    fn new(kind: PathKind, dir: PathBuf) -> Self {
+    pub fn new(kind: PathKind, dir: PathBuf) -> Self {
         // Get the files within the directory.
-        let files = match std::fs::read_dir(&dir) {
+        let mut files = match std::fs::read_dir(&dir) {
             Ok(files) => files
                 .filter_map(|e| {
                     e.ok().and_then(|e| {
-                        e.file_name().to_str().map(|s| SearchPathFile {
-                            path: e.path(),
-                            file_name_str: s.to_string(),
-                        })
+                        e.file_name().to_str().map(|s| SearchPathFile { file_name_str: s.into() })
                     })
                 })
-                .collect::<Vec<_>>(),
-            Err(..) => vec![],
-        };
+                .collect::<Vec<SearchPathFile>>(),
 
+            Err(..) => Default::default(),
+        };
+        files.sort_unstable_by(|lhs, rhs| lhs.file_name_str.cmp(&rhs.file_name_str));
+        let files = FilesIndex(files);
         SearchPath { kind, dir, files }
     }
 }

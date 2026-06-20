@@ -1,4 +1,7 @@
+//@ check-pass
+
 #![warn(clippy::repeat_once)]
+#![expect(clippy::let_unit_value)]
 
 trait Repeat {
     fn repeat(&self) {}

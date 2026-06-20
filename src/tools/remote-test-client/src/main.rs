@@ -5,18 +5,21 @@
 //! Here is also where we bake in the support to spawn the QEMU emulator as
 //! well.
 
-use std::env;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::{self, BufWriter};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::{env, thread};
 
 const REMOTE_ADDR_ENV: &str = "TEST_DEVICE_ADDR";
 const DEFAULT_ADDR: &str = "127.0.0.1:12345";
+
+const CONNECT_TIMEOUT_ENV: &str = "TEST_DEVICE_CONNECT_TIMEOUT_SECONDS";
+/// The default timeout is high to not break slow CI or slow device starts.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_mins(30);
 
 macro_rules! t {
     ($e:expr) => {
@@ -57,6 +60,17 @@ fn main() {
     }
 }
 
+fn connect_timeout() -> Duration {
+    match env::var(CONNECT_TIMEOUT_ENV).ok() {
+        Some(timeout) => timeout.parse().map(Duration::from_secs).unwrap_or_else(|e| {
+            panic!(
+                "error: parsing `{CONNECT_TIMEOUT_ENV}` value \"{timeout}\" as seconds failed: {e}"
+            )
+        }),
+        None => DEFAULT_CONNECT_TIMEOUT,
+    }
+}
+
 fn spawn_emulator(target: &str, server: &Path, tmpdir: &Path, rootfs: Option<PathBuf>) {
     let device_address = env::var(REMOTE_ADDR_ENV).unwrap_or(DEFAULT_ADDR.to_string());
 
@@ -70,19 +84,27 @@ fn spawn_emulator(target: &str, server: &Path, tmpdir: &Path, rootfs: Option<Pat
     }
 
     // Wait for the emulator to come online
-    loop {
-        let dur = Duration::from_millis(100);
+    let timeout = connect_timeout();
+    let mut successful_read = false;
+    let start_time = Instant::now();
+    while start_time.elapsed() < timeout {
+        let dur = Duration::from_millis(2000);
         if let Ok(mut client) = TcpStream::connect(&device_address) {
             t!(client.set_read_timeout(Some(dur)));
             t!(client.set_write_timeout(Some(dur)));
             if client.write_all(b"ping").is_ok() {
                 let mut b = [0; 4];
                 if client.read_exact(&mut b).is_ok() {
+                    successful_read = true;
                     break;
                 }
             }
         }
         thread::sleep(dur);
+    }
+
+    if !successful_read {
+        panic!("Gave up trying to connect to test device at {device_address} after {timeout:?}");
     }
 }
 
@@ -93,7 +115,7 @@ fn start_android_emulator(server: &Path) {
 
     println!("pushing server");
     let status =
-        Command::new("adb").arg("push").arg(server).arg("/data/tmp/testd").status().unwrap();
+        Command::new("adb").arg("push").arg(server).arg("/data/local/tmp/testd").status().unwrap();
     assert!(status.success());
 
     println!("forwarding tcp");
@@ -102,7 +124,7 @@ fn start_android_emulator(server: &Path) {
     assert!(status.success());
 
     println!("executing server");
-    Command::new("adb").arg("shell").arg("/data/tmp/testd").spawn().unwrap();
+    Command::new("adb").arg("shell").arg("/data/local/tmp/testd").spawn().unwrap();
 }
 
 fn prepare_rootfs(target: &str, rootfs: &Path, server: &Path, rootfs_img: &Path) {
@@ -300,7 +322,7 @@ fn run(support_lib_count: usize, exe: String, all_args: Vec<String>) {
 
     // Ok now it's time to read all the output. We're receiving "frames"
     // representing stdout/stderr, so we decode all that here.
-    let mut header = [0; 5];
+    let mut header = [0; 9];
     let mut stderr_done = false;
     let mut stdout_done = false;
     let mut client = t!(client.into_inner());
@@ -308,10 +330,8 @@ fn run(support_lib_count: usize, exe: String, all_args: Vec<String>) {
     let mut stderr = io::stderr();
     while !stdout_done || !stderr_done {
         t!(client.read_exact(&mut header));
-        let amt = ((header[1] as u64) << 24)
-            | ((header[2] as u64) << 16)
-            | ((header[3] as u64) << 8)
-            | ((header[4] as u64) << 0);
+        let amt = u64::from_be_bytes(header[1..9].try_into().unwrap());
+
         if header[0] == 0 {
             if amt == 0 {
                 stdout_done = true;
@@ -319,13 +339,11 @@ fn run(support_lib_count: usize, exe: String, all_args: Vec<String>) {
                 t!(io::copy(&mut (&mut client).take(amt), &mut stdout));
                 t!(stdout.flush());
             }
+        } else if amt == 0 {
+            stderr_done = true;
         } else {
-            if amt == 0 {
-                stderr_done = true;
-            } else {
-                t!(io::copy(&mut (&mut client).take(amt), &mut stderr));
-                t!(stderr.flush());
-            }
+            t!(io::copy(&mut (&mut client).take(amt), &mut stderr));
+            t!(stderr.flush());
         }
     }
 
@@ -340,7 +358,9 @@ fn run(support_lib_count: usize, exe: String, all_args: Vec<String>) {
         std::process::exit(code);
     } else {
         println!("died due to signal {}", code);
-        std::process::exit(3);
+        // Behave like bash and other tools and exit with 128 + the signal
+        // number. That way we can avoid special case code in other places.
+        std::process::exit(128 + code);
     }
 }
 
@@ -349,7 +369,8 @@ fn send(path: &Path, dst: &mut dyn Write) {
     t!(dst.write_all(&[0]));
     let mut file = t!(File::open(&path));
     let amt = t!(file.metadata()).len();
-    t!(dst.write_all(&[(amt >> 24) as u8, (amt >> 16) as u8, (amt >> 8) as u8, (amt >> 0) as u8,]));
+
+    t!(dst.write_all(&amt.to_be_bytes()));
     t!(io::copy(&mut file, dst));
 }
 

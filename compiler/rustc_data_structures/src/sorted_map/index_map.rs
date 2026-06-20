@@ -1,10 +1,9 @@
 //! A variant of `SortedMap` that preserves insertion order.
 
 use std::hash::{Hash, Hasher};
-use std::iter::FromIterator;
 
-use crate::stable_hasher::{HashStable, StableHasher};
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
+use rustc_macros::StableHash;
 
 /// An indexed multi-map that preserves insertion order while permitting both *O*(log *n*) lookup of
 /// an item by key and *O*(1) lookup by index.
@@ -24,11 +23,13 @@ use rustc_index::vec::{Idx, IndexVec};
 /// in-place.
 ///
 /// [`SortedMap`]: super::SortedMap
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, StableHash)]
 pub struct SortedIndexMultiMap<I: Idx, K, V> {
     /// The elements of the map in insertion order.
     items: IndexVec<I, (K, V)>,
 
+    // We can ignore this field because it is not observable from the outside.
+    #[stable_hash(ignore)]
     /// Indices of the items in the set, sorted by the item's key.
     idx_sorted_by_item_key: Vec<I>,
 }
@@ -64,13 +65,13 @@ impl<I: Idx, K: Ord, V> SortedIndexMultiMap<I, K, V> {
     /// Returns an iterator over the items in the map in insertion order.
     #[inline]
     pub fn iter(&self) -> impl '_ + DoubleEndedIterator<Item = (&K, &V)> {
-        self.items.iter().map(|(ref k, ref v)| (k, v))
+        self.items.iter().map(|(k, v)| (k, v))
     }
 
     /// Returns an iterator over the items in the map in insertion order along with their indices.
     #[inline]
     pub fn iter_enumerated(&self) -> impl '_ + DoubleEndedIterator<Item = (I, (&K, &V))> {
-        self.items.iter_enumerated().map(|(i, (ref k, ref v))| (i, (k, v)))
+        self.items.iter_enumerated().map(|(i, (k, v))| (i, (k, v)))
     }
 
     /// Returns the item in the map with the given index.
@@ -84,7 +85,7 @@ impl<I: Idx, K: Ord, V> SortedIndexMultiMap<I, K, V> {
     /// If there are multiple items that are equivalent to `key`, they will be yielded in
     /// insertion order.
     #[inline]
-    pub fn get_by_key(&self, key: K) -> impl Iterator<Item = &V> + '_ {
+    pub fn get_by_key(&self, key: K) -> impl Iterator<Item = &V> {
         self.get_by_key_enumerated(key).map(|(_, v)| v)
     }
 
@@ -94,12 +95,17 @@ impl<I: Idx, K: Ord, V> SortedIndexMultiMap<I, K, V> {
     /// If there are multiple items that are equivalent to `key`, they will be yielded in
     /// insertion order.
     #[inline]
-    pub fn get_by_key_enumerated(&self, key: K) -> impl Iterator<Item = (I, &V)> + '_ {
+    pub fn get_by_key_enumerated(&self, key: K) -> impl Iterator<Item = (I, &V)> {
         let lower_bound = self.idx_sorted_by_item_key.partition_point(|&i| self.items[i].0 < key);
         self.idx_sorted_by_item_key[lower_bound..].iter().map_while(move |&i| {
             let (k, v) = &self.items[i];
             (k == &key).then_some((i, v))
         })
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: K) -> bool {
+        self.get_by_key(key).next().is_some()
     }
 }
 
@@ -120,22 +126,13 @@ where
         self.items.hash(hasher)
     }
 }
-impl<I: Idx, K, V, C> HashStable<C> for SortedIndexMultiMap<I, K, V>
-where
-    K: HashStable<C>,
-    V: HashStable<C>,
-{
-    fn hash_stable(&self, ctx: &mut C, hasher: &mut StableHasher) {
-        self.items.hash_stable(ctx, hasher)
-    }
-}
 
 impl<I: Idx, K: Ord, V> FromIterator<(K, V)> for SortedIndexMultiMap<I, K, V> {
     fn from_iter<J>(iter: J) -> Self
     where
         J: IntoIterator<Item = (K, V)>,
     {
-        let items = IndexVec::from_iter(iter);
+        let items = IndexVec::<I, _>::from_iter(iter);
         let mut idx_sorted_by_item_key: Vec<_> = items.indices().collect();
 
         // `sort_by_key` is stable, so insertion order is preserved for duplicate items.

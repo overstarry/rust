@@ -5,46 +5,55 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 
 use crate::ffi::OsStr;
-use crate::io;
 use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use crate::process;
-use crate::sealed::Sealed;
-use crate::sys;
-use crate::sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
+use crate::path::Path;
+use crate::sys::process::ChildPipe;
+use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
+use crate::{io, process, sys};
+
+cfg_select! {
+    any(target_os = "vxworks", target_os = "espidf", target_os = "horizon", target_os = "vita") => {
+        type UserId = u16;
+        type GroupId = u16;
+    }
+    target_os = "nto" => {
+        // Both IDs are signed, see `sys/target_nto.h` of the QNX Neutrino SDP.
+        // Only positive values should be used, see e.g.
+        // https://www.qnx.com/developers/docs/7.1/#com.qnx.doc.neutrino.lib_ref/topic/s/setuid.html
+        type UserId = i32;
+        type GroupId = i32;
+    }
+    _ => {
+        type UserId = u32;
+        type GroupId = u32;
+    }
+}
 
 /// Unix-specific extensions to the [`process::Command`] builder.
-///
-/// This trait is sealed: it cannot be implemented outside the standard library.
-/// This is so that future additional methods are not breaking changes.
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait CommandExt: Sealed {
+pub impl(self) trait CommandExt {
     /// Sets the child process's user ID. This translates to a
     /// `setuid` call in the child process. Failure in the `setuid`
     /// call will cause the spawn to fail.
+    ///
+    /// # Notes
+    ///
+    /// This will also trigger a call to `setgroups(0, NULL)` in the child
+    /// process if no groups have been specified.
+    /// This removes supplementary groups that might have given the child
+    /// unwanted permissions.
     #[stable(feature = "rust1", since = "1.0.0")]
-    fn uid(
-        &mut self,
-        #[cfg(not(target_os = "vxworks"))] id: u32,
-        #[cfg(target_os = "vxworks")] id: u16,
-    ) -> &mut process::Command;
+    fn uid(&mut self, id: UserId) -> &mut process::Command;
 
     /// Similar to `uid`, but sets the group ID of the child process. This has
     /// the same semantics as the `uid` field.
     #[stable(feature = "rust1", since = "1.0.0")]
-    fn gid(
-        &mut self,
-        #[cfg(not(target_os = "vxworks"))] id: u32,
-        #[cfg(target_os = "vxworks")] id: u16,
-    ) -> &mut process::Command;
+    fn gid(&mut self, id: GroupId) -> &mut process::Command;
 
     /// Sets the supplementary group IDs for the calling process. Translates to
     /// a `setgroups` call in the child process.
     #[unstable(feature = "setgroups", issue = "90747")]
-    fn groups(
-        &mut self,
-        #[cfg(not(target_os = "vxworks"))] groups: &[u32],
-        #[cfg(target_os = "vxworks")] groups: &[u16],
-    ) -> &mut process::Command;
+    fn groups(&mut self, groups: &[GroupId]) -> &mut process::Command;
 
     /// Schedules a closure to be run just before the `exec` function is
     /// invoked.
@@ -68,6 +77,9 @@ pub trait CommandExt: Sealed {
     /// or acquiring a mutex are not guaranteed to work (due to
     /// other threads perhaps still running when the `fork` was run).
     ///
+    /// Note that the list of allocating functions includes [`Error::new`] and
+    /// [`Error::other`]. To signal a non-trivial error, prefer [`panic!`].
+    ///
     /// For further details refer to the [POSIX fork() specification]
     /// and the equivalent documentation for any targeted
     /// platform, especially the requirements around *async-signal-safety*.
@@ -90,6 +102,8 @@ pub trait CommandExt: Sealed {
     /// [POSIX fork() specification]:
     ///     https://pubs.opengroup.org/onlinepubs/9699919799/functions/fork.html
     /// [`std::env`]: mod@crate::env
+    /// [`Error::new`]: crate::io::Error::new
+    /// [`Error::other`]: crate::io::Error::other
     #[stable(feature = "process_pre_exec", since = "1.34.0")]
     unsafe fn pre_exec<F>(&mut self, f: F) -> &mut process::Command
     where
@@ -98,13 +112,17 @@ pub trait CommandExt: Sealed {
     /// Schedules a closure to be run just before the `exec` function is
     /// invoked.
     ///
-    /// This method is stable and usable, but it should be unsafe. To fix
-    /// that, it got deprecated in favor of the unsafe [`pre_exec`].
+    /// `before_exec` used to be a safe method, but it needs to be unsafe since the closure may only
+    /// perform operations that are *async-signal-safe*. Hence it got deprecated in favor of the
+    /// unsafe [`pre_exec`]. Meanwhile, Rust gained the ability to make an existing safe method
+    /// fully unsafe in a new edition, which is how `before_exec` became `unsafe`. It still also
+    /// remains deprecated; `pre_exec` should be used instead.
     ///
     /// [`pre_exec`]: CommandExt::pre_exec
     #[stable(feature = "process_exec", since = "1.15.0")]
-    #[rustc_deprecated(since = "1.37.0", reason = "should be unsafe, use `pre_exec` instead")]
-    fn before_exec<F>(&mut self, f: F) -> &mut process::Command
+    #[deprecated(since = "1.37.0", note = "should be unsafe, use `pre_exec` instead")]
+    #[rustc_deprecated_safe_2024(audit_that = "the closure is async-signal-safe")]
+    unsafe fn before_exec<F>(&mut self, f: F) -> &mut process::Command
     where
         F: FnMut() -> io::Result<()> + Send + Sync + 'static,
     {
@@ -128,7 +146,7 @@ pub trait CommandExt: Sealed {
     ///
     /// This function, unlike `spawn`, will **not** `fork` the process to create
     /// a new child. Like spawn, however, the default behavior for the stdio
-    /// descriptors will be to inherited from the current process.
+    /// descriptors will be to inherit them from the current process.
     ///
     /// # Notes
     ///
@@ -139,6 +157,7 @@ pub trait CommandExt: Sealed {
     /// required to gracefully handle errors it is recommended to use the
     /// cross-platform `spawn` instead.
     #[stable(feature = "process_exec2", since = "1.9.0")]
+    #[must_use]
     fn exec(&mut self) -> io::Error;
 
     /// Set executable argument
@@ -150,37 +169,67 @@ pub trait CommandExt: Sealed {
     where
         S: AsRef<OsStr>;
 
-    /// Sets the process group ID of the child process. Translates to a `setpgid` call in the child
-    /// process.
-    #[unstable(feature = "process_set_process_group", issue = "93857")]
+    /// Sets the process group ID (PGID) of the child process. Equivalent to a
+    /// `setpgid` call in the child process, but may be more efficient.
+    ///
+    /// Process groups determine which processes receive signals.
+    ///
+    /// # Examples
+    ///
+    /// Pressing Ctrl-C in a terminal will send SIGINT to all processes in
+    /// the current foreground process group. By spawning the `sleep`
+    /// subprocess in a new process group, it will not receive SIGINT from the
+    /// terminal.
+    ///
+    /// The parent process could install a signal handler and manage the
+    /// subprocess on its own terms.
+    ///
+    /// A process group ID of 0 will use the process ID as the PGID.
+    ///
+    /// ```no_run
+    /// use std::process::Command;
+    /// use std::os::unix::process::CommandExt;
+    ///
+    /// Command::new("sleep")
+    ///     .arg("10")
+    ///     .process_group(0)
+    ///     .spawn()?
+    ///     .wait()?;
+    /// #
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
+    #[stable(feature = "process_set_process_group", since = "1.64.0")]
     fn process_group(&mut self, pgroup: i32) -> &mut process::Command;
+
+    /// Set the root of the child process. This calls `chroot` in the child process before executing
+    /// the command.
+    ///
+    /// This happens before changing to the directory specified with
+    /// [`process::Command::current_dir`], and that directory will be relative to the new root.
+    ///
+    /// If no directory has been specified with [`process::Command::current_dir`], this will set the
+    /// directory to `/`, to avoid leaving the current directory outside the chroot. (This is an
+    /// intentional difference from the underlying `chroot` system call.)
+    #[unstable(feature = "process_chroot", issue = "141298")]
+    fn chroot<P: AsRef<Path>>(&mut self, dir: P) -> &mut process::Command;
+
+    #[unstable(feature = "process_setsid", issue = "105376")]
+    fn setsid(&mut self, setsid: bool) -> &mut process::Command;
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl CommandExt for process::Command {
-    fn uid(
-        &mut self,
-        #[cfg(not(target_os = "vxworks"))] id: u32,
-        #[cfg(target_os = "vxworks")] id: u16,
-    ) -> &mut process::Command {
+    fn uid(&mut self, id: UserId) -> &mut process::Command {
         self.as_inner_mut().uid(id);
         self
     }
 
-    fn gid(
-        &mut self,
-        #[cfg(not(target_os = "vxworks"))] id: u32,
-        #[cfg(target_os = "vxworks")] id: u16,
-    ) -> &mut process::Command {
+    fn gid(&mut self, id: GroupId) -> &mut process::Command {
         self.as_inner_mut().gid(id);
         self
     }
 
-    fn groups(
-        &mut self,
-        #[cfg(not(target_os = "vxworks"))] groups: &[u32],
-        #[cfg(target_os = "vxworks")] groups: &[u16],
-    ) -> &mut process::Command {
+    fn groups(&mut self, groups: &[GroupId]) -> &mut process::Command {
         self.as_inner_mut().groups(groups);
         self
     }
@@ -211,6 +260,16 @@ impl CommandExt for process::Command {
         self.as_inner_mut().pgroup(pgroup);
         self
     }
+
+    fn chroot<P: AsRef<Path>>(&mut self, dir: P) -> &mut process::Command {
+        self.as_inner_mut().chroot(dir.as_ref());
+        self
+    }
+
+    fn setsid(&mut self, setsid: bool) -> &mut process::Command {
+        self.as_inner_mut().setsid(setsid);
+        self
+    }
 }
 
 /// Unix-specific extensions to [`process::ExitStatus`] and
@@ -224,11 +283,8 @@ impl CommandExt for process::Command {
 ///
 /// A Unix wait status (a Rust `ExitStatus`) can represent a Unix exit status, but can also
 /// represent other kinds of process event.
-///
-/// This trait is sealed: it cannot be implemented outside the standard library.
-/// This is so that future additional methods are not breaking changes.
 #[stable(feature = "rust1", since = "1.0.0")]
-pub trait ExitStatusExt: Sealed {
+pub impl(self) trait ExitStatusExt {
     /// Creates a new `ExitStatus` or `ExitStatusError` from the raw underlying integer status
     /// value from `wait`
     ///
@@ -329,6 +385,122 @@ impl ExitStatusExt for process::ExitStatusError {
     }
 }
 
+#[unstable(feature = "unix_send_signal", issue = "141975")]
+pub impl(self) trait ChildExt {
+    /// Sends a signal to a child process.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the signal is invalid. The integer values associated
+    /// with signals are implementation-specific, so it's encouraged to use a crate that provides
+    /// posix bindings.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(unix_send_signal)]
+    ///
+    /// use std::{io, os::unix::process::ChildExt, process::{Command, Stdio}};
+    ///
+    /// use libc::SIGTERM;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     # if cfg!(not(all(target_vendor = "apple", not(target_os = "macos")))) {
+    ///     let child = Command::new("cat").stdin(Stdio::piped()).spawn()?;
+    ///     child.send_signal(SIGTERM)?;
+    ///     # }
+    ///     Ok(())
+    /// }
+    /// ```
+    fn send_signal(&self, signal: i32) -> io::Result<()>;
+
+    /// Sends a signal to a child process's process group.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if the signal is invalid or if the
+    /// child process does not have a process group. The integer values
+    /// associated with signals are implementation-specific, so it's encouraged
+    /// to use a crate that provides posix bindings.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(unix_send_signal)]
+    ///
+    /// use std::{io, os::unix::process::{ChildExt, CommandExt}, process::{Command, Stdio}};
+    ///
+    /// use libc::SIGTERM;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     # if cfg!(not(all(target_vendor = "apple", not(target_os = "macos")))) {
+    ///     let child = Command::new("cat")
+    ///         .stdin(Stdio::piped())
+    ///         .process_group(0)
+    ///         .spawn()?;
+    ///     child.send_process_group_signal(SIGTERM)?;
+    ///     # }
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "unix_send_signal", issue = "141975")]
+    fn send_process_group_signal(&self, signal: i32) -> io::Result<()>;
+
+    /// Forces the child process's process group to exit.
+    ///
+    /// This is analogous to [`Child::kill`] but applies to every process in
+    /// the child process's process group.
+    ///
+    /// Use [`CommandExt::process_group`] to assign a child process to an
+    /// existing process group, or to make it the leader of a new process group.
+    /// By default spawned processes are in the parent's process group.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// #![feature(unix_kill_process_group)]
+    ///
+    /// use std::{os::unix::process::{ChildExt, CommandExt}, process::{Command, Stdio}};
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut child = Command::new("cat")
+    ///         .stdin(Stdio::piped())
+    ///         .process_group(0)
+    ///         .spawn()?;
+    ///     child.kill_process_group()?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// [`Child::kill`]: process::Child::kill
+    #[unstable(feature = "unix_kill_process_group", issue = "156537")]
+    fn kill_process_group(&mut self) -> io::Result<()>;
+}
+
+#[unstable(feature = "unix_send_signal", issue = "141975")]
+impl ChildExt for process::Child {
+    fn send_signal(&self, signal: i32) -> io::Result<()> {
+        self.handle.send_signal(signal)
+    }
+
+    fn send_process_group_signal(&self, signal: i32) -> io::Result<()> {
+        self.handle.send_process_group_signal(signal)
+    }
+
+    #[cfg(not(target_os = "espidf"))]
+    fn kill_process_group(&mut self) -> io::Result<()> {
+        self.handle.send_process_group_signal(libc::SIGKILL)
+    }
+
+    #[cfg(target_os = "espidf")]
+    fn kill_process_group(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process groups are not supported on espidf",
+        ))
+    }
+}
+
 #[stable(feature = "process_extensions", since = "1.2.0")]
 impl FromRawFd for process::Stdio {
     #[inline]
@@ -339,8 +511,10 @@ impl FromRawFd for process::Stdio {
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl From<OwnedFd> for process::Stdio {
+    /// Takes ownership of a file descriptor and returns a [`Stdio`](process::Stdio)
+    /// that can attach a stream to it.
     #[inline]
     fn from(fd: OwnedFd) -> process::Stdio {
         let fd = sys::fd::FileDesc::from_inner(fd);
@@ -397,7 +571,7 @@ impl IntoRawFd for process::ChildStderr {
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl AsFd for crate::process::ChildStdin {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -405,15 +579,29 @@ impl AsFd for crate::process::ChildStdin {
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl From<crate::process::ChildStdin> for OwnedFd {
+    /// Takes ownership of a [`ChildStdin`](crate::process::ChildStdin)'s file descriptor.
     #[inline]
     fn from(child_stdin: crate::process::ChildStdin) -> OwnedFd {
-        child_stdin.into_inner().into_inner().into_inner()
+        child_stdin.into_inner().into_inner()
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+/// Creates a `ChildStdin` from the provided `OwnedFd`.
+///
+/// The provided file descriptor must point to a pipe
+/// with the `CLOEXEC` flag set.
+#[stable(feature = "child_stream_from_fd", since = "1.74.0")]
+impl From<OwnedFd> for process::ChildStdin {
+    #[inline]
+    fn from(fd: OwnedFd) -> process::ChildStdin {
+        let pipe = ChildPipe::from_inner(fd);
+        process::ChildStdin::from_inner(pipe)
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl AsFd for crate::process::ChildStdout {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -421,15 +609,29 @@ impl AsFd for crate::process::ChildStdout {
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl From<crate::process::ChildStdout> for OwnedFd {
+    /// Takes ownership of a [`ChildStdout`](crate::process::ChildStdout)'s file descriptor.
     #[inline]
     fn from(child_stdout: crate::process::ChildStdout) -> OwnedFd {
-        child_stdout.into_inner().into_inner().into_inner()
+        child_stdout.into_inner().into_inner()
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+/// Creates a `ChildStdout` from the provided `OwnedFd`.
+///
+/// The provided file descriptor must point to a pipe
+/// with the `CLOEXEC` flag set.
+#[stable(feature = "child_stream_from_fd", since = "1.74.0")]
+impl From<OwnedFd> for process::ChildStdout {
+    #[inline]
+    fn from(fd: OwnedFd) -> process::ChildStdout {
+        let pipe = ChildPipe::from_inner(fd);
+        process::ChildStdout::from_inner(pipe)
+    }
+}
+
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl AsFd for crate::process::ChildStderr {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -437,11 +639,25 @@ impl AsFd for crate::process::ChildStderr {
     }
 }
 
-#[unstable(feature = "io_safety", issue = "87074")]
+#[stable(feature = "io_safety", since = "1.63.0")]
 impl From<crate::process::ChildStderr> for OwnedFd {
+    /// Takes ownership of a [`ChildStderr`](crate::process::ChildStderr)'s file descriptor.
     #[inline]
     fn from(child_stderr: crate::process::ChildStderr) -> OwnedFd {
-        child_stderr.into_inner().into_inner().into_inner()
+        child_stderr.into_inner().into_inner()
+    }
+}
+
+/// Creates a `ChildStderr` from the provided `OwnedFd`.
+///
+/// The provided file descriptor must point to a pipe
+/// with the `CLOEXEC` flag set.
+#[stable(feature = "child_stream_from_fd", since = "1.74.0")]
+impl From<OwnedFd> for process::ChildStderr {
+    #[inline]
+    fn from(fd: OwnedFd) -> process::ChildStderr {
+        let pipe = ChildPipe::from_inner(fd);
+        process::ChildStderr::from_inner(pipe)
     }
 }
 
@@ -449,5 +665,5 @@ impl From<crate::process::ChildStderr> for OwnedFd {
 #[must_use]
 #[stable(feature = "unix_ppid", since = "1.27.0")]
 pub fn parent_id() -> u32 {
-    crate::sys::os::getppid()
+    crate::sys::process::getppid()
 }

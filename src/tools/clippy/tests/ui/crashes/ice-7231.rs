@@ -1,4 +1,6 @@
-#![allow(clippy::never_loop)]
+//@ check-pass
+
+#![expect(clippy::never_loop)]
 
 async fn f() {
     loop {

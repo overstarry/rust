@@ -1,14 +1,18 @@
-use clippy_utils::diagnostics::span_lint_and_then;
-
-use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::{
-    def::Res, def_id::DefId, Item, ItemKind, PolyTraitRef, PrimTy, TraitBoundModifier, Ty, TyKind, UseKind,
-};
+use clippy_config::Conf;
+use clippy_config::types::{DisallowedPath, create_disallowed_map};
+use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
+use clippy_utils::disallowed_profiles::{ProfileEntry, ProfileResolver};
+use clippy_utils::paths::PathNS;
+use clippy_utils::sym;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::smallvec::SmallVec;
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::DefIdMap;
+use rustc_hir::{AmbigArg, Item, ItemKind, PolyTraitRef, PrimTy, Ty, TyKind, UseKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
-use rustc_span::Span;
-
-use crate::utils::conf;
+use rustc_middle::ty::TyCtxt;
+use rustc_session::impl_lint_pass;
+use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -32,6 +36,11 @@ declare_clippy_lint! {
     ///     # When using an inline table, can add a `reason` for why the type
     ///     # is disallowed.
     ///     { path = "std::net::Ipv4Addr", reason = "no IPv4 allowed" },
+    ///     # Can also add a `replacement` that will be offered as a suggestion.
+    ///     { path = "std::sync::Mutex", reason = "prefer faster & simpler non-poisonable mutex", replacement = "parking_lot::Mutex" },
+    ///     # This would normally error if the path is incorrect, but with `allow-invalid` = `true`,
+    ///     # it will be silently ignored
+    ///     { path = "std::invalid::Type", reason = "use alternative instead", allow-invalid = true }
     /// ]
     /// ```
     ///
@@ -45,96 +54,183 @@ declare_clippy_lint! {
     /// // A similar type that is allowed by the config
     /// use std::collections::HashMap;
     /// ```
+    ///
+    /// Disallowed profiles can scope lists to specific modules:
+    /// ```toml
+    /// [profiles.forward_pass]
+    /// disallowed-types = [{ path = "crate::buffers::HostBuffer", reason = "Prefer device buffers in forward computations" }]
+    /// ```
+    ///
+    /// ```rust,ignore
+    /// #[clippy::disallowed_profile("forward_pass")]
+    /// fn forward_step(buffer: crate::buffers::DeviceBuffer) { /* ... */ }
+    /// ```
     #[clippy::version = "1.55.0"]
     pub DISALLOWED_TYPES,
     style,
     "use of disallowed types"
 }
-#[derive(Clone, Debug)]
-pub struct DisallowedTypes {
-    conf_disallowed: Vec<conf::DisallowedType>,
-    def_ids: FxHashMap<DefId, Option<String>>,
-    prim_tys: FxHashMap<PrimTy, Option<String>>,
-}
-
-impl DisallowedTypes {
-    pub fn new(conf_disallowed: Vec<conf::DisallowedType>) -> Self {
-        Self {
-            conf_disallowed,
-            def_ids: FxHashMap::default(),
-            prim_tys: FxHashMap::default(),
-        }
-    }
-
-    fn check_res_emit(&self, cx: &LateContext<'_>, res: &Res, span: Span) {
-        match res {
-            Res::Def(_, did) => {
-                if let Some(reason) = self.def_ids.get(did) {
-                    emit(cx, &cx.tcx.def_path_str(*did), span, reason.as_deref());
-                }
-            },
-            Res::PrimTy(prim) => {
-                if let Some(reason) = self.prim_tys.get(prim) {
-                    emit(cx, prim.name_str(), span, reason.as_deref());
-                }
-            },
-            _ => {},
-        }
-    }
-}
 
 impl_lint_pass!(DisallowedTypes => [DISALLOWED_TYPES]);
 
-impl<'tcx> LateLintPass<'tcx> for DisallowedTypes {
-    fn check_crate(&mut self, cx: &LateContext<'_>) {
-        for conf in &self.conf_disallowed {
-            let (path, reason) = match conf {
-                conf::DisallowedType::Simple(path) => (path, None),
-                conf::DisallowedType::WithReason { path, reason } => (
-                    path,
-                    reason.as_ref().map(|reason| format!("{} (from clippy.toml)", reason)),
-                ),
-            };
-            let segs: Vec<_> = path.split("::").collect();
-            match clippy_utils::def_path_res(cx, &segs) {
-                Res::Def(_, id) => {
-                    self.def_ids.insert(id, reason);
-                },
-                Res::PrimTy(ty) => {
-                    self.prim_tys.insert(ty, reason);
-                },
-                _ => {},
-            }
-        }
+struct TypeLookup {
+    def_ids: DefIdMap<(&'static str, &'static DisallowedPath)>,
+    prim_tys: FxHashMap<PrimTy, (&'static str, &'static DisallowedPath)>,
+}
+
+impl TypeLookup {
+    fn from_config(tcx: TyCtxt<'_>, paths: &'static [DisallowedPath]) -> Self {
+        let (def_ids, prim_tys) = create_disallowed_map(tcx, paths, PathNS::Type, def_kind_predicate, "type", true);
+        Self { def_ids, prim_tys }
     }
 
-    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
-        if let ItemKind::Use(path, UseKind::Single) = &item.kind {
-            self.check_res_emit(cx, &path.res, item.span);
+    fn find(&self, res: &Res) -> Option<(&'static str, &'static DisallowedPath)> {
+        match res {
+            Res::Def(_, did) => self.def_ids.get(did).copied(),
+            Res::PrimTy(prim) => self.prim_tys.get(prim).copied(),
+            _ => None,
         }
-    }
-
-    fn check_ty(&mut self, cx: &LateContext<'tcx>, ty: &'tcx Ty<'tcx>) {
-        if let TyKind::Path(path) = &ty.kind {
-            self.check_res_emit(cx, &cx.qpath_res(path, ty.hir_id), ty.span);
-        }
-    }
-
-    fn check_poly_trait_ref(&mut self, cx: &LateContext<'tcx>, poly: &'tcx PolyTraitRef<'tcx>, _: TraitBoundModifier) {
-        self.check_res_emit(cx, &poly.trait_ref.path.res, poly.trait_ref.path.span);
     }
 }
 
-fn emit(cx: &LateContext<'_>, name: &str, span: Span, reason: Option<&str>) {
-    span_lint_and_then(
-        cx,
-        DISALLOWED_TYPES,
-        span,
-        &format!("`{}` is not allowed according to config", name),
-        |diag| {
-            if let Some(reason) = reason {
-                diag.note(reason);
+pub struct DisallowedTypes {
+    default: TypeLookup,
+    /// Lookup per profile that declares a non-empty `disallowed_types` list. Profiles
+    /// declared in `[profiles.*]` but without `disallowed_types` entries are absent here.
+    profiles: FxHashMap<Symbol, TypeLookup>,
+    /// Every profile name declared in `[profiles.*]`, regardless of whether it contributes
+    /// to this lint. Used to suppress the "unknown profile" warning for profiles that exist
+    /// in config but only define entries for other lints (e.g. `disallowed_methods`).
+    known_profiles: FxHashSet<Symbol>,
+    profile_cache: ProfileResolver,
+    warned_unknown_profiles: FxHashSet<Span>,
+}
+
+impl DisallowedTypes {
+    #[allow(rustc::potential_query_instability)] // Profiles are sorted for deterministic iteration.
+    pub fn new(tcx: TyCtxt<'_>, conf: &'static Conf) -> Self {
+        let default = TypeLookup::from_config(tcx, &conf.disallowed_types);
+
+        let mut profiles = FxHashMap::default();
+        let mut known_profiles = FxHashSet::default();
+        let mut profile_entries: Vec<_> = conf.profiles.iter().collect();
+        profile_entries.sort_by_key(|(a, _)| *a);
+        for (name, profile) in profile_entries {
+            let symbol = Symbol::intern(name.as_str());
+            known_profiles.insert(symbol);
+
+            let paths = profile.disallowed_types.as_slice();
+            if paths.is_empty() {
+                continue;
             }
-        },
-    );
+            profiles.insert(symbol, TypeLookup::from_config(tcx, paths));
+        }
+
+        Self {
+            default,
+            profiles,
+            known_profiles,
+            profile_cache: ProfileResolver::default(),
+            warned_unknown_profiles: FxHashSet::default(),
+        }
+    }
+
+    fn warn_unknown_profile(&mut self, cx: &LateContext<'_>, entry: &ProfileEntry) {
+        if self.warned_unknown_profiles.insert(entry.span) {
+            let attr_name = if entry.attr_name == sym::disallowed_profiles {
+                "clippy::disallowed_profiles"
+            } else {
+                "clippy::disallowed_profile"
+            };
+            span_lint(
+                cx,
+                DISALLOWED_TYPES,
+                entry.span,
+                format!(
+                    "`{attr_name}` references unknown profile `{}` for `clippy::disallowed_types`",
+                    entry.name
+                ),
+            );
+        }
+    }
+
+    fn check_res_emit(&mut self, cx: &LateContext<'_>, hir_id: rustc_hir::HirId, res: &Res, span: Span) {
+        let mut active_profiles = SmallVec::<[Symbol; 2]>::new();
+        // Copy entries out of the cache before iterating: `warn_unknown_profile` takes
+        // `&mut self`, which conflicts with the borrow held by `active_profiles(...)`.
+        let entries: SmallVec<[ProfileEntry; 2]> = self
+            .profile_cache
+            .active_profiles(cx, hir_id)
+            .map(|selection| selection.iter().copied().collect())
+            .unwrap_or_default();
+        for entry in &entries {
+            if self.profiles.contains_key(&entry.name) {
+                active_profiles.push(entry.name);
+            } else if !self.known_profiles.contains(&entry.name) {
+                self.warn_unknown_profile(cx, entry);
+            }
+        }
+
+        if let Some((profile, (path, disallowed_path))) = active_profiles.iter().find_map(|symbol| {
+            self.profiles
+                .get(symbol)
+                .and_then(|lookup| lookup.find(res).map(|info| (*symbol, info)))
+        }) {
+            let diag_amendment = disallowed_path.diag_amendment(span);
+            span_lint_and_then(
+                cx,
+                DISALLOWED_TYPES,
+                span,
+                format!("use of a disallowed type `{path}` (profile: {profile})"),
+                |diag| diag_amendment(diag),
+            );
+        } else if let Some((path, disallowed_path)) = self.default.find(res) {
+            let diag_amendment = disallowed_path.diag_amendment(span);
+            span_lint_and_then(
+                cx,
+                DISALLOWED_TYPES,
+                span,
+                format!("use of a disallowed type `{path}`"),
+                |diag| diag_amendment(diag),
+            );
+        }
+    }
+}
+
+pub fn def_kind_predicate(def_kind: DefKind) -> bool {
+    matches!(
+        def_kind,
+        DefKind::Struct
+            | DefKind::Union
+            | DefKind::Enum
+            | DefKind::Trait
+            | DefKind::TyAlias
+            | DefKind::ForeignTy
+            | DefKind::AssocTy
+    )
+}
+
+impl<'tcx> LateLintPass<'tcx> for DisallowedTypes {
+    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
+        if let ItemKind::Use(path, UseKind::Single(_)) = &item.kind
+            && let Some(res) = path.res.type_ns
+        {
+            self.check_res_emit(cx, item.hir_id(), &res, item.span);
+        }
+    }
+
+    fn check_ty(&mut self, cx: &LateContext<'tcx>, ty: &'tcx Ty<'tcx, AmbigArg>) {
+        if let TyKind::Path(path) = &ty.kind {
+            self.check_res_emit(cx, ty.hir_id, &cx.qpath_res(path, ty.hir_id), ty.span);
+        }
+    }
+
+    fn check_poly_trait_ref(&mut self, cx: &LateContext<'tcx>, poly: &'tcx PolyTraitRef<'tcx>) {
+        self.check_res_emit(
+            cx,
+            poly.trait_ref.hir_ref_id,
+            &poly.trait_ref.path.res,
+            poly.trait_ref.path.span,
+        );
+    }
 }

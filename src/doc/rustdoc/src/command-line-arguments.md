@@ -52,7 +52,7 @@ rustdoc 1.17.0 (56124baa9 2017-04-24)
 binary: rustdoc
 commit-hash: hash
 commit-date: date
-host: host-triple
+host: host-tuple
 release: 1.17.0
 LLVM version: 3.9
 ```
@@ -100,7 +100,8 @@ mod private { // this item is private and will not be documented
 }
 ```
 
-`--document-private-items` documents all items, even if they're not public.
+`--document-private-items` includes all non-public items in the generated documentation except for `#[doc(hidden)]` items.  Private items will be shown with a 🔒 icon.
+
 
 ## `-L`/`--library-path`: where to look for dependencies
 
@@ -130,6 +131,20 @@ $ rustdoc src/lib.rs --cfg feature="foo"
 This flag accepts the same values as `rustc --cfg`, and uses it to configure
 compilation. The example above uses `feature`, but any of the `cfg` values
 are acceptable.
+
+## `--check-cfg`: check configuration flags
+
+This flag accepts the same values as `rustc --check-cfg`, and uses it to
+check configuration flags.
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --check-cfg='cfg(my_cfg, values("foo", "bar"))'
+```
+
+The example above check every well known names and values (`target_os`, `doc`, `test`, ...)
+and check the values of `my_cfg`: `foo` and `bar`.
 
 ## `--extern`: specify a dependency's location
 
@@ -168,6 +183,18 @@ affect that.
 The arguments to this flag are the same as those for the `-C` flag on rustc. Run `rustc -C help` to
 get the full list.
 
+## `--remap-path-prefix`: remap source paths in output
+
+This flag is the equivalent flag from `rustc`: `--remap-path-prefix`.
+
+```bash
+$ rustdoc src/lib.rs --remap-path-prefix="$PWD=/foo"
+```
+
+It permits remapping (as a best effort) source path prefixes in all output, including diagnostics,
+debug information, macro expansions, generated documentation, etc. It takes a value of the
+form `FROM=TO` where a path prefix equal to `FROM` is rewritten to the value `TO`.
+
 ## `--test`: run code examples as tests
 
 Using this flag looks like this:
@@ -179,7 +206,7 @@ $ rustdoc src/lib.rs --test
 This flag will run your code examples as tests. For more, see [the chapter
 on documentation tests](write-documentation/documentation-tests.md).
 
-See also `--test-args`.
+See also `--test-args` and `--test-run-directory`.
 
 ## `--test-args`: pass options to test runner
 
@@ -193,6 +220,41 @@ This flag will pass options to the test runner when running documentation tests.
 For more, see [the chapter on documentation tests](write-documentation/documentation-tests.md).
 
 See also `--test`.
+
+## `--test-run-directory`: run code examples in a specific directory
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --test --test-run-directory=/path/to/working/directory
+```
+
+This flag will run your code examples in the specified working directory.
+For more, see [the chapter on documentation tests](write-documentation/documentation-tests.md).
+
+See also `--test`.
+
+## `--test-runtool`, `--test-runtool-arg`: program to run tests with; args to pass to it
+
+A doctest wrapper program can be specified with the `--test-runtool` flag.
+Rustdoc will execute that wrapper instead of the doctest executable when
+running tests. The first arguments to the wrapper will be any arguments
+specified with the `--test-runtool-arg` flag, followed by the path to the
+doctest executable to run.
+
+Using these options looks like this:
+
+```bash
+$ rustdoc src/lib.rs --test-runtool path/to/runner --test-runtool-arg --do-thing --test-runtool-arg --do-other-thing
+```
+
+For example, if you want to run your doctests under valgrind you might run:
+
+```bash
+$ rustdoc src/lib.rs --test-runtool valgrind
+```
+
+Another use case would be to run a test inside an emulator, or through a Virtual Machine.
 
 ## `--target`: generate documentation for the specified target triple
 
@@ -246,7 +308,7 @@ will be added.
 
 When rendering Rust files, this flag is ignored.
 
-## `--html-in-header`: include more HTML in <head>
+## `--html-in-header`: include more HTML in `<head>`
 
 Using this flag looks like this:
 
@@ -320,10 +382,7 @@ $ rustdoc src/lib.rs --extend-css extra.css
 ```
 
 With this flag, the contents of the files you pass are included at the bottom
-of Rustdoc's `theme.css` file.
-
-While this flag is stable, the contents of `theme.css` are not, so be careful!
-Updates may break your theme extensions.
+of the `theme.css` file.
 
 ## `--sysroot`: override the system root
 
@@ -392,6 +451,43 @@ $ rustdoc src/lib.rs --crate-version 1.3.37
 When `rustdoc` receives this flag, it will print an extra "Version (version)" into the sidebar of
 the crate root's docs. You can use this flag to differentiate between different versions of your
 library's documentation.
+
+## `--emit`: control the types of output for rustdoc to emit
+
+This flag controls the types of output by rustdoc. It accepts a comma-separated
+list of values, and may be specified multiple times. The valid emit kinds are:
+
+- `html-static-files` --- Generates shared static files whose contents are
+  tied to a specific toolchain version. These are written with a filename
+  that includes a hash of their contents, so they are safe to cache with
+  the change if the toolchain version or their contents change, or with the
+  `Cache-Control: immutable` directive.
+- `html-non-static-files` --- Generates files based on the crate(s) being
+  documented. These file names need to be deterministic so there is no
+  content-hash in their file names.
+- `dep-info` --- Generates a file with Makefile syntax that indicates all the
+  source files that were loaded to document the crate. The default output
+  filename is `CRATE_NAME.d`. This emit type can can optionally be followed by
+  `=` to specify an explicit output path, for example,
+  `--emit=dep-info=/path/to/foo.d`. The output can be sent to stdout by
+  specifying `-` as the path (e.g., `--emit=dep-info=-`).
+
+Using this flag looks like this:
+
+```bash
+$ rustdoc src/lib.rs --emit=html-static-files,html-non-static-files,dep-info=/path/to/build/cache/foo.d
+```
+
+If not specified, the default emit types would be
+`--emit=html-static-files,html-non-static-files`.
+
+Output files are written to the current directory unless the `--out-dir` flag is used.
+
+## `-`: load source code from the standard input
+
+If you specify `-` as the INPUT on the command line, then `rustdoc` will read the
+source code from stdin (standard input stream) until the EOF, instead of the file
+system with an otherwise specified path.
 
 ## `@path`: load command-line flags from a path
 

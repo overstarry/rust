@@ -5,7 +5,7 @@
 //! annotations. These annotations can be used to test whether paths
 //! exist in the graph. These checks run after codegen, so they view the
 //! the final state of the dependency graph. Note that there are
-//! similar assertions found in `persist::dirty_clean` which check the
+//! similar assertions found in `persist::clean` which check the
 //! **initial** state of the dependency graph, just after it has been
 //! loaded from disk.
 //!
@@ -22,7 +22,7 @@
 //!
 //! Example:
 //!
-//! ```
+//! ```ignore (needs flags)
 //! #[rustc_if_this_changed(Hir)]
 //! fn foo() { }
 //!
@@ -33,40 +33,48 @@
 //! fn baz() { foo(); }
 //! ```
 
-use rustc_ast as ast;
-use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::graph::implementation::{Direction, NodeIndex, INCOMING, OUTGOING};
-use rustc_graphviz as dot;
-use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
-use rustc_hir::intravisit::{self, Visitor};
-use rustc_middle::dep_graph::{
-    DepGraphQuery, DepKind, DepNode, DepNodeExt, DepNodeFilter, EdgeFilter,
-};
-use rustc_middle::hir::nested_filter;
-use rustc_middle::ty::TyCtxt;
-use rustc_span::symbol::{sym, Symbol};
-use rustc_span::Span;
-
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::Write;
+
+use rustc_data_structures::fx::FxIndexSet;
+use rustc_data_structures::graph::linked_graph::{Direction, INCOMING, NodeIndex, OUTGOING};
+use rustc_graphviz as dot;
+use rustc_hir as hir;
+use rustc_hir::Attribute;
+use rustc_hir::attrs::AttributeKind;
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId};
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_middle::bug;
+use rustc_middle::dep_graph::{DepKind, DepNode, DepNodeFilter, EdgeFilter, RetainedDepGraph};
+use rustc_middle::hir::nested_filter;
+use rustc_middle::ty::TyCtxt;
+use rustc_span::{Span, Symbol, sym};
+use tracing::debug;
+
+use crate::diagnostics;
 
 #[allow(missing_docs)]
-pub fn assert_dep_graph(tcx: TyCtxt<'_>) {
+pub(crate) fn assert_dep_graph(tcx: TyCtxt<'_>) {
     tcx.dep_graph.with_ignore(|| {
-        if tcx.sess.opts.debugging_opts.dump_dep_graph {
-            tcx.dep_graph.with_query(dump_graph);
+        // Clone the retained dep graph once and share it between the graph dump and the path
+        // checks below, rather than locking and cloning it separately for each.
+        let retained_dep_graph = tcx.dep_graph.retained_dep_graph();
+
+        if tcx.sess.opts.unstable_opts.dump_dep_graph {
+            if let Some(graph) = &retained_dep_graph {
+                dump_graph(graph);
+            }
         }
 
-        if !tcx.sess.opts.debugging_opts.query_dep_graph {
+        if !tcx.sess.opts.unstable_opts.query_dep_graph {
             return;
         }
 
         // if the `rustc_attrs` feature is not enabled, then the
         // attributes we are interested in cannot be present anyway, so
         // skip the walk.
-        if !tcx.features().rustc_attrs {
+        if !tcx.features().rustc_attrs() {
             return;
         }
 
@@ -74,14 +82,14 @@ pub fn assert_dep_graph(tcx: TyCtxt<'_>) {
         let (if_this_changed, then_this_would_need) = {
             let mut visitor =
                 IfThisChanged { tcx, if_this_changed: vec![], then_this_would_need: vec![] };
-            visitor.process_attrs(hir::CRATE_HIR_ID);
-            tcx.hir().visit_all_item_likes(&mut visitor.as_deep_visitor());
+            visitor.process_attrs(CRATE_DEF_ID);
+            tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
             (visitor.if_this_changed, visitor.then_this_would_need)
         };
 
         if !if_this_changed.is_empty() || !then_this_would_need.is_empty() {
             assert!(
-                tcx.sess.opts.debugging_opts.query_dep_graph,
+                tcx.sess.opts.unstable_opts.query_dep_graph,
                 "cannot use the `#[{}]` or `#[{}]` annotations \
                     without supplying `-Z query-dep-graph`",
                 sym::rustc_if_this_changed,
@@ -90,7 +98,7 @@ pub fn assert_dep_graph(tcx: TyCtxt<'_>) {
         }
 
         // Check paths.
-        check_paths(tcx, &if_this_changed, &then_this_would_need);
+        check_paths(tcx, retained_dep_graph.as_ref(), &if_this_changed, &then_this_would_need);
     })
 }
 
@@ -104,69 +112,40 @@ struct IfThisChanged<'tcx> {
 }
 
 impl<'tcx> IfThisChanged<'tcx> {
-    fn argument(&self, attr: &ast::Attribute) -> Option<Symbol> {
-        let mut value = None;
-        for list_item in attr.meta_item_list().unwrap_or_default() {
-            match list_item.ident() {
-                Some(ident) if list_item.is_word() && value.is_none() => value = Some(ident.name),
-                _ =>
-                // FIXME better-encapsulate meta_item (don't directly access `node`)
-                {
-                    span_bug!(list_item.span(), "unexpected meta-item {:?}", list_item)
-                }
-            }
-        }
-        value
-    }
-
-    fn process_attrs(&mut self, hir_id: hir::HirId) {
-        let def_id = self.tcx.hir().local_def_id(hir_id);
+    fn process_attrs(&mut self, def_id: LocalDefId) {
         let def_path_hash = self.tcx.def_path_hash(def_id.to_def_id());
-        let attrs = self.tcx.hir().attrs(hir_id);
+        let hir_id = self.tcx.local_def_id_to_hir_id(def_id);
+        let attrs = self.tcx.hir_attrs(hir_id);
         for attr in attrs {
-            if attr.has_name(sym::rustc_if_this_changed) {
-                let dep_node_interned = self.argument(attr);
-                let dep_node = match dep_node_interned {
+            if let Attribute::Parsed(AttributeKind::RustcIfThisChanged(span, dep_node)) = *attr {
+                let dep_node = match dep_node {
                     None => {
                         DepNode::from_def_path_hash(self.tcx, def_path_hash, DepKind::hir_owner)
                     }
                     Some(n) => {
                         match DepNode::from_label_string(self.tcx, n.as_str(), def_path_hash) {
                             Ok(n) => n,
-                            Err(()) => {
-                                self.tcx.sess.span_fatal(
-                                    attr.span,
-                                    &format!("unrecognized DepNode variant {:?}", n),
-                                );
-                            }
+                            Err(()) => self
+                                .tcx
+                                .dcx()
+                                .emit_fatal(diagnostics::UnrecognizedDepNode { span, name: n }),
                         }
                     }
                 };
-                self.if_this_changed.push((attr.span, def_id.to_def_id(), dep_node));
-            } else if attr.has_name(sym::rustc_then_this_would_need) {
-                let dep_node_interned = self.argument(attr);
-                let dep_node = match dep_node_interned {
-                    Some(n) => {
-                        match DepNode::from_label_string(self.tcx, n.as_str(), def_path_hash) {
-                            Ok(n) => n,
-                            Err(()) => {
-                                self.tcx.sess.span_fatal(
-                                    attr.span,
-                                    &format!("unrecognized DepNode variant {:?}", n),
-                                );
-                            }
-                        }
-                    }
-                    None => {
-                        self.tcx.sess.span_fatal(attr.span, "missing DepNode variant");
-                    }
-                };
-                self.then_this_would_need.push((
-                    attr.span,
-                    dep_node_interned.unwrap(),
-                    hir_id,
-                    dep_node,
-                ));
+                self.if_this_changed.push((span, def_id.to_def_id(), dep_node));
+            } else if let Attribute::Parsed(AttributeKind::RustcThenThisWouldNeed(dep_nodes)) = attr
+            {
+                for &n in dep_nodes {
+                    let Ok(dep_node) =
+                        DepNode::from_label_string(self.tcx, n.as_str(), def_path_hash)
+                    else {
+                        self.tcx.dcx().emit_fatal(diagnostics::UnrecognizedDepNode {
+                            span: n.span,
+                            name: n.name,
+                        });
+                    };
+                    self.then_this_would_need.push((n.span, n.name, hir_id, dep_node));
+                }
             }
         }
     }
@@ -175,61 +154,61 @@ impl<'tcx> IfThisChanged<'tcx> {
 impl<'tcx> Visitor<'tcx> for IfThisChanged<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
-    fn nested_visit_map(&mut self) -> Self::Map {
-        self.tcx.hir()
+    fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+        self.tcx
     }
 
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
-        self.process_attrs(item.hir_id());
+        self.process_attrs(item.owner_id.def_id);
         intravisit::walk_item(self, item);
     }
 
     fn visit_trait_item(&mut self, trait_item: &'tcx hir::TraitItem<'tcx>) {
-        self.process_attrs(trait_item.hir_id());
+        self.process_attrs(trait_item.owner_id.def_id);
         intravisit::walk_trait_item(self, trait_item);
     }
 
     fn visit_impl_item(&mut self, impl_item: &'tcx hir::ImplItem<'tcx>) {
-        self.process_attrs(impl_item.hir_id());
+        self.process_attrs(impl_item.owner_id.def_id);
         intravisit::walk_impl_item(self, impl_item);
     }
 
     fn visit_field_def(&mut self, s: &'tcx hir::FieldDef<'tcx>) {
-        self.process_attrs(s.hir_id);
+        self.process_attrs(s.def_id);
         intravisit::walk_field_def(self, s);
     }
 }
 
-fn check_paths<'tcx>(tcx: TyCtxt<'tcx>, if_this_changed: &Sources, then_this_would_need: &Targets) {
-    // Return early here so as not to construct the query, which is not cheap.
+fn check_paths<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    retained_dep_graph: Option<&RetainedDepGraph>,
+    if_this_changed: &Sources,
+    then_this_would_need: &Targets,
+) {
     if if_this_changed.is_empty() {
         for &(target_span, _, _, _) in then_this_would_need {
-            tcx.sess.span_err(target_span, "no `#[rustc_if_this_changed]` annotation detected");
+            tcx.dcx().emit_err(diagnostics::MissingIfThisChanged { span: target_span });
         }
         return;
     }
-    tcx.dep_graph.with_query(|query| {
-        for &(_, source_def_id, ref source_dep_node) in if_this_changed {
-            let dependents = query.transitive_predecessors(source_dep_node);
-            for &(target_span, ref target_pass, _, ref target_dep_node) in then_this_would_need {
-                if !dependents.contains(&target_dep_node) {
-                    tcx.sess.span_err(
-                        target_span,
-                        &format!(
-                            "no path from `{}` to `{}`",
-                            tcx.def_path_str(source_def_id),
-                            target_pass
-                        ),
-                    );
-                } else {
-                    tcx.sess.span_err(target_span, "OK");
-                }
+    let Some(query) = retained_dep_graph else { return };
+    for &(_, source_def_id, ref source_dep_node) in if_this_changed {
+        let dependents = query.transitive_predecessors(source_dep_node);
+        for &(target_span, ref target_pass, _, ref target_dep_node) in then_this_would_need {
+            if !dependents.contains(&target_dep_node) {
+                tcx.dcx().emit_err(diagnostics::NoPath {
+                    span: target_span,
+                    source: tcx.def_path_str(source_def_id),
+                    target: *target_pass,
+                });
+            } else {
+                tcx.dcx().emit_err(diagnostics::Ok { span: target_span });
             }
         }
-    });
+    }
 }
 
-fn dump_graph(query: &DepGraphQuery) {
+fn dump_graph(graph: &RetainedDepGraph) {
     let path: String = env::var("RUST_DEP_GRAPH").unwrap_or_else(|_| "dep_graph".to_string());
 
     let nodes = match env::var("RUST_DEP_GRAPH_FILTER") {
@@ -237,26 +216,26 @@ fn dump_graph(query: &DepGraphQuery) {
             // Expect one of: "-> target", "source -> target", or "source ->".
             let edge_filter =
                 EdgeFilter::new(&string).unwrap_or_else(|e| bug!("invalid filter: {}", e));
-            let sources = node_set(&query, &edge_filter.source);
-            let targets = node_set(&query, &edge_filter.target);
-            filter_nodes(&query, &sources, &targets)
+            let sources = node_set(graph, &edge_filter.source);
+            let targets = node_set(graph, &edge_filter.target);
+            filter_nodes(graph, &sources, &targets)
         }
-        Err(_) => query.nodes().into_iter().map(|n| n.kind).collect(),
+        Err(_) => graph.nodes().into_iter().map(|n| n.kind).collect(),
     };
-    let edges = filter_edges(&query, &nodes);
+    let edges = filter_edges(graph, &nodes);
 
     {
         // dump a .txt file with just the edges:
-        let txt_path = format!("{}.txt", path);
-        let mut file = BufWriter::new(File::create(&txt_path).unwrap());
-        for &(ref source, ref target) in &edges {
-            write!(file, "{:?} -> {:?}\n", source, target).unwrap();
+        let txt_path = format!("{path}.txt");
+        let mut file = File::create_buffered(&txt_path).unwrap();
+        for (source, target) in &edges {
+            write!(file, "{source:?} -> {target:?}\n").unwrap();
         }
     }
 
     {
         // dump a .dot file in graphviz format:
-        let dot_path = format!("{}.dot", path);
+        let dot_path = format!("{path}.dot");
         let mut v = Vec::new();
         dot::render(&GraphvizDepGraph(nodes, edges), &mut v).unwrap();
         fs::write(dot_path, v).unwrap();
@@ -264,7 +243,7 @@ fn dump_graph(query: &DepGraphQuery) {
 }
 
 #[allow(missing_docs)]
-pub struct GraphvizDepGraph(FxHashSet<DepKind>, Vec<(DepKind, DepKind)>);
+struct GraphvizDepGraph(FxIndexSet<DepKind>, Vec<(DepKind, DepKind)>);
 
 impl<'a> dot::GraphWalk<'a> for GraphvizDepGraph {
     type Node = DepKind;
@@ -291,7 +270,7 @@ impl<'a> dot::Labeller<'a> for GraphvizDepGraph {
         dot::Id::new("DependencyGraph").unwrap()
     }
     fn node_id(&self, n: &DepKind) -> dot::Id<'_> {
-        let s: String = format!("{:?}", n)
+        let s: String = format!("{n:?}")
             .chars()
             .map(|c| if c == '_' || c.is_alphanumeric() { c } else { '_' })
             .collect();
@@ -299,58 +278,58 @@ impl<'a> dot::Labeller<'a> for GraphvizDepGraph {
         dot::Id::new(s).unwrap()
     }
     fn node_label(&self, n: &DepKind) -> dot::LabelText<'_> {
-        dot::LabelText::label(format!("{:?}", n))
+        dot::LabelText::label(format!("{n:?}"))
     }
 }
 
 // Given an optional filter like `"x,y,z"`, returns either `None` (no
 // filter) or the set of nodes whose labels contain all of those
 // substrings.
-fn node_set<'q>(
-    query: &'q DepGraphQuery,
+fn node_set<'g>(
+    graph: &'g RetainedDepGraph,
     filter: &DepNodeFilter,
-) -> Option<FxHashSet<&'q DepNode>> {
+) -> Option<FxIndexSet<&'g DepNode>> {
     debug!("node_set(filter={:?})", filter);
 
     if filter.accepts_all() {
         return None;
     }
 
-    Some(query.nodes().into_iter().filter(|n| filter.test(n)).collect())
+    Some(graph.nodes().into_iter().filter(|n| filter.test(n)).collect())
 }
 
-fn filter_nodes<'q>(
-    query: &'q DepGraphQuery,
-    sources: &Option<FxHashSet<&'q DepNode>>,
-    targets: &Option<FxHashSet<&'q DepNode>>,
-) -> FxHashSet<DepKind> {
+fn filter_nodes<'g>(
+    graph: &'g RetainedDepGraph,
+    sources: &Option<FxIndexSet<&'g DepNode>>,
+    targets: &Option<FxIndexSet<&'g DepNode>>,
+) -> FxIndexSet<DepKind> {
     if let Some(sources) = sources {
         if let Some(targets) = targets {
-            walk_between(query, sources, targets)
+            walk_between(graph, sources, targets)
         } else {
-            walk_nodes(query, sources, OUTGOING)
+            walk_nodes(graph, sources, OUTGOING)
         }
     } else if let Some(targets) = targets {
-        walk_nodes(query, targets, INCOMING)
+        walk_nodes(graph, targets, INCOMING)
     } else {
-        query.nodes().into_iter().map(|n| n.kind).collect()
+        graph.nodes().into_iter().map(|n| n.kind).collect()
     }
 }
 
-fn walk_nodes<'q>(
-    query: &'q DepGraphQuery,
-    starts: &FxHashSet<&'q DepNode>,
+fn walk_nodes<'g>(
+    graph: &'g RetainedDepGraph,
+    starts: &FxIndexSet<&'g DepNode>,
     direction: Direction,
-) -> FxHashSet<DepKind> {
-    let mut set = FxHashSet::default();
+) -> FxIndexSet<DepKind> {
+    let mut set = FxIndexSet::default();
     for &start in starts {
         debug!("walk_nodes: start={:?} outgoing?={:?}", start, direction == OUTGOING);
         if set.insert(start.kind) {
-            let mut stack = vec![query.indices[start]];
+            let mut stack = vec![graph.indices[start]];
             while let Some(index) = stack.pop() {
-                for (_, edge) in query.graph.adjacent_edges(index, direction) {
+                for (_, edge) in graph.inner.adjacent_edges(index, direction) {
                     let neighbor_index = edge.source_or_target(direction);
-                    let neighbor = query.graph.node_data(neighbor_index);
+                    let neighbor = graph.inner.node_data(neighbor_index);
                     if set.insert(neighbor.kind) {
                         stack.push(neighbor_index);
                     }
@@ -361,14 +340,14 @@ fn walk_nodes<'q>(
     set
 }
 
-fn walk_between<'q>(
-    query: &'q DepGraphQuery,
-    sources: &FxHashSet<&'q DepNode>,
-    targets: &FxHashSet<&'q DepNode>,
-) -> FxHashSet<DepKind> {
+fn walk_between<'g>(
+    graph: &'g RetainedDepGraph,
+    sources: &FxIndexSet<&'g DepNode>,
+    targets: &FxIndexSet<&'g DepNode>,
+) -> FxIndexSet<DepKind> {
     // This is a bit tricky. We want to include a node only if it is:
     // (a) reachable from a source and (b) will reach a target. And we
-    // have to be careful about cycles etc.  Luckily efficiency is not
+    // have to be careful about cycles etc. Luckily efficiency is not
     // a big concern!
 
     #[derive(Copy, Clone, PartialEq)]
@@ -379,27 +358,27 @@ fn walk_between<'q>(
         Excluded,
     }
 
-    let mut node_states = vec![State::Undecided; query.graph.len_nodes()];
+    let mut node_states = vec![State::Undecided; graph.inner.len_nodes()];
 
     for &target in targets {
-        node_states[query.indices[target].0] = State::Included;
+        node_states[graph.indices[target].0] = State::Included;
     }
 
-    for source in sources.iter().map(|&n| query.indices[n]) {
-        recurse(query, &mut node_states, source);
+    for source in sources.iter().map(|&n| graph.indices[n]) {
+        recurse(graph, &mut node_states, source);
     }
 
-    return query
+    return graph
         .nodes()
         .into_iter()
         .filter(|&n| {
-            let index = query.indices[n];
+            let index = graph.indices[n];
             node_states[index.0] == State::Included
         })
         .map(|n| n.kind)
         .collect();
 
-    fn recurse(query: &DepGraphQuery, node_states: &mut [State], node: NodeIndex) -> bool {
+    fn recurse(graph: &RetainedDepGraph, node_states: &mut [State], node: NodeIndex) -> bool {
         match node_states[node.0] {
             // known to reach a target
             State::Included => return true,
@@ -415,8 +394,8 @@ fn walk_between<'q>(
 
         node_states[node.0] = State::Deciding;
 
-        for neighbor_index in query.graph.successor_nodes(node) {
-            if recurse(query, node_states, neighbor_index) {
+        for neighbor_index in graph.inner.successor_nodes(node) {
+            if recurse(graph, node_states, neighbor_index) {
                 node_states[node.0] = State::Included;
             }
         }
@@ -432,11 +411,8 @@ fn walk_between<'q>(
     }
 }
 
-fn filter_edges<'q>(
-    query: &'q DepGraphQuery,
-    nodes: &FxHashSet<DepKind>,
-) -> Vec<(DepKind, DepKind)> {
-    let uniq: FxHashSet<_> = query
+fn filter_edges(graph: &RetainedDepGraph, nodes: &FxIndexSet<DepKind>) -> Vec<(DepKind, DepKind)> {
+    let uniq: FxIndexSet<_> = graph
         .edges()
         .into_iter()
         .map(|(s, t)| (s.kind, t.kind))

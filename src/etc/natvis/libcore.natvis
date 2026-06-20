@@ -7,15 +7,15 @@
     </Expand>
   </Type>
   <Type Name="core::cell::Ref&lt;*&gt;">
-    <DisplayString>{value}</DisplayString>
+    <DisplayString>{value.pointer}</DisplayString>
     <Expand>
-      <ExpandedItem>value</ExpandedItem>
+      <ExpandedItem>value.pointer</ExpandedItem>
     </Expand>
   </Type>
   <Type Name="core::cell::RefMut&lt;*&gt;">
-    <DisplayString>{value}</DisplayString>
+    <DisplayString>{value.pointer}</DisplayString>
     <Expand>
-      <ExpandedItem>value</ExpandedItem>
+      <ExpandedItem>value.pointer</ExpandedItem>
     </Expand>
   </Type>
   <Type Name="core::cell::RefCell&lt;*&gt;">
@@ -35,47 +35,17 @@
   </Type>
 
   <Type Name="core::mem::manually_drop::ManuallyDrop&lt;*&gt;">
-    <DisplayString>{value}</DisplayString>
+    <DisplayString>{value.__0}</DisplayString>
     <Expand>
-      <ExpandedItem>value</ExpandedItem>
+      <ExpandedItem>value.__0</ExpandedItem>
     </Expand>
   </Type>
 
-  <Type Name="core::num::nonzero::NonZeroI8">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroI16">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroI32">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroI64">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroI128">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroIsize">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroU8">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroU16">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroU32">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroU64">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroU128">
-    <DisplayString>{__0}</DisplayString>
-  </Type>
-  <Type Name="core::num::nonzero::NonZeroUsize">
-    <DisplayString>{__0}</DisplayString>
+  <Type Name="core::num::nonzero::NonZero&lt;*&gt;">
+    <DisplayString>{__0.__0}</DisplayString>
+    <Expand>
+      <ExpandedItem>__0.__0</ExpandedItem>
+    </Expand>
   </Type>
 
   <Type Name="core::num::wrapping::Wrapping&lt;*&gt;">
@@ -119,45 +89,45 @@
     </Expand>
   </Type>
 
-  <Type Name="core::sync::atomic::AtomicBool">
-    <DisplayString>{(bool)v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;bool&gt;">
+    <DisplayString>{(bool)v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicI8">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;i8&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicI16">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;i16&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicI32">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;i32&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicI64">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;i64&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicIsize">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;isize&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-    <Type Name="core::sync::atomic::AtomicU8">
-    <DisplayString>{v.value}</DisplayString>
+    <Type Name="core::sync::atomic::Atomic&lt;u8&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicU16">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;u16&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicU32">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;u32&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicU64">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;u64&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
-  <Type Name="core::sync::atomic::AtomicUsize">
-    <DisplayString>{v.value}</DisplayString>
+  <Type Name="core::sync::atomic::Atomic&lt;usize&gt;">
+    <DisplayString>{v.value.__0}</DisplayString>
   </Type>
 
   <Type Name="core::time::Duration">
-    <DisplayString>{secs,d}s {nanos,d}ns</DisplayString>
+    <DisplayString>{secs,d}s {nanos.__0,d}ns</DisplayString>
     <Expand>
       <Item Name="seconds">secs,d</Item>
-      <Item Name="nanoseconds">nanos,d</Item>
+      <Item Name="nanoseconds">nanos.__0,d</Item>
     </Expand>
   </Type>
 </AutoVisualizer>

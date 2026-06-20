@@ -1,8 +1,10 @@
-use super::LabelText::{self, EscStr, HtmlStr, LabelStr};
-use super::{render, Edges, GraphWalk, Id, Labeller, Nodes, Style};
 use std::io;
 use std::io::prelude::*;
+
 use NodeLabels::*;
+
+use super::LabelText::{self, EscStr, HtmlStr, LabelStr};
+use super::{Edges, GraphWalk, Id, Labeller, Nodes, Style, render};
 
 /// each node is an index in a vector in the graph.
 type Node = usize;
@@ -61,10 +63,10 @@ impl NodeLabels<&'static str> {
     }
 
     fn len(&self) -> usize {
-        match self {
-            &UnlabelledNodes(len) => len,
-            &AllNodesLabelled(ref lbls) => lbls.len(),
-            &SomeNodesLabelled(ref lbls) => lbls.len(),
+        match *self {
+            UnlabelledNodes(len) => len,
+            AllNodesLabelled(ref lbls) => lbls.len(),
+            SomeNodesLabelled(ref lbls) => lbls.len(),
         }
     }
 }

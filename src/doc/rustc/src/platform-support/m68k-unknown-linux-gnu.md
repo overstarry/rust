@@ -4,10 +4,10 @@
 
 Motorola 680x0 Linux
 
-## Designated Developers
+## Target Maintainers
 
-* [@glaubitz](https://github.com/glaubitz)
-* [@ricky26](https://github.com/ricky26)
+[@glaubitz](https://github.com/glaubitz)
+[@ricky26](https://github.com/ricky26)
 
 ## Requirements
 
@@ -52,7 +52,7 @@ Atari systems or emulated environments such as QEMU version 4.2 or newer or ARAn
 ISO images for installation are provided by the Debian Ports team and can be obtained
 from the Debian CD image server available at:
 
-[https://cdimage.debian.org/cdimage/ports/current](https://cdimage.debian.org/cdimage/ports/current/)
+[https://cdimage.debian.org/cdimage/ports/12.0/m68k/](https://cdimage.debian.org/cdimage/ports/12.0/m68k/)
 
 Documentation for Debian/m68k is available on the Debian Wiki at:
 
@@ -87,7 +87,7 @@ Rust programs can be built for that target:
 rustc --target m68k-unknown-linux-gnu your-code.rs
 ```
 
-Very simple progams can be run using the `qemu-m68k-static` program:
+Very simple programs can be run using the `qemu-m68k-static` program:
 
 ```text
 $ qemu-m68k-static your-code

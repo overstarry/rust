@@ -1,4 +1,6 @@
-#![allow(clippy::explicit_counter_loop)]
+//@ check-pass
+
+#![expect(clippy::explicit_counter_loop)]
 
 fn main() {
     let v = vec![1, 2, 3];

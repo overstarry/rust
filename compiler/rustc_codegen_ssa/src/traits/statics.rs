@@ -1,20 +1,11 @@
-use super::BackendTypes;
 use rustc_hir::def_id::DefId;
-use rustc_target::abi::Align;
+use rustc_middle::mir::interpret::ConstAllocation;
 
-pub trait StaticMethods: BackendTypes {
-    fn static_addr_of(&self, cv: Self::Value, align: Align, kind: Option<&str>) -> Self::Value;
-    fn codegen_static(&self, def_id: DefId, is_mutable: bool);
+use super::BackendTypes;
 
-    /// Mark the given global value as "used", to prevent the compiler and linker from potentially
-    /// removing a static variable that may otherwise appear unused.
-    fn add_used_global(&self, global: Self::Value);
-
-    /// Same as add_used_global(), but only prevent the compiler from potentially removing an
-    /// otherwise unused symbol. The linker is still permitted to drop it.
-    ///
-    /// This corresponds to the semantics of the `#[used]` attribute.
-    fn add_compiler_used_global(&self, global: Self::Value);
+pub trait StaticCodegenMethods: BackendTypes {
+    fn static_addr_of(&self, alloc: ConstAllocation<'_>, kind: Option<&str>) -> Self::Value;
+    fn codegen_static(&mut self, def_id: DefId);
 }
 
 pub trait StaticBuilderMethods: BackendTypes {

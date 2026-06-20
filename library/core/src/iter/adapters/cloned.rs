@@ -1,7 +1,8 @@
-use crate::iter::adapters::{
-    zip::try_get_unchecked, TrustedRandomAccess, TrustedRandomAccessNoCoerce,
-};
-use crate::iter::{FusedIterator, TrustedLen};
+use core::num::NonZero;
+
+use crate::iter::adapters::zip::try_get_unchecked;
+use crate::iter::adapters::{SourceIter, TrustedRandomAccess, TrustedRandomAccessNoCoerce};
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedLen};
 use crate::ops::Try;
 
 /// An iterator that clones the elements of an underlying iterator.
@@ -19,7 +20,7 @@ pub struct Cloned<I> {
 }
 
 impl<I> Cloned<I> {
-    pub(in crate::iter) fn new(it: I) -> Cloned<I> {
+    pub(in crate::iter) const fn new(it: I) -> Cloned<I> {
         Cloned { it }
     }
 }
@@ -60,7 +61,6 @@ where
         self.it.map(T::clone).fold(init, f)
     }
 
-    #[doc(hidden)]
     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> T
     where
         Self: TrustedRandomAccessNoCoerce,
@@ -140,4 +140,38 @@ where
     I: TrustedLen<Item = &'a T>,
     T: Clone,
 {
+}
+
+#[stable(feature = "default_iters", since = "1.70.0")]
+impl<I: Default> Default for Cloned<I> {
+    /// Creates a `Cloned` iterator from the default value of `I`
+    /// ```
+    /// # use core::slice;
+    /// # use core::iter::Cloned;
+    /// let iter: Cloned<slice::Iter<'_, u8>> = Default::default();
+    /// assert_eq!(iter.len(), 0);
+    /// ```
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I> SourceIter for Cloned<I>
+where
+    I: SourceIter,
+{
+    type Source = I::Source;
+
+    #[inline]
+    unsafe fn as_inner(&mut self) -> &mut I::Source {
+        // SAFETY: unsafe function forwarding to unsafe function with the same requirements
+        unsafe { SourceIter::as_inner(&mut self.it) }
+    }
+}
+
+#[unstable(issue = "none", feature = "inplace_iteration")]
+unsafe impl<I: InPlaceIterable> InPlaceIterable for Cloned<I> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
 }

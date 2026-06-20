@@ -1,34 +1,43 @@
-// Validate AST before lowering it to HIR.
-//
-// This pass is supposed to catch things that fit into AST data structures,
-// but not permitted by the language. It runs after expansion when AST is frozen,
-// so it can check for erroneous constructions produced by syntax extensions.
-// This pass is supposed to perform only simple checks not requiring name resolution
-// or type checking or some other kind of complex analysis.
+//! Validate AST before lowering it to HIR.
+//!
+//! This pass intends to check that the constructed AST is *syntactically valid* to allow the rest
+//! of the compiler to assume that the AST is valid. These checks cannot be performed during parsing
+//! because attribute macros are allowed to accept certain pieces of invalid syntax such as a
+//! function without body outside of a trait definition:
+//!
+//! ```ignore (illustrative)
+//! #[my_attribute]
+//! mod foo {
+//!     fn missing_body();
+//! }
+//! ```
+//!
+//! These checks are run post-expansion, after AST is frozen, to be able to check for erroneous
+//! constructions produced by proc macros. This pass is only intended for simple checks that do not
+//! require name resolution or type checking, or other kinds of complex analysis.
+
+use std::mem;
+use std::str::FromStr;
 
 use itertools::{Either, Itertools};
-use rustc_ast::ptr::P;
-use rustc_ast::visit::{self, AssocCtxt, FnCtxt, FnKind, Visitor};
-use rustc_ast::walk_list;
+use rustc_abi::{CVariadicStatus, CanonAbi, ExternAbi, InterruptKind};
+use rustc_ast::visit::{AssocCtxt, BoundKind, FnCtxt, FnKind, Visitor, walk_list};
 use rustc_ast::*;
 use rustc_ast_pretty::pprust::{self, State};
-use rustc_data_structures::fx::FxHashMap;
-use rustc_errors::{error_code, pluralize, struct_span_err, Applicability};
-use rustc_parse::validate_attr;
-use rustc_session::lint::builtin::{
-    DEPRECATED_WHERE_CLAUSE_LOCATION, MISSING_ABI, PATTERNS_IN_FNS_WITHOUT_BODY,
-};
-use rustc_session::lint::{BuiltinLintDiagnostics, LintBuffer};
+use rustc_attr_parsing::validate_attr;
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_errors::{DiagCtxtHandle, Diagnostic, LintBuffer};
+use rustc_feature::Features;
 use rustc_session::Session;
-use rustc_span::source_map::Spanned;
-use rustc_span::symbol::{kw, sym, Ident};
-use rustc_span::Span;
-use rustc_target::spec::abi;
-use std::mem;
-use std::ops::{Deref, DerefMut};
+use rustc_session::errors::feature_err;
+use rustc_session::lint::builtin::{
+    DEPRECATED_WHERE_CLAUSE_LOCATION, MISSING_ABI, MISSING_UNSAFE_ON_EXTERN,
+    PATTERNS_IN_FNS_WITHOUT_BODY, UNUSED_VISIBILITIES,
+};
+use rustc_span::{Ident, Span, kw, sym};
+use rustc_target::spec::{AbiMap, AbiMapping};
 
-const MORE_EXTERN: &str =
-    "for more information, visit https://doc.rust-lang.org/std/keyword.extern.html";
+use crate::diagnostics::{self, TildeConstReason};
 
 /// Is `self` allowed semantically as the first parameter in an `FnDecl`?
 enum SelfSemantic {
@@ -36,280 +45,221 @@ enum SelfSemantic {
     No,
 }
 
+enum TraitOrImpl {
+    Trait { vis: Span, constness: Const },
+    TraitImpl { constness: Const, polarity: ImplPolarity, trait_ref_span: Span },
+    Impl { constness: Const },
+}
+
+impl TraitOrImpl {
+    fn constness(&self) -> Option<Span> {
+        match self {
+            Self::Trait { constness: Const::Yes(span), .. }
+            | Self::Impl { constness: Const::Yes(span), .. }
+            | Self::TraitImpl { constness: Const::Yes(span), .. } => Some(*span),
+            _ => None,
+        }
+    }
+}
+
+enum AllowDefault {
+    Yes,
+    No,
+}
+
+impl AllowDefault {
+    fn when(b: bool) -> Self {
+        if b { Self::Yes } else { Self::No }
+    }
+}
+
+enum AllowFinal {
+    Yes,
+    No,
+}
+
+impl AllowFinal {
+    fn when(b: bool) -> Self {
+        if b { Self::Yes } else { Self::No }
+    }
+}
+
 struct AstValidator<'a> {
-    session: &'a Session,
+    sess: &'a Session,
+    features: &'a Features,
 
     /// The span of the `extern` in an `extern { ... }` block, if any.
-    extern_mod: Option<&'a Item>,
+    extern_mod_span: Option<Span>,
 
-    /// Are we inside a trait impl?
-    in_trait_impl: bool,
-
-    in_const_trait_impl: bool,
+    outer_trait_or_trait_impl: Option<TraitOrImpl>,
 
     has_proc_macro_decls: bool,
 
     /// Used to ban nested `impl Trait`, e.g., `impl Into<impl Debug>`.
     /// Nested `impl Trait` _is_ allowed in associated type position,
     /// e.g., `impl Iterator<Item = impl Debug>`.
-    outer_impl_trait: Option<Span>,
+    outer_impl_trait_span: Option<Span>,
 
-    is_tilde_const_allowed: bool,
+    disallow_tilde_const: Option<TildeConstReason>,
 
-    /// Used to ban `impl Trait` in path projections like `<impl Iterator>::Item`
-    /// or `Foo::Bar<impl Trait>`
-    is_impl_trait_banned: bool,
+    /// Used to ban explicit safety on foreign items when the extern block is not marked as unsafe.
+    extern_mod_safety: Option<Safety>,
+    extern_mod_abi: Option<ExternAbi>,
 
-    /// Used to ban associated type bounds (i.e., `Type<AssocType: Bounds>`) in
-    /// certain positions.
-    is_assoc_ty_bound_banned: bool,
+    lint_node_id: NodeId,
 
-    /// See [ForbiddenLetReason]
-    forbidden_let_reason: Option<ForbiddenLetReason>,
+    is_sdylib_interface: bool,
 
     lint_buffer: &'a mut LintBuffer,
 }
 
 impl<'a> AstValidator<'a> {
-    fn with_in_trait_impl(
+    fn with_in_trait_or_impl(
         &mut self,
-        is_in: bool,
-        constness: Option<Const>,
+        in_trait_or_impl: Option<TraitOrImpl>,
         f: impl FnOnce(&mut Self),
     ) {
-        let old = mem::replace(&mut self.in_trait_impl, is_in);
-        let old_const =
-            mem::replace(&mut self.in_const_trait_impl, matches!(constness, Some(Const::Yes(_))));
+        let old = mem::replace(&mut self.outer_trait_or_trait_impl, in_trait_or_impl);
         f(self);
-        self.in_trait_impl = old;
-        self.in_const_trait_impl = old_const;
+        self.outer_trait_or_trait_impl = old;
     }
 
-    fn with_banned_impl_trait(&mut self, f: impl FnOnce(&mut Self)) {
-        let old = mem::replace(&mut self.is_impl_trait_banned, true);
+    fn with_in_trait(&mut self, vis: Span, constness: Const, f: impl FnOnce(&mut Self)) {
+        let old = mem::replace(
+            &mut self.outer_trait_or_trait_impl,
+            Some(TraitOrImpl::Trait { vis, constness }),
+        );
         f(self);
-        self.is_impl_trait_banned = old;
+        self.outer_trait_or_trait_impl = old;
     }
 
-    fn with_tilde_const(&mut self, allowed: bool, f: impl FnOnce(&mut Self)) {
-        let old = mem::replace(&mut self.is_tilde_const_allowed, allowed);
-        f(self);
-        self.is_tilde_const_allowed = old;
-    }
-
-    fn with_tilde_const_allowed(&mut self, f: impl FnOnce(&mut Self)) {
-        self.with_tilde_const(true, f)
-    }
-
-    fn with_banned_tilde_const(&mut self, f: impl FnOnce(&mut Self)) {
-        self.with_tilde_const(false, f)
-    }
-
-    fn with_let_management(
+    fn with_in_extern_mod(
         &mut self,
-        forbidden_let_reason: Option<ForbiddenLetReason>,
-        f: impl FnOnce(&mut Self, Option<ForbiddenLetReason>),
+        extern_mod_safety: Safety,
+        abi: Option<ExternAbi>,
+        f: impl FnOnce(&mut Self),
     ) {
-        let old = mem::replace(&mut self.forbidden_let_reason, forbidden_let_reason);
-        f(self, old);
-        self.forbidden_let_reason = old;
+        let old_safety = mem::replace(&mut self.extern_mod_safety, Some(extern_mod_safety));
+        let old_abi = mem::replace(&mut self.extern_mod_abi, abi);
+        f(self);
+        self.extern_mod_safety = old_safety;
+        self.extern_mod_abi = old_abi;
     }
 
-    /// Emits an error banning the `let` expression provided in the given location.
-    fn ban_let_expr(&self, expr: &'a Expr, forbidden_let_reason: ForbiddenLetReason) {
-        let sess = &self.session;
-        if sess.opts.unstable_features.is_nightly_build() {
-            let err = "`let` expressions are not supported here";
-            let mut diag = sess.struct_span_err(expr.span, err);
-            diag.note("only supported directly in conditions of `if` and `while` expressions");
-            match forbidden_let_reason {
-                ForbiddenLetReason::GenericForbidden => {}
-                ForbiddenLetReason::NotSupportedOr(span) => {
-                    diag.span_note(
-                        span,
-                        "`||` operators are not supported in let chain expressions",
-                    );
-                }
-                ForbiddenLetReason::NotSupportedParentheses(span) => {
-                    diag.span_note(
-                        span,
-                        "`let`s wrapped in parentheses are not supported in a context with let \
-                        chains",
-                    );
-                }
-            }
-            diag.emit();
-        } else {
-            sess.struct_span_err(expr.span, "expected expression, found statement (`let`)")
-                .note("variable declaration using `let` is a statement")
-                .emit();
+    fn with_tilde_const(
+        &mut self,
+        disallowed: Option<TildeConstReason>,
+        f: impl FnOnce(&mut Self),
+    ) {
+        let old = mem::replace(&mut self.disallow_tilde_const, disallowed);
+        f(self);
+        self.disallow_tilde_const = old;
+    }
+
+    fn check_type_alias_where_clause_location(
+        &mut self,
+        ty_alias: &TyAlias,
+    ) -> Result<(), diagnostics::WhereClauseBeforeTypeAlias> {
+        if ty_alias.ty.is_none() || !ty_alias.generics.where_clause.has_where_token {
+            return Ok(());
         }
-    }
 
-    fn check_gat_where(
-        &mut self,
-        id: NodeId,
-        before_predicates: &[WherePredicate],
-        where_clauses: (ast::TyAliasWhereClause, ast::TyAliasWhereClause),
-    ) {
-        if !before_predicates.is_empty() {
+        let span = ty_alias.generics.where_clause.span;
+
+        let sugg = if !ty_alias.generics.where_clause.predicates.is_empty()
+            || !ty_alias.after_where_clause.has_where_token
+        {
             let mut state = State::new();
-            if !where_clauses.1.0 {
+
+            let mut needs_comma = !ty_alias.after_where_clause.predicates.is_empty();
+            if !ty_alias.after_where_clause.has_where_token {
                 state.space();
                 state.word_space("where");
-            } else {
-                state.word_space(",");
+            } else if !needs_comma {
+                state.space();
             }
-            let mut first = true;
-            for p in before_predicates.iter() {
-                if !first {
+
+            for p in &ty_alias.generics.where_clause.predicates {
+                if needs_comma {
                     state.word_space(",");
                 }
-                first = false;
+                needs_comma = true;
                 state.print_where_predicate(p);
             }
-            let suggestion = state.s.eof();
-            self.lint_buffer.buffer_lint_with_diagnostic(
-                DEPRECATED_WHERE_CLAUSE_LOCATION,
-                id,
-                where_clauses.0.1,
-                "where clause not allowed here",
-                BuiltinLintDiagnostics::DeprecatedWhereclauseLocation(
-                    where_clauses.1.1.shrink_to_hi(),
-                    suggestion,
-                ),
-            );
-        }
-    }
 
-    fn with_banned_assoc_ty_bound(&mut self, f: impl FnOnce(&mut Self)) {
-        let old = mem::replace(&mut self.is_assoc_ty_bound_banned, true);
-        f(self);
-        self.is_assoc_ty_bound_banned = old;
-    }
-
-    fn with_impl_trait(&mut self, outer: Option<Span>, f: impl FnOnce(&mut Self)) {
-        let old = mem::replace(&mut self.outer_impl_trait, outer);
-        if outer.is_some() {
-            self.with_banned_tilde_const(f);
-        } else {
-            f(self);
-        }
-        self.outer_impl_trait = old;
-    }
-
-    fn visit_assoc_constraint_from_generic_args(&mut self, constraint: &'a AssocConstraint) {
-        match constraint.kind {
-            AssocConstraintKind::Equality { .. } => {}
-            AssocConstraintKind::Bound { .. } => {
-                if self.is_assoc_ty_bound_banned {
-                    self.err_handler().span_err(
-                        constraint.span,
-                        "associated type bounds are not allowed within structs, enums, or unions",
-                    );
-                }
+            diagnostics::WhereClauseBeforeTypeAliasSugg::Move {
+                left: span,
+                snippet: state.s.eof(),
+                right: ty_alias.after_where_clause.span.shrink_to_hi(),
             }
-        }
-        self.visit_assoc_constraint(constraint);
+        } else {
+            diagnostics::WhereClauseBeforeTypeAliasSugg::Remove { span }
+        };
+
+        Err(diagnostics::WhereClauseBeforeTypeAlias { span, sugg })
+    }
+
+    fn with_impl_trait(&mut self, outer_span: Option<Span>, f: impl FnOnce(&mut Self)) {
+        let old = mem::replace(&mut self.outer_impl_trait_span, outer_span);
+        f(self);
+        self.outer_impl_trait_span = old;
     }
 
     // Mirrors `visit::walk_ty`, but tracks relevant state.
-    fn walk_ty(&mut self, t: &'a Ty) {
-        match t.kind {
-            TyKind::ImplTrait(..) => {
-                self.with_impl_trait(Some(t.span), |this| visit::walk_ty(this, t))
-            }
-            TyKind::TraitObject(..) => self.with_banned_tilde_const(|this| visit::walk_ty(this, t)),
-            TyKind::Path(ref qself, ref path) => {
-                // We allow these:
-                //  - `Option<impl Trait>`
-                //  - `option::Option<impl Trait>`
-                //  - `option::Option<T>::Foo<impl Trait>
-                //
-                // But not these:
-                //  - `<impl Trait>::Foo`
-                //  - `option::Option<impl Trait>::Foo`.
-                //
-                // To implement this, we disallow `impl Trait` from `qself`
-                // (for cases like `<impl Trait>::Foo>`)
-                // but we allow `impl Trait` in `GenericArgs`
-                // iff there are no more PathSegments.
-                if let Some(ref qself) = *qself {
-                    // `impl Trait` in `qself` is always illegal
-                    self.with_banned_impl_trait(|this| this.visit_ty(&qself.ty));
-                }
+    fn walk_ty(&mut self, t: &Ty) {
+        match &t.kind {
+            TyKind::ImplTrait(_, bounds) => {
+                self.with_impl_trait(Some(t.span), |this| visit::walk_ty(this, t));
 
-                // Note that there should be a call to visit_path here,
-                // so if any logic is added to process `Path`s a call to it should be
-                // added both in visit_path and here. This code mirrors visit::walk_path.
-                for (i, segment) in path.segments.iter().enumerate() {
-                    // Allow `impl Trait` iff we're on the final path segment
-                    if i == path.segments.len() - 1 {
-                        self.visit_path_segment(path.span, segment);
-                    } else {
-                        self.with_banned_impl_trait(|this| {
-                            this.visit_path_segment(path.span, segment)
-                        });
-                    }
+                // FIXME(precise_capturing): If we were to allow `use` in other positions
+                // (e.g. GATs), then we must validate those as well. However, we don't have
+                // a good way of doing this with the current `Visitor` structure.
+                let mut use_bounds = bounds
+                    .iter()
+                    .filter_map(|bound| match bound {
+                        GenericBound::Use(_, span) => Some(span),
+                        _ => None,
+                    })
+                    .copied();
+                if let Some(bound1) = use_bounds.next()
+                    && let Some(bound2) = use_bounds.next()
+                {
+                    self.dcx().emit_err(diagnostics::DuplicatePreciseCapturing { bound1, bound2 });
                 }
             }
+            TyKind::TraitObject(..) => self
+                .with_tilde_const(Some(TildeConstReason::TraitObject), |this| {
+                    visit::walk_ty(this, t)
+                }),
             _ => visit::walk_ty(self, t),
         }
     }
 
-    fn visit_struct_field_def(&mut self, field: &'a FieldDef) {
-        if let Some(ident) = field.ident {
-            if ident.name == kw::Underscore {
-                self.visit_vis(&field.vis);
-                self.visit_ident(ident);
-                self.visit_ty_common(&field.ty);
-                self.walk_ty(&field.ty);
-                walk_list!(self, visit_attribute, &field.attrs);
-                return;
-            }
-        }
-        self.visit_field_def(field);
+    fn dcx(&self) -> DiagCtxtHandle<'a> {
+        self.sess.dcx()
     }
 
-    fn err_handler(&self) -> &rustc_errors::Handler {
-        &self.session.diagnostic()
-    }
-
-    fn check_lifetime(&self, ident: Ident) {
-        let valid_names = [kw::UnderscoreLifetime, kw::StaticLifetime, kw::Empty];
-        if !valid_names.contains(&ident.name) && ident.without_first_quote().is_reserved() {
-            self.err_handler().span_err(ident.span, "lifetimes cannot use keyword names");
-        }
-    }
-
-    fn check_label(&self, ident: Ident) {
-        if ident.without_first_quote().is_reserved() {
-            self.err_handler()
-                .span_err(ident.span, &format!("invalid label name `{}`", ident.name));
-        }
-    }
-
-    fn invalid_visibility(&self, vis: &Visibility, note: Option<&str>) {
+    fn visibility_not_permitted(
+        &self,
+        vis: &Visibility,
+        note: diagnostics::VisibilityNotPermittedNote,
+    ) {
         if let VisibilityKind::Inherited = vis.kind {
             return;
         }
 
-        let mut err =
-            struct_span_err!(self.session, vis.span, E0449, "unnecessary visibility qualifier");
-        if vis.kind.is_pub() {
-            err.span_label(vis.span, "`pub` not permitted here because it's implied");
-        }
-        if let Some(note) = note {
-            err.note(note);
-        }
-        err.emit();
+        self.dcx().emit_err(diagnostics::VisibilityNotPermitted {
+            span: vis.span,
+            note,
+            remove_qualifier_sugg: vis.span,
+        });
     }
 
     fn check_decl_no_pat(decl: &FnDecl, mut report_err: impl FnMut(Span, Option<Ident>, bool)) {
         for Param { pat, .. } in &decl.inputs {
             match pat.kind {
-                PatKind::Ident(BindingMode::ByValue(Mutability::Not), _, None) | PatKind::Wild => {}
-                PatKind::Ident(BindingMode::ByValue(Mutability::Mut), ident, None) => {
+                PatKind::Missing | PatKind::Ident(BindingMode::NONE, _, None) | PatKind::Wild => {}
+                PatKind::Ident(BindingMode::MUT, ident, None) => {
                     report_err(pat.span, Some(ident), true)
                 }
                 _ => report_err(pat.span, None, false),
@@ -317,79 +267,93 @@ impl<'a> AstValidator<'a> {
         }
     }
 
-    fn check_trait_fn_not_async(&self, fn_span: Span, asyncness: Async) {
-        if let Async::Yes { span, .. } = asyncness {
-            struct_span_err!(
-                self.session,
-                fn_span,
-                E0706,
-                "functions in traits cannot be declared `async`"
-            )
-            .span_label(span, "`async` because of this")
-            .note("`async` trait functions are not currently supported")
-            .note("consider using the `async-trait` crate: https://crates.io/crates/async-trait")
-            .emit();
-        }
+    fn check_impl_fn_not_const(&self, constness: Const, parent_constness: Const) {
+        let Const::Yes(span) = constness else {
+            return;
+        };
+
+        let span = self.sess.source_map().span_extend_while_whitespace(span);
+
+        let Const::Yes(parent_constness) = parent_constness else {
+            return;
+        };
+
+        self.dcx().emit_err(diagnostics::ImplFnConst { span, parent_constness });
     }
 
-    fn check_trait_fn_not_const(&self, constness: Const) {
-        if let Const::Yes(span) = constness {
-            struct_span_err!(
-                self.session,
-                span,
-                E0379,
-                "functions in traits cannot be declared const"
-            )
-            .span_label(span, "functions in traits cannot be const")
-            .emit();
-        }
+    fn check_trait_fn_not_const(&self, constness: Const, parent: &TraitOrImpl) {
+        let Const::Yes(span) = constness else {
+            return;
+        };
+
+        let const_trait_impl = self.features.const_trait_impl();
+        let make_impl_const_sugg = if const_trait_impl
+            && let TraitOrImpl::TraitImpl {
+                constness: Const::No,
+                polarity: ImplPolarity::Positive,
+                trait_ref_span,
+                ..
+            } = parent
+        {
+            Some(trait_ref_span.shrink_to_lo())
+        } else {
+            None
+        };
+
+        let map = self.sess.source_map();
+
+        let make_trait_const_sugg = if const_trait_impl
+            && let &TraitOrImpl::Trait { vis, constness: ast::Const::No } = parent
+        {
+            Some(map.span_extend_while_whitespace(vis).shrink_to_hi())
+        } else {
+            None
+        };
+
+        let parent_constness = parent.constness();
+        self.dcx().emit_err(diagnostics::TraitFnConst {
+            span,
+            in_impl: matches!(parent, TraitOrImpl::TraitImpl { .. }),
+            const_context_label: parent_constness,
+            remove_const_sugg: (
+                map.span_extend_while_whitespace(span),
+                match parent_constness {
+                    Some(_) => rustc_errors::Applicability::MachineApplicable,
+                    None => rustc_errors::Applicability::MaybeIncorrect,
+                },
+            ),
+            requires_multiple_changes: make_impl_const_sugg.is_some()
+                || make_trait_const_sugg.is_some(),
+            make_impl_const_sugg,
+            make_trait_const_sugg,
+        });
     }
 
-    // FIXME(ecstaticmorse): Instead, use `bound_context` to check this in `visit_param_bound`.
-    fn no_questions_in_bounds(&self, bounds: &GenericBounds, where_: &str, is_trait: bool) {
-        for bound in bounds {
-            if let GenericBound::Trait(ref poly, TraitBoundModifier::Maybe) = *bound {
-                let mut err = self.err_handler().struct_span_err(
-                    poly.span,
-                    &format!("`?Trait` is not permitted in {}", where_),
-                );
-                if is_trait {
-                    let path_str = pprust::path_to_string(&poly.trait_ref.path);
-                    err.note(&format!("traits are `?{}` by default", path_str));
-                }
-                err.emit();
-            }
-        }
-    }
+    fn check_async_fn_in_const_trait_or_impl(&self, sig: &FnSig, parent: &TraitOrImpl) {
+        let Some(const_keyword) = parent.constness() else { return };
 
-    fn check_late_bound_lifetime_defs(&self, params: &[GenericParam]) {
-        // Check only lifetime parameters are present and that the lifetime
-        // parameters that are present have no bounds.
-        let non_lt_param_spans: Vec<_> = params
-            .iter()
-            .filter_map(|param| match param.kind {
-                GenericParamKind::Lifetime { .. } => {
-                    if !param.bounds.is_empty() {
-                        let spans: Vec<_> = param.bounds.iter().map(|b| b.span()).collect();
-                        self.err_handler()
-                            .span_err(spans, "lifetime bounds cannot be used in this context");
-                    }
-                    None
-                }
-                _ => Some(param.ident.span),
-            })
-            .collect();
-        if !non_lt_param_spans.is_empty() {
-            self.err_handler().span_err(
-                non_lt_param_spans,
-                "only lifetime parameters can be used in this context",
-            );
-        }
+        let Some(CoroutineKind::Async { span: async_keyword, .. }) = sig.header.coroutine_kind
+        else {
+            return;
+        };
+
+        let context = match parent {
+            TraitOrImpl::Trait { .. } => "trait",
+            TraitOrImpl::TraitImpl { .. } => "trait_impl",
+            TraitOrImpl::Impl { .. } => "impl",
+        };
+
+        self.dcx().emit_err(diagnostics::AsyncFnInConstTraitOrTraitImpl {
+            async_keyword,
+            context,
+            const_keyword,
+        });
     }
 
     fn check_fn_decl(&self, fn_decl: &FnDecl, self_semantic: SelfSemantic) {
         self.check_decl_num_args(fn_decl);
-        self.check_decl_cvaradic_pos(fn_decl);
+        let c_variadic_span = self.check_decl_cvariadic_pos(fn_decl);
+        self.check_decl_splatting(fn_decl, c_variadic_span);
         self.check_decl_attrs(fn_decl);
         self.check_decl_self_param(fn_decl, self_semantic);
     }
@@ -400,34 +364,77 @@ impl<'a> AstValidator<'a> {
         let max_num_args: usize = u16::MAX.into();
         if fn_decl.inputs.len() > max_num_args {
             let Param { span, .. } = fn_decl.inputs[0];
-            self.err_handler().span_fatal(
-                span,
-                &format!("function can not have more than {} arguments", max_num_args),
-            );
+            self.dcx().emit_fatal(diagnostics::FnParamTooMany { span, max_num_args });
         }
     }
 
-    fn check_decl_cvaradic_pos(&self, fn_decl: &FnDecl) {
+    /// Emits an error if a function declaration has a variadic parameter in the
+    /// beginning or middle of parameter list.
+    /// Example: `fn foo(..., x: i32)` will emit an error.
+    /// If a C-variadic parameter is found, returns its span.
+    fn check_decl_cvariadic_pos(&self, fn_decl: &FnDecl) -> Option<Span> {
+        let mut c_variadic_span = None;
+
         match &*fn_decl.inputs {
-            [Param { ty, span, .. }] => {
-                if let TyKind::CVarArgs = ty.kind {
-                    self.err_handler().span_err(
-                        *span,
-                        "C-variadic function must be declared with at least one named argument",
-                    );
-                }
-            }
             [ps @ .., _] => {
                 for Param { ty, span, .. } in ps {
                     if let TyKind::CVarArgs = ty.kind {
-                        self.err_handler().span_err(
-                            *span,
-                            "`...` must be the last argument of a C-variadic function",
-                        );
+                        c_variadic_span = Some(*span);
+                        self.dcx().emit_err(diagnostics::FnParamCVarArgsNotLast { span: *span });
                     }
                 }
             }
             _ => {}
+        }
+
+        if let Some(Param { ty, span, .. }) = &fn_decl.inputs.last()
+            && let TyKind::CVarArgs = ty.kind
+        {
+            c_variadic_span = Some(*span);
+        }
+
+        c_variadic_span
+    }
+
+    /// Emits an error if a function declaration has more than one splatted argument, with a
+    /// C-variadic parameter, or a splat at an unsupported index (for performance).
+    /// Example: `fn foo(#[splat] x: (), #[splat] y: ())` will emit an error.
+    fn check_decl_splatting(&self, fn_decl: &FnDecl, c_variadic_span: Option<Span>) {
+        let (splatted_arg_indexes, mut splatted_spans): (Vec<u16>, Vec<Span>) = fn_decl
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, arg)| {
+                arg.attrs
+                    .iter()
+                    .any(|attr| attr.has_name(sym::splat))
+                    .then_some((u16::try_from(index).unwrap(), arg.span))
+            })
+            .unzip();
+
+        // A splatted argument at the "no splatted" marker index is not supported (this is an
+        // unlikely edge case).
+        if let (Some(&splatted_arg_index), Some(&splatted_span)) =
+            (splatted_arg_indexes.last(), splatted_spans.last())
+            && splatted_arg_index == FnDecl::NO_SPLATTED_ARG_INDEX
+        {
+            self.dcx().emit_err(diagnostics::InvalidSplattedArg {
+                splatted_arg_index,
+                span: splatted_span,
+            });
+        }
+
+        // Multiple splatted arguments are invalid: we can't know which arguments go in each splat.
+        if splatted_arg_indexes.len() > 1 {
+            self.dcx()
+                .emit_err(diagnostics::DuplicateSplattedArgs { spans: splatted_spans.clone() });
+        }
+
+        if let Some(c_variadic_span) = c_variadic_span
+            && !splatted_spans.is_empty()
+        {
+            splatted_spans.push(c_variadic_span);
+            self.dcx().emit_err(diagnostics::CVarArgsAndSplat { spans: splatted_spans });
         }
     }
 
@@ -437,24 +444,23 @@ impl<'a> AstValidator<'a> {
             .iter()
             .flat_map(|i| i.attrs.as_ref())
             .filter(|attr| {
-                let arr = [sym::allow, sym::cfg, sym::cfg_attr, sym::deny, sym::forbid, sym::warn];
-                !arr.contains(&attr.name_or_empty()) && rustc_attr::is_builtin_attr(attr)
+                let arr = [
+                    sym::allow,
+                    sym::cfg_trace,
+                    sym::cfg_attr_trace,
+                    sym::deny,
+                    sym::expect,
+                    sym::forbid,
+                    sym::splat,
+                    sym::warn,
+                ];
+                !attr.has_any_name(&arr) && rustc_attr_parsing::is_builtin_attr(*attr)
             })
             .for_each(|attr| {
                 if attr.is_doc_comment() {
-                    self.err_handler()
-                        .struct_span_err(
-                            attr.span,
-                            "documentation comments cannot be applied to function parameters",
-                        )
-                        .span_label(attr.span, "doc comments are not allowed here")
-                        .emit();
+                    self.dcx().emit_err(diagnostics::FnParamDocComment { span: attr.span });
                 } else {
-                    self.err_handler().span_err(
-                        attr.span,
-                        "allow, cfg, cfg_attr, deny, \
-                forbid, and warn are the only allowed built-in attributes in function parameters",
-                    );
+                    self.dcx().emit_err(diagnostics::FnParamForbiddenAttr { span: attr.span });
                 }
             });
     }
@@ -462,51 +468,227 @@ impl<'a> AstValidator<'a> {
     fn check_decl_self_param(&self, fn_decl: &FnDecl, self_semantic: SelfSemantic) {
         if let (SelfSemantic::No, [param, ..]) = (self_semantic, &*fn_decl.inputs) {
             if param.is_self() {
-                self.err_handler()
-                    .struct_span_err(
-                        param.span,
-                        "`self` parameter is only allowed in associated functions",
-                    )
-                    .span_label(param.span, "not semantically valid as function parameter")
-                    .note("associated functions are those in `impl` or `trait` definitions")
-                    .emit();
+                self.dcx().emit_err(diagnostics::FnParamForbiddenSelf { span: param.span });
             }
         }
     }
 
-    fn check_defaultness(&self, span: Span, defaultness: Defaultness) {
-        if let Defaultness::Default(def_span) = defaultness {
-            let span = self.session.source_map().guess_head_span(span);
-            self.err_handler()
-                .struct_span_err(span, "`default` is only allowed on items in trait impls")
-                .span_label(def_span, "`default` because of this")
-                .emit();
+    /// Check that the signature of this function does not violate the constraints of its ABI.
+    fn check_extern_fn_signature(&self, abi: ExternAbi, ctxt: FnCtxt, ident: &Ident, sig: &FnSig) {
+        match AbiMap::from_target(&self.sess.target).canonize_abi(abi, false) {
+            AbiMapping::Direct(canon_abi) | AbiMapping::Deprecated(canon_abi) => {
+                match canon_abi {
+                    CanonAbi::C
+                    | CanonAbi::Rust
+                    | CanonAbi::RustCold
+                    | CanonAbi::RustPreserveNone
+                    | CanonAbi::RustTail
+                    | CanonAbi::Swift
+                    | CanonAbi::Arm(_)
+                    | CanonAbi::X86(_) => { /* nothing to check */ }
+
+                    CanonAbi::GpuKernel => {
+                        // An `extern "gpu-kernel"` function cannot be `async` and/or `gen`.
+                        self.reject_coroutine(abi, sig);
+
+                        // An `extern "gpu-kernel"` function cannot return a value.
+                        self.reject_return(abi, sig);
+                    }
+
+                    CanonAbi::Custom => {
+                        // An `extern "custom"` function must be unsafe.
+                        self.reject_safe_fn(abi, ctxt, sig);
+
+                        // An `extern "custom"` function cannot be `async` and/or `gen`.
+                        self.reject_coroutine(abi, sig);
+
+                        // An `extern "custom"` function must have type `fn()`.
+                        self.reject_params_or_return(abi, ident, sig);
+                    }
+
+                    CanonAbi::Interrupt(interrupt_kind) => {
+                        // An interrupt handler cannot be `async` and/or `gen`.
+                        self.reject_coroutine(abi, sig);
+
+                        if let InterruptKind::X86 = interrupt_kind {
+                            // "x86-interrupt" is special because it does have arguments.
+                            // FIXME(workingjubilee): properly lint on acceptable input types.
+                            let inputs = &sig.decl.inputs;
+                            let param_count = inputs.len();
+                            if !matches!(param_count, 1 | 2) {
+                                let mut spans: Vec<Span> =
+                                    inputs.iter().map(|arg| arg.span).collect();
+                                if spans.is_empty() {
+                                    spans = vec![sig.span];
+                                }
+                                self.dcx()
+                                    .emit_err(diagnostics::AbiX86Interrupt { spans, param_count });
+                            }
+
+                            self.reject_return(abi, sig);
+                        } else {
+                            // An `extern "interrupt"` function must have type `fn()`.
+                            self.reject_params_or_return(abi, ident, sig);
+                        }
+                    }
+                }
+            }
+            AbiMapping::Invalid => { /* ignore */ }
         }
     }
 
-    fn error_item_without_body(&self, sp: Span, ctx: &str, msg: &str, sugg: &str) {
-        let source_map = self.session.source_map();
+    fn reject_safe_fn(&self, abi: ExternAbi, ctxt: FnCtxt, sig: &FnSig) {
+        let dcx = self.dcx();
+
+        match sig.header.safety {
+            Safety::Unsafe(_) => { /* all good */ }
+            Safety::Safe(safe_span) => {
+                let source_map = self.sess.psess.source_map();
+                let safe_span = source_map.span_until_non_whitespace(safe_span.to(sig.span));
+                dcx.emit_err(diagnostics::AbiCustomSafeForeignFunction {
+                    span: sig.span,
+                    safe_span,
+                });
+            }
+            Safety::Default => match ctxt {
+                FnCtxt::Foreign => { /* all good */ }
+                FnCtxt::Free | FnCtxt::Assoc(_) => {
+                    dcx.emit_err(diagnostics::AbiCustomSafeFunction {
+                        span: sig.span,
+                        abi,
+                        unsafe_span: sig.span.shrink_to_lo(),
+                    });
+                }
+            },
+        }
+    }
+
+    fn reject_coroutine(&self, abi: ExternAbi, sig: &FnSig) {
+        if let Some(coroutine_kind) = sig.header.coroutine_kind {
+            let coroutine_kind_span = self
+                .sess
+                .psess
+                .source_map()
+                .span_until_non_whitespace(coroutine_kind.span().to(sig.span));
+
+            self.dcx().emit_err(diagnostics::AbiCannotBeCoroutine {
+                span: sig.span,
+                abi,
+                coroutine_kind_span,
+                coroutine_kind_str: coroutine_kind.as_str(),
+            });
+        }
+    }
+
+    fn reject_return(&self, abi: ExternAbi, sig: &FnSig) {
+        if let FnRetTy::Ty(ref ret_ty) = sig.decl.output
+            && match &ret_ty.kind {
+                TyKind::Never => false,
+                TyKind::Tup(tup) if tup.is_empty() => false,
+                _ => true,
+            }
+        {
+            self.dcx().emit_err(diagnostics::AbiMustNotHaveReturnType { span: ret_ty.span, abi });
+        }
+    }
+
+    fn reject_params_or_return(&self, abi: ExternAbi, ident: &Ident, sig: &FnSig) {
+        let mut spans: Vec<_> = sig.decl.inputs.iter().map(|p| p.span).collect();
+        if let FnRetTy::Ty(ref ret_ty) = sig.decl.output
+            && match &ret_ty.kind {
+                TyKind::Never => false,
+                TyKind::Tup(tup) if tup.is_empty() => false,
+                _ => true,
+            }
+        {
+            spans.push(ret_ty.span);
+        }
+
+        if !spans.is_empty() {
+            let header_span = sig.header_span();
+            let suggestion_span = header_span.shrink_to_hi().to(sig.decl.output.span());
+            let padding = if header_span.is_empty() { "" } else { " " };
+
+            self.dcx().emit_err(diagnostics::AbiMustNotHaveParametersOrReturnType {
+                spans,
+                symbol: ident.name,
+                suggestion_span,
+                padding,
+                abi,
+            });
+        }
+    }
+
+    /// This ensures that items can only be `unsafe` (or unmarked) outside of extern
+    /// blocks.
+    ///
+    /// This additionally ensures that within extern blocks, items can only be
+    /// `safe`/`unsafe` inside of a `unsafe`-adorned extern block.
+    fn check_item_safety(&self, span: Span, safety: Safety) {
+        match self.extern_mod_safety {
+            Some(extern_safety) => {
+                if matches!(safety, Safety::Unsafe(_) | Safety::Safe(_))
+                    && extern_safety == Safety::Default
+                {
+                    self.dcx().emit_err(diagnostics::InvalidSafetyOnExtern {
+                        item_span: span,
+                        block: Some(self.current_extern_span().shrink_to_lo()),
+                    });
+                }
+            }
+            None => {
+                if matches!(safety, Safety::Safe(_)) {
+                    self.dcx().emit_err(diagnostics::InvalidSafetyOnItem { span });
+                }
+            }
+        }
+    }
+
+    fn check_fn_ptr_safety(&self, span: Span, safety: Safety) {
+        if matches!(safety, Safety::Safe(_)) {
+            self.dcx().emit_err(diagnostics::InvalidSafetyOnFnPtr { span });
+        }
+    }
+
+    fn check_defaultness(
+        &self,
+        span: Span,
+        defaultness: Defaultness,
+        allow_default: AllowDefault,
+        allow_final: AllowFinal,
+    ) {
+        match defaultness {
+            Defaultness::Default(def_span) if matches!(allow_default, AllowDefault::No) => {
+                let span = self.sess.source_map().guess_head_span(span);
+                self.dcx().emit_err(diagnostics::ForbiddenDefault { span, def_span });
+            }
+            Defaultness::Final(def_span) if matches!(allow_final, AllowFinal::No) => {
+                let span = self.sess.source_map().guess_head_span(span);
+                self.dcx().emit_err(diagnostics::ForbiddenFinal { span, def_span });
+            }
+            _ => (),
+        }
+    }
+
+    fn check_final_has_body(&self, item: &Item<AssocItemKind>, defaultness: Defaultness) {
+        if let AssocItemKind::Fn(Fn { body: None, .. }) = &item.kind
+            && let Defaultness::Final(def_span) = defaultness
+        {
+            let span = self.sess.source_map().guess_head_span(item.span);
+            self.dcx().emit_err(diagnostics::ForbiddenFinalWithoutBody { span, def_span });
+        }
+    }
+
+    /// If `sp` ends with a semicolon, returns it as a `Span`
+    /// Otherwise, returns `sp.shrink_to_hi()`
+    fn ending_semi_or_hi(&self, sp: Span) -> Span {
+        let source_map = self.sess.source_map();
         let end = source_map.end_point(sp);
-        let replace_span = if source_map.span_to_snippet(end).map(|s| s == ";").unwrap_or(false) {
+
+        if source_map.span_to_snippet(end).is_ok_and(|s| s == ";") {
             end
         } else {
             sp.shrink_to_hi()
-        };
-        self.err_handler()
-            .struct_span_err(sp, msg)
-            .span_suggestion(
-                replace_span,
-                &format!("provide a definition for the {}", ctx),
-                sugg.to_string(),
-                Applicability::HasPlaceholders,
-            )
-            .emit();
-    }
-
-    fn check_impl_item_provided<T>(&self, sp: Span, body: &Option<T>, ctx: &str, sugg: &str) {
-        if body.is_none() {
-            let msg = format!("associated {} in `impl` without body", ctx);
-            self.error_item_without_body(sp, ctx, &msg, sugg);
         }
     }
 
@@ -516,56 +698,43 @@ impl<'a> AstValidator<'a> {
             [b0] => b0.span(),
             [b0, .., bl] => b0.span().to(bl.span()),
         };
-        self.err_handler()
-            .struct_span_err(span, &format!("bounds on `type`s in {} have no effect", ctx))
-            .emit();
+        self.dcx().emit_err(diagnostics::BoundInContext { span, ctx });
     }
 
-    fn check_foreign_ty_genericless(&self, generics: &Generics, where_span: Span) {
+    fn check_foreign_ty_genericless(&self, generics: &Generics, after_where_clause: &WhereClause) {
         let cannot_have = |span, descr, remove_descr| {
-            self.err_handler()
-                .struct_span_err(
-                    span,
-                    &format!("`type`s inside `extern` blocks cannot have {}", descr),
-                )
-                .span_suggestion(
-                    span,
-                    &format!("remove the {}", remove_descr),
-                    String::new(),
-                    Applicability::MaybeIncorrect,
-                )
-                .span_label(self.current_extern_span(), "`extern` block begins here")
-                .note(MORE_EXTERN)
-                .emit();
+            self.dcx().emit_err(diagnostics::ExternTypesCannotHave {
+                span,
+                descr,
+                remove_descr,
+                block_span: self.current_extern_span(),
+            });
         };
 
         if !generics.params.is_empty() {
             cannot_have(generics.span, "generic parameters", "generic parameters");
         }
 
-        if !generics.where_clause.predicates.is_empty() {
-            cannot_have(where_span, "`where` clauses", "`where` clause");
-        }
+        let check_where_clause = |where_clause: &WhereClause| {
+            if where_clause.has_where_token {
+                cannot_have(where_clause.span, "`where` clauses", "`where` clause");
+            }
+        };
+
+        check_where_clause(&generics.where_clause);
+        check_where_clause(&after_where_clause);
     }
 
-    fn check_foreign_kind_bodyless(&self, ident: Ident, kind: &str, body: Option<Span>) {
-        let Some(body) = body else {
+    fn check_foreign_kind_bodyless(&self, ident: Ident, kind: &str, body_span: Option<Span>) {
+        let Some(body_span) = body_span else {
             return;
         };
-        self.err_handler()
-            .struct_span_err(ident.span, &format!("incorrect `{}` inside `extern` block", kind))
-            .span_label(ident.span, "cannot have a body")
-            .span_label(body, "the invalid body")
-            .span_label(
-                self.current_extern_span(),
-                format!(
-                    "`extern` blocks define existing foreign {0}s and {0}s \
-                    inside of them cannot have a body",
-                    kind
-                ),
-            )
-            .note(MORE_EXTERN)
-            .emit();
+        self.dcx().emit_err(diagnostics::BodyInExtern {
+            span: ident.span,
+            body: body_span,
+            block: self.current_extern_span(),
+            kind,
+        });
     }
 
     /// An `fn` in `extern { ... }` cannot have a body `{ ... }`.
@@ -573,91 +742,194 @@ impl<'a> AstValidator<'a> {
         let Some(body) = body else {
             return;
         };
-        self.err_handler()
-            .struct_span_err(ident.span, "incorrect function inside `extern` block")
-            .span_label(ident.span, "cannot have a body")
-            .span_suggestion(
-                body.span,
-                "remove the invalid body",
-                ";".to_string(),
-                Applicability::MaybeIncorrect,
-            )
-            .help(
-                "you might have meant to write a function accessible through FFI, \
-                which can be done by writing `extern fn` outside of the `extern` block",
-            )
-            .span_label(
-                self.current_extern_span(),
-                "`extern` blocks define existing foreign functions and functions \
-                inside of them cannot have a body",
-            )
-            .note(MORE_EXTERN)
-            .emit();
+        self.dcx().emit_err(diagnostics::FnBodyInExtern {
+            span: ident.span,
+            body: body.span,
+            block: self.current_extern_span(),
+        });
     }
 
     fn current_extern_span(&self) -> Span {
-        self.session.source_map().guess_head_span(self.extern_mod.unwrap().span)
+        self.sess.source_map().guess_head_span(self.extern_mod_span.unwrap())
     }
 
     /// An `fn` in `extern { ... }` cannot have qualifiers, e.g. `async fn`.
-    fn check_foreign_fn_headerless(&self, ident: Ident, span: Span, header: FnHeader) {
-        if header.has_qualifiers() {
-            self.err_handler()
-                .struct_span_err(ident.span, "functions in `extern` blocks cannot have qualifiers")
-                .span_label(self.current_extern_span(), "in this `extern` block")
-                .span_suggestion_verbose(
-                    span.until(ident.span.shrink_to_lo()),
-                    "remove the qualifiers",
-                    "fn ".to_string(),
-                    Applicability::MaybeIncorrect,
-                )
-                .emit();
+    fn check_foreign_fn_headerless(
+        &self,
+        // Deconstruct to ensure exhaustiveness
+        FnHeader { safety: _, coroutine_kind, constness, ext }: FnHeader,
+    ) {
+        let report_err = |span, kw| {
+            self.dcx().emit_err(diagnostics::FnQualifierInExtern {
+                span,
+                kw,
+                block: self.current_extern_span(),
+            });
+        };
+        match coroutine_kind {
+            Some(kind) => report_err(kind.span(), kind.as_str()),
+            None => (),
+        }
+        match constness {
+            Const::Yes(span) => report_err(span, "const"),
+            Const::No => (),
+        }
+        match ext {
+            Extern::None => (),
+            Extern::Implicit(span) | Extern::Explicit(_, span) => report_err(span, "extern"),
         }
     }
 
     /// An item in `extern { ... }` cannot use non-ascii identifier.
     fn check_foreign_item_ascii_only(&self, ident: Ident) {
         if !ident.as_str().is_ascii() {
-            let n = 83942;
-            self.err_handler()
-                .struct_span_err(
-                    ident.span,
-                    "items in `extern` blocks cannot use non-ascii identifiers",
-                )
-                .span_label(self.current_extern_span(), "in this `extern` block")
-                .note(&format!(
-                    "this limitation may be lifted in the future; see issue #{} <https://github.com/rust-lang/rust/issues/{}> for more information",
-                    n, n,
-                ))
-                .emit();
+            self.dcx().emit_err(diagnostics::ExternItemAscii {
+                span: ident.span,
+                block: self.current_extern_span(),
+            });
         }
     }
 
-    /// Reject C-variadic type unless the function is foreign,
-    /// or free and `unsafe extern "C"` semantically.
-    fn check_c_variadic_type(&self, fk: FnKind<'a>) {
-        match (fk.ctxt(), fk.header()) {
-            (Some(FnCtxt::Foreign), _) => return,
-            (Some(FnCtxt::Free), Some(header)) => match header.ext {
-                Extern::Explicit(StrLit { symbol_unescaped: sym::C, .. }) | Extern::Implicit
-                    if matches!(header.unsafety, Unsafe::Yes(_)) =>
-                {
-                    return;
-                }
-                _ => {}
-            },
-            _ => {}
+    /// Reject invalid C-variadic types.
+    ///
+    /// C-variadics must be:
+    /// - Non-const
+    /// - Either foreign, or free and `unsafe extern "C"` semantically
+    fn check_c_variadic_type(&self, fk: FnKind<'_>, attrs: &AttrVec) {
+        // `...` is already rejected when it is not the final parameter.
+        let variadic_param = match fk.decl().inputs.last() {
+            Some(param) if matches!(param.ty.kind, TyKind::CVarArgs) => param,
+            _ => return,
         };
 
-        for Param { ty, span, .. } in &fk.decl().inputs {
-            if let TyKind::CVarArgs = ty.kind {
-                self.err_handler()
-                    .struct_span_err(
-                        *span,
-                        "only foreign or `unsafe extern \"C\"` functions may be C-variadic",
-                    )
-                    .emit();
+        let FnKind::Fn(fn_ctxt, _, Fn { sig, .. }) = fk else {
+            // Unreachable because the parser already rejects `...` in closures.
+            unreachable!("C variable argument list cannot be used in closures")
+        };
+
+        if let Const::Yes(_) = sig.header.constness
+            && !self.features.enabled(sym::const_c_variadic)
+        {
+            let msg = format!("c-variadic const function definitions are unstable");
+            feature_err(&self.sess, sym::const_c_variadic, sig.span, msg).emit();
+        }
+
+        if let Some(coroutine_kind) = sig.header.coroutine_kind {
+            self.dcx().emit_err(diagnostics::CoroutineAndCVariadic {
+                spans: vec![coroutine_kind.span(), variadic_param.span],
+                coroutine_kind: coroutine_kind.as_str(),
+                coroutine_span: coroutine_kind.span(),
+                variadic_span: variadic_param.span,
+            });
+        }
+
+        match fn_ctxt {
+            FnCtxt::Foreign => return,
+            FnCtxt::Free | FnCtxt::Assoc(_) => {
+                match self.sess.target.supports_c_variadic_definitions() {
+                    CVariadicStatus::NotSupported => {
+                        self.dcx().emit_err(diagnostics::CVariadicNotSupported {
+                            variadic_span: variadic_param.span,
+                            target: &*self.sess.target.llvm_target,
+                        });
+                        return;
+                    }
+                    CVariadicStatus::Unstable { feature } if !self.features.enabled(feature) => {
+                        let msg =
+                            format!("C-variadic function definitions on this target are unstable");
+                        feature_err(&self.sess, feature, variadic_param.span, msg).emit();
+                        return;
+                    }
+                    CVariadicStatus::Unstable { .. } | CVariadicStatus::Stable => {
+                        /* fall through */
+                    }
+                }
+
+                match sig.header.ext {
+                    Extern::Implicit(_) => {
+                        if !matches!(sig.header.safety, Safety::Unsafe(_)) {
+                            self.dcx().emit_err(diagnostics::CVariadicMustBeUnsafe {
+                                span: variadic_param.span,
+                                unsafe_span: sig.safety_span(),
+                            });
+                        }
+                    }
+                    Extern::Explicit(StrLit { symbol_unescaped, .. }, _) => {
+                        // Just bail if the ABI is not even recognized.
+                        let Ok(abi) = ExternAbi::from_str(symbol_unescaped.as_str()) else {
+                            return;
+                        };
+
+                        self.check_c_variadic_abi(abi, attrs, variadic_param.span, sig);
+
+                        if !matches!(sig.header.safety, Safety::Unsafe(_)) {
+                            self.dcx().emit_err(diagnostics::CVariadicMustBeUnsafe {
+                                span: variadic_param.span,
+                                unsafe_span: sig.safety_span(),
+                            });
+                        }
+                    }
+                    Extern::None => {
+                        let err = diagnostics::CVariadicNoExtern { span: variadic_param.span };
+                        self.dcx().emit_err(err);
+                    }
+                }
             }
+        }
+    }
+
+    fn check_c_variadic_abi(
+        &self,
+        abi: ExternAbi,
+        attrs: &AttrVec,
+        dotdotdot_span: Span,
+        sig: &FnSig,
+    ) {
+        // For naked functions we accept any ABI that is accepted on c-variadic
+        // foreign functions, if the c_variadic_naked_functions feature is enabled.
+        if attr::contains_name(attrs, sym::naked) {
+            match abi.supports_c_variadic() {
+                CVariadicStatus::Stable if let ExternAbi::C { .. } = abi => {
+                    // With `c_variadic` naked c-variadic `extern "C"` functions are allowed.
+                }
+                CVariadicStatus::Stable => {
+                    // For e.g. aapcs or sysv64 `c_variadic_naked_functions` must also be enabled.
+                    if !self.features.enabled(sym::c_variadic_naked_functions) {
+                        let msg = format!("Naked c-variadic `extern {abi}` functions are unstable");
+                        feature_err(&self.sess, sym::c_variadic_naked_functions, sig.span, msg)
+                            .emit();
+                    }
+                }
+                CVariadicStatus::Unstable { feature } => {
+                    // Some ABIs need additional features.
+                    if !self.features.enabled(sym::c_variadic_naked_functions) {
+                        let msg = format!("Naked c-variadic `extern {abi}` functions are unstable");
+                        feature_err(&self.sess, sym::c_variadic_naked_functions, sig.span, msg)
+                            .emit();
+                    }
+
+                    if !self.features.enabled(feature) {
+                        let msg = format!(
+                            "C-variadic functions with the {abi} calling convention are unstable"
+                        );
+                        feature_err(&self.sess, feature, sig.span, msg).emit();
+                    }
+                }
+                CVariadicStatus::NotSupported => {
+                    // Some ABIs, e.g. `extern "Rust"`, never support c-variadic functions.
+                    self.dcx().emit_err(diagnostics::CVariadicBadNakedExtern {
+                        span: dotdotdot_span,
+                        abi: abi.as_str(),
+                        extern_span: sig.extern_span(),
+                    });
+                }
+            }
+        } else if !matches!(abi, ExternAbi::C { .. }) {
+            self.dcx().emit_err(diagnostics::CVariadicBadExtern {
+                span: dotdotdot_span,
+                abi: abi.as_str(),
+                extern_span: sig.extern_span(),
+            });
         }
     }
 
@@ -665,108 +937,62 @@ impl<'a> AstValidator<'a> {
         if ident.name != kw::Underscore {
             return;
         }
-        self.err_handler()
-            .struct_span_err(ident.span, &format!("`{}` items in this context need a name", kind))
-            .span_label(ident.span, format!("`_` is not a valid name for this `{}` item", kind))
-            .emit();
+        self.dcx().emit_err(diagnostics::ItemUnderscore { span: ident.span, kind });
     }
 
     fn check_nomangle_item_asciionly(&self, ident: Ident, item_span: Span) {
         if ident.name.as_str().is_ascii() {
             return;
         }
-        let head_span = self.session.source_map().guess_head_span(item_span);
-        struct_span_err!(
-            self.session,
-            head_span,
-            E0754,
-            "`#[no_mangle]` requires ASCII identifier"
-        )
-        .emit();
+        let span = self.sess.source_map().guess_head_span(item_span);
+        self.dcx().emit_err(diagnostics::NoMangleAscii { span });
     }
 
     fn check_mod_file_item_asciionly(&self, ident: Ident) {
         if ident.name.as_str().is_ascii() {
             return;
         }
-        struct_span_err!(
-            self.session,
-            ident.span,
-            E0754,
-            "trying to load file for module `{}` with non-ascii identifier name",
-            ident.name
-        )
-        .help("consider using `#[path]` attribute to specify filesystem path")
-        .emit();
+        self.dcx().emit_err(diagnostics::ModuleNonAscii { span: ident.span, name: ident.name });
+    }
+
+    fn deny_const_auto_traits(&self, constness: Const) {
+        if let Const::Yes(span) = constness {
+            self.dcx().emit_err(diagnostics::ConstAutoTrait { span });
+        }
     }
 
     fn deny_generic_params(&self, generics: &Generics, ident_span: Span) {
         if !generics.params.is_empty() {
-            struct_span_err!(
-                self.session,
-                generics.span,
-                E0567,
-                "auto traits cannot have generic parameters"
-            )
-            .span_label(ident_span, "auto trait cannot have generic parameters")
-            .span_suggestion(
-                generics.span,
-                "remove the parameters",
-                String::new(),
-                Applicability::MachineApplicable,
-            )
-            .emit();
+            self.dcx()
+                .emit_err(diagnostics::AutoTraitGeneric { span: generics.span, ident: ident_span });
         }
     }
 
-    fn emit_e0568(&self, span: Span, ident_span: Span) {
-        struct_span_err!(
-            self.session,
-            span,
-            E0568,
-            "auto traits cannot have super traits or lifetime bounds"
-        )
-        .span_label(ident_span, "auto trait cannot have super traits or lifetime bounds")
-        .span_suggestion(
-            span,
-            "remove the super traits or lifetime bounds",
-            String::new(),
-            Applicability::MachineApplicable,
-        )
-        .emit();
-    }
-
-    fn deny_super_traits(&self, bounds: &GenericBounds, ident_span: Span) {
+    fn deny_super_traits(&self, bounds: &GenericBounds, ident: Span) {
         if let [.., last] = &bounds[..] {
-            let span = ident_span.shrink_to_hi().to(last.span());
-            self.emit_e0568(span, ident_span);
+            let span = bounds.iter().map(|b| b.span()).collect();
+            let removal = ident.shrink_to_hi().to(last.span());
+            self.dcx().emit_err(diagnostics::AutoTraitBounds { span, removal, ident });
         }
     }
 
-    fn deny_where_clause(&self, where_clause: &WhereClause, ident_span: Span) {
+    fn deny_where_clause(&self, where_clause: &WhereClause, ident: Span) {
         if !where_clause.predicates.is_empty() {
-            self.emit_e0568(where_clause.span, ident_span);
+            // FIXME: The current diagnostic is misleading since it only talks about
+            // super trait and lifetime bounds while we should just say “bounds”.
+            self.dcx().emit_err(diagnostics::AutoTraitBounds {
+                span: vec![where_clause.span],
+                removal: where_clause.span,
+                ident,
+            });
         }
     }
 
-    fn deny_items(&self, trait_items: &[P<AssocItem>], ident_span: Span) {
+    fn deny_items(&self, trait_items: &[Box<AssocItem>], ident_span: Span) {
         if !trait_items.is_empty() {
-            let spans: Vec<_> = trait_items.iter().map(|i| i.ident.span).collect();
-            let total_span = trait_items.first().unwrap().span.to(trait_items.last().unwrap().span);
-            struct_span_err!(
-                self.session,
-                spans,
-                E0380,
-                "auto traits cannot have associated items"
-            )
-            .span_suggestion(
-                total_span,
-                "remove these associated items",
-                String::new(),
-                Applicability::MachineApplicable,
-            )
-            .span_label(ident_span, "auto trait cannot have associated items")
-            .emit();
+            let spans: Vec<_> = trait_items.iter().map(|i| i.kind.ident().unwrap().span).collect();
+            let total = trait_items.first().unwrap().span.to(trait_items.last().unwrap().span);
+            self.dcx().emit_err(diagnostics::AutoTraitItems { spans, total, ident: ident_span });
         }
     }
 
@@ -788,7 +1014,7 @@ impl<'a> AstValidator<'a> {
         let constraint_sugg = data.args.iter().filter_map(|a| match a {
             AngleBracketedArg::Arg(_) => None,
             AngleBracketedArg::Constraint(c) => {
-                Some(pprust::to_string(|s| s.print_assoc_constraint(c)))
+                Some(pprust::to_string(|s| s.print_assoc_item_constraint(c)))
             }
         });
         format!(
@@ -812,130 +1038,101 @@ impl<'a> AstValidator<'a> {
         let args_len = arg_spans.len();
         let constraint_len = constraint_spans.len();
         // ...and then error:
-        self.err_handler()
-            .struct_span_err(
-                arg_spans.clone(),
-                "generic arguments must come before the first constraint",
-            )
-            .span_label(constraint_spans[0], &format!("constraint{}", pluralize!(constraint_len)))
-            .span_label(
-                *arg_spans.iter().last().unwrap(),
-                &format!("generic argument{}", pluralize!(args_len)),
-            )
-            .span_labels(constraint_spans, "")
-            .span_labels(arg_spans, "")
-            .span_suggestion_verbose(
-                data.span,
-                &format!(
-                    "move the constraint{} after the generic argument{}",
-                    pluralize!(constraint_len),
-                    pluralize!(args_len)
-                ),
-                self.correct_generic_order_suggestion(&data),
-                Applicability::MachineApplicable,
-            )
-            .emit();
+        self.dcx().emit_err(diagnostics::ArgsBeforeConstraint {
+            arg_spans: arg_spans.clone(),
+            constraints: constraint_spans[0],
+            args: *arg_spans.iter().last().unwrap(),
+            data: data.span,
+            constraint_spans: diagnostics::EmptyLabelManySpans(constraint_spans),
+            arg_spans2: diagnostics::EmptyLabelManySpans(arg_spans),
+            suggestion: self.correct_generic_order_suggestion(data),
+            constraint_len,
+            args_len,
+        });
     }
 
-    fn visit_ty_common(&mut self, ty: &'a Ty) {
-        match ty.kind {
-            TyKind::BareFn(ref bfty) => {
+    fn visit_ty_common(&mut self, ty: &Ty) {
+        match &ty.kind {
+            TyKind::FnPtr(bfty) => {
+                self.check_fn_ptr_safety(bfty.decl_span, bfty.safety);
                 self.check_fn_decl(&bfty.decl, SelfSemantic::No);
                 Self::check_decl_no_pat(&bfty.decl, |span, _, _| {
-                    struct_span_err!(
-                        self.session,
-                        span,
-                        E0561,
-                        "patterns aren't allowed in function pointer types"
-                    )
-                    .emit();
+                    self.dcx().emit_err(diagnostics::PatternFnPointer { span });
                 });
-                self.check_late_bound_lifetime_defs(&bfty.generic_params);
-                if let Extern::Implicit = bfty.ext {
-                    let sig_span = self.session.source_map().next_point(ty.span.shrink_to_lo());
-                    self.maybe_lint_missing_abi(sig_span, ty.id);
+                if let Extern::Implicit(extern_span) = bfty.ext {
+                    self.handle_missing_abi(extern_span, ty.id);
                 }
             }
-            TyKind::TraitObject(ref bounds, ..) => {
+            TyKind::TraitObject(bounds, ..) => {
                 let mut any_lifetime_bounds = false;
                 for bound in bounds {
-                    if let GenericBound::Outlives(ref lifetime) = *bound {
+                    if let GenericBound::Outlives(lifetime) = bound {
                         if any_lifetime_bounds {
-                            struct_span_err!(
-                                self.session,
-                                lifetime.ident.span,
-                                E0226,
-                                "only a single explicit lifetime bound is permitted"
-                            )
-                            .emit();
+                            self.dcx().emit_err(diagnostics::TraitObjectBound {
+                                span: lifetime.ident.span,
+                            });
                             break;
                         }
                         any_lifetime_bounds = true;
                     }
                 }
-                self.no_questions_in_bounds(bounds, "trait object types", false);
             }
-            TyKind::ImplTrait(_, ref bounds) => {
-                if self.is_impl_trait_banned {
-                    struct_span_err!(
-                        self.session,
-                        ty.span,
-                        E0667,
-                        "`impl Trait` is not allowed in path parameters"
-                    )
-                    .emit();
-                }
-
-                if let Some(outer_impl_trait_sp) = self.outer_impl_trait {
-                    struct_span_err!(
-                        self.session,
-                        ty.span,
-                        E0666,
-                        "nested `impl Trait` is not allowed"
-                    )
-                    .span_label(outer_impl_trait_sp, "outer `impl Trait`")
-                    .span_label(ty.span, "nested `impl Trait` here")
-                    .emit();
+            TyKind::ImplTrait(_, bounds) => {
+                if let Some(outer_impl_trait_sp) = self.outer_impl_trait_span {
+                    self.dcx().emit_err(diagnostics::NestedImplTrait {
+                        span: ty.span,
+                        outer: outer_impl_trait_sp,
+                        inner: ty.span,
+                    });
                 }
 
                 if !bounds.iter().any(|b| matches!(b, GenericBound::Trait(..))) {
-                    self.err_handler().span_err(ty.span, "at least one trait must be specified");
+                    self.dcx().emit_err(diagnostics::AtLeastOneTrait { span: ty.span });
                 }
             }
             _ => {}
         }
     }
 
-    fn maybe_lint_missing_abi(&mut self, span: Span, id: NodeId) {
+    fn handle_missing_abi(&mut self, span: Span, id: NodeId) {
         // FIXME(davidtwco): This is a hack to detect macros which produce spans of the
         // call site which do not have a macro backtrace. See #61963.
-        let is_macro_callsite = self
-            .session
+        if span.edition().at_least_edition_future() && self.features.explicit_extern_abis() {
+            self.dcx().emit_err(diagnostics::MissingAbi { span });
+        } else if self
+            .sess
             .source_map()
             .span_to_snippet(span)
-            .map(|snippet| snippet.starts_with("#["))
-            .unwrap_or(true);
-        if !is_macro_callsite {
-            self.lint_buffer.buffer_lint_with_diagnostic(
+            .is_ok_and(|snippet| !snippet.starts_with("#["))
+        {
+            self.lint_buffer.buffer_lint(
                 MISSING_ABI,
                 id,
                 span,
-                "extern declarations without an explicit ABI are deprecated",
-                BuiltinLintDiagnostics::MissingAbi(span, abi::Abi::FALLBACK),
+                diagnostics::MissingAbiSugg { span, default_abi: ExternAbi::FALLBACK },
             )
         }
+    }
+
+    // Used within `visit_item` for item kinds where we don't call `visit::walk_item`.
+    fn visit_attrs_vis(&mut self, attrs: &AttrVec, vis: &Visibility) {
+        walk_list!(self, visit_attribute, attrs);
+        self.visit_vis(vis);
+    }
+
+    // Used within `visit_item` for item kinds where we don't call `visit::walk_item`.
+    fn visit_attrs_vis_ident(&mut self, attrs: &AttrVec, vis: &Visibility, ident: &Ident) {
+        walk_list!(self, visit_attribute, attrs);
+        self.visit_vis(vis);
+        self.visit_ident(ident);
     }
 }
 
 /// Checks that generic parameters are in the correct order,
 /// which is lifetimes, then types and then consts. (`<'a, T, const N: usize>`)
-fn validate_generic_param_order(
-    handler: &rustc_errors::Handler,
-    generics: &[GenericParam],
-    span: Span,
-) {
+fn validate_generic_param_order(dcx: DiagCtxtHandle<'_>, generics: &[GenericParam], span: Span) {
     let mut max_param: Option<ParamKindOrd> = None;
-    let mut out_of_order = FxHashMap::default();
+    let mut out_of_order = FxIndexMap::default();
     let mut param_idents = Vec::with_capacity(generics.len());
 
     for (idx, param) in generics.iter().enumerate() {
@@ -943,10 +1140,10 @@ fn validate_generic_param_order(
         let (kind, bounds, span) = (&param.kind, &param.bounds, ident.span);
         let (ord_kind, ident) = match &param.kind {
             GenericParamKind::Lifetime => (ParamKindOrd::Lifetime, ident.to_string()),
-            GenericParamKind::Type { default: _ } => (ParamKindOrd::Type, ident.to_string()),
-            GenericParamKind::Const { ref ty, kw_span: _, default: _ } => {
+            GenericParamKind::Type { .. } => (ParamKindOrd::TypeOrConst, ident.to_string()),
+            GenericParamKind::Const { ty, .. } => {
                 let ty = pprust::ty_to_string(ty);
-                (ParamKindOrd::Const, format!("const {}: {}", ident, ty))
+                (ParamKindOrd::TypeOrConst, format!("const {ident}: {ty}"))
             }
         };
         param_idents.push((kind, ord_kind, bounds, idx, ident));
@@ -971,7 +1168,7 @@ fn validate_generic_param_order(
 
             if !bounds.is_empty() {
                 ordered_params += ": ";
-                ordered_params += &pprust::bounds_to_string(&bounds);
+                ordered_params += &pprust::bounds_to_string(bounds);
             }
 
             match kind {
@@ -981,11 +1178,11 @@ fn validate_generic_param_order(
                 }
                 GenericParamKind::Type { default: None } => (),
                 GenericParamKind::Lifetime => (),
-                GenericParamKind::Const { ty: _, kw_span: _, default: Some(default) } => {
+                GenericParamKind::Const { ty: _, span: _, default: Some(default) } => {
                     ordered_params += " = ";
-                    ordered_params += &pprust::expr_to_string(&*default.value);
+                    ordered_params += &pprust::expr_to_string(&default.value);
                 }
-                GenericParamKind::Const { ty: _, kw_span: _, default: None } => (),
+                GenericParamKind::Const { ty: _, span: _, default: None } => (),
             }
             first = false;
         }
@@ -993,406 +1190,433 @@ fn validate_generic_param_order(
         ordered_params += ">";
 
         for (param_ord, (max_param, spans)) in &out_of_order {
-            let mut err = handler.struct_span_err(
-                spans.clone(),
-                &format!(
-                    "{} parameters must be declared prior to {} parameters",
-                    param_ord, max_param,
-                ),
-            );
-            err.span_suggestion(
-                span,
-                "reorder the parameters: lifetimes, then consts and types",
-                ordered_params.clone(),
-                Applicability::MachineApplicable,
-            );
-            err.emit();
+            dcx.emit_err(diagnostics::OutOfOrderParams {
+                spans: spans.clone(),
+                sugg_span: span,
+                param_ord: param_ord.to_string(),
+                max_param: max_param.to_string(),
+                ordered_params: &ordered_params,
+            });
         }
     }
 }
 
-impl<'a> Visitor<'a> for AstValidator<'a> {
+impl Visitor<'_> for AstValidator<'_> {
     fn visit_attribute(&mut self, attr: &Attribute) {
-        validate_attr::check_meta(&self.session.parse_sess, attr);
+        validate_attr::check_attr(&self.sess.psess, attr);
     }
 
-    fn visit_expr(&mut self, expr: &'a Expr) {
-        self.with_let_management(Some(ForbiddenLetReason::GenericForbidden), |this, forbidden_let_reason| {
-            match &expr.kind {
-                ExprKind::Binary(Spanned { node: BinOpKind::Or, span }, lhs, rhs) => {
-                    let local_reason = Some(ForbiddenLetReason::NotSupportedOr(*span));
-                    this.with_let_management(local_reason, |this, _| this.visit_expr(lhs));
-                    this.with_let_management(local_reason, |this, _| this.visit_expr(rhs));
-                }
-                ExprKind::If(cond, then, opt_else) => {
-                    this.visit_block(then);
-                    walk_list!(this, visit_expr, opt_else);
-                    this.with_let_management(None, |this, _| this.visit_expr(cond));
-                    return;
-                }
-                ExprKind::Let(..) if let Some(elem) = forbidden_let_reason => {
-                    this.ban_let_expr(expr, elem);
-                },
-                ExprKind::Match(scrutinee, arms) => {
-                    this.visit_expr(scrutinee);
-                    for arm in arms {
-                        this.visit_expr(&arm.body);
-                        this.visit_pat(&arm.pat);
-                        walk_list!(this, visit_attribute, &arm.attrs);
-                        if let Some(guard) = &arm.guard && let ExprKind::Let(_, guard_expr, _) = &guard.kind {
-                            this.with_let_management(None, |this, _| {
-                                this.visit_expr(guard_expr)
-                            });
-                            return;
-                        }
-                    }
-                }
-                ExprKind::Paren(local_expr) => {
-                    fn has_let_expr(expr: &Expr) -> bool {
-                        match expr.kind {
-                            ExprKind::Binary(_, ref lhs, ref rhs) => has_let_expr(lhs) || has_let_expr(rhs),
-                            ExprKind::Let(..) => true,
-                            _ => false,
-                        }
-                    }
-                    let local_reason = if has_let_expr(local_expr) {
-                        Some(ForbiddenLetReason::NotSupportedParentheses(local_expr.span))
-                    }
-                    else {
-                        forbidden_let_reason
-                    };
-                    this.with_let_management(local_reason, |this, _| this.visit_expr(local_expr));
-                }
-                ExprKind::Binary(Spanned { node: BinOpKind::And, .. }, ..) => {
-                    this.with_let_management(forbidden_let_reason, |this, _| visit::walk_expr(this, expr));
-                    return;
-                }
-                ExprKind::While(cond, then, opt_label) => {
-                    walk_list!(this, visit_label, opt_label);
-                    this.visit_block(then);
-                    this.with_let_management(None, |this, _| this.visit_expr(cond));
-                    return;
-                }
-                _ => visit::walk_expr(this, expr),
-            }
-        });
-    }
-
-    fn visit_ty(&mut self, ty: &'a Ty) {
+    fn visit_ty(&mut self, ty: &Ty) {
         self.visit_ty_common(ty);
         self.walk_ty(ty)
     }
 
-    fn visit_label(&mut self, label: &'a Label) {
-        self.check_label(label.ident);
-        visit::walk_label(self, label);
-    }
-
-    fn visit_lifetime(&mut self, lifetime: &'a Lifetime) {
-        self.check_lifetime(lifetime.ident);
-        visit::walk_lifetime(self, lifetime);
-    }
-
-    fn visit_field_def(&mut self, s: &'a FieldDef) {
-        visit::walk_field_def(self, s)
-    }
-
-    fn visit_item(&mut self, item: &'a Item) {
-        if item.attrs.iter().any(|attr| self.session.is_proc_macro_attr(attr)) {
+    fn visit_item(&mut self, item: &Item) {
+        if item.attrs.iter().any(|attr| attr.is_proc_macro_attr()) {
             self.has_proc_macro_decls = true;
         }
 
-        if self.session.contains_name(&item.attrs, sym::no_mangle) {
-            self.check_nomangle_item_asciionly(item.ident, item.span);
+        let previous_lint_node_id = mem::replace(&mut self.lint_node_id, item.id);
+
+        if let Some(ident) = item.kind.ident()
+            && attr::contains_name(&item.attrs, sym::no_mangle)
+        {
+            self.check_nomangle_item_asciionly(ident, item.span);
         }
 
-        match item.kind {
-            ItemKind::Impl(box Impl {
-                unsafety,
-                polarity,
-                defaultness: _,
+        match &item.kind {
+            ItemKind::Impl(Impl {
+                generics,
                 constness,
-                ref generics,
-                of_trait: Some(ref t),
-                ref self_ty,
-                ref items,
+                of_trait: Some(TraitImplHeader { safety, polarity, defaultness: _, trait_ref: t }),
+                self_ty,
+                items,
             }) => {
-                self.with_in_trait_impl(true, Some(constness), |this| {
-                    this.invalid_visibility(&item.vis, None);
-                    if let TyKind::Err = self_ty.kind {
-                        this.err_handler()
-                            .struct_span_err(
-                                item.span,
-                                "`impl Trait for .. {}` is an obsolete syntax",
-                            )
-                            .help("use `auto trait Trait {}` instead")
-                            .emit();
-                    }
-                    if let (Unsafe::Yes(span), ImplPolarity::Negative(sp)) = (unsafety, polarity) {
-                        struct_span_err!(
-                            this.session,
-                            sp.to(t.path.span),
-                            E0198,
-                            "negative impls cannot be unsafe"
-                        )
-                        .span_label(sp, "negative because of this")
-                        .span_label(span, "unsafe because of this")
-                        .emit();
-                    }
+                self.visit_attrs_vis(&item.attrs, &item.vis);
+                self.visibility_not_permitted(
+                    &item.vis,
+                    diagnostics::VisibilityNotPermittedNote::TraitImpl,
+                );
+                if let TyKind::Dummy = self_ty.kind {
+                    // Abort immediately otherwise the `TyKind::Dummy` will reach HIR lowering,
+                    // which isn't allowed. Not a problem for this obscure, obsolete syntax.
+                    self.dcx().emit_fatal(diagnostics::ObsoleteAuto { span: item.span });
+                }
+                if let (&Safety::Unsafe(span), &ImplPolarity::Negative(sp)) = (safety, polarity) {
+                    self.dcx().emit_err(diagnostics::UnsafeNegativeImpl {
+                        span: sp.to(t.path.span),
+                        negative: sp,
+                        r#unsafe: span,
+                    });
+                }
 
-                    this.visit_vis(&item.vis);
-                    this.visit_ident(item.ident);
-                    if let Const::Yes(_) = constness {
-                        this.with_tilde_const_allowed(|this| this.visit_generics(generics));
+                let disallowed = matches!(constness, Const::No)
+                    .then(|| TildeConstReason::TraitImpl { span: item.span });
+                self.with_tilde_const(disallowed, |this| this.visit_generics(generics));
+                self.visit_trait_ref(t);
+                self.visit_ty(self_ty);
+
+                self.with_in_trait_or_impl(
+                    Some(TraitOrImpl::TraitImpl {
+                        constness: *constness,
+                        polarity: *polarity,
+                        trait_ref_span: t.path.span,
+                    }),
+                    |this| {
+                        walk_list!(
+                            this,
+                            visit_assoc_item,
+                            items,
+                            AssocCtxt::Impl { of_trait: true }
+                        );
+                    },
+                );
+            }
+            ItemKind::Impl(Impl { generics, of_trait: None, self_ty, items, constness }) => {
+                self.visit_attrs_vis(&item.attrs, &item.vis);
+                self.visibility_not_permitted(
+                    &item.vis,
+                    diagnostics::VisibilityNotPermittedNote::IndividualImplItems,
+                );
+
+                let disallowed = matches!(constness, ast::Const::No)
+                    .then(|| TildeConstReason::Impl { span: item.span });
+
+                self.with_tilde_const(disallowed, |this| this.visit_generics(generics));
+
+                self.visit_ty(self_ty);
+                self.with_in_trait_or_impl(
+                    Some(TraitOrImpl::Impl { constness: *constness }),
+                    |this| {
+                        walk_list!(
+                            this,
+                            visit_assoc_item,
+                            items,
+                            AssocCtxt::Impl { of_trait: false }
+                        );
+                    },
+                );
+            }
+            ItemKind::Fn(
+                func @ Fn {
+                    defaultness,
+                    ident,
+                    generics: _,
+                    sig,
+                    contract: _,
+                    body,
+                    define_opaque: _,
+                    eii_impls,
+                },
+            ) => {
+                self.visit_attrs_vis_ident(&item.attrs, &item.vis, ident);
+                self.check_defaultness(item.span, *defaultness, AllowDefault::No, AllowFinal::No);
+
+                for EiiImpl { eii_macro_path, .. } in eii_impls {
+                    self.visit_path(eii_macro_path);
+                }
+
+                let is_intrinsic = item.attrs.iter().any(|a| a.has_name(sym::rustc_intrinsic));
+                if body.is_none() && !is_intrinsic && !self.is_sdylib_interface {
+                    self.dcx().emit_err(diagnostics::FnWithoutBody {
+                        span: item.span,
+                        replace_span: self.ending_semi_or_hi(item.span),
+                        extern_block_suggestion: match sig.header.ext {
+                            Extern::None => None,
+                            Extern::Implicit(start_span) => {
+                                Some(diagnostics::ExternBlockSuggestion::Implicit {
+                                    start_span,
+                                    end_span: item.span.shrink_to_hi(),
+                                })
+                            }
+                            Extern::Explicit(abi, start_span) => {
+                                Some(diagnostics::ExternBlockSuggestion::Explicit {
+                                    start_span,
+                                    end_span: item.span.shrink_to_hi(),
+                                    abi: abi.symbol_unescaped,
+                                })
+                            }
+                        },
+                    });
+                }
+
+                let kind = FnKind::Fn(FnCtxt::Free, &item.vis, &*func);
+                self.visit_fn(kind, &item.attrs, item.span, item.id);
+            }
+            ItemKind::ForeignMod(ForeignMod { extern_span, abi, safety, .. }) => {
+                let old_item = mem::replace(&mut self.extern_mod_span, Some(item.span));
+                self.visibility_not_permitted(
+                    &item.vis,
+                    diagnostics::VisibilityNotPermittedNote::IndividualForeignItems,
+                );
+
+                if &Safety::Default == safety {
+                    if item.span.at_least_rust_2024() {
+                        self.dcx().emit_err(diagnostics::MissingUnsafeOnExtern { span: item.span });
                     } else {
-                        this.visit_generics(generics);
+                        self.lint_buffer.buffer_lint(
+                            MISSING_UNSAFE_ON_EXTERN,
+                            item.id,
+                            item.span,
+                            diagnostics::MissingUnsafeOnExternLint {
+                                suggestion: item.span.shrink_to_lo(),
+                            },
+                        );
                     }
-                    this.visit_trait_ref(t);
-                    this.visit_ty(self_ty);
+                }
 
-                    walk_list!(this, visit_assoc_item, items, AssocCtxt::Impl);
-                });
-                return; // Avoid visiting again.
-            }
-            ItemKind::Impl(box Impl {
-                unsafety,
-                polarity,
-                defaultness,
-                constness,
-                generics: _,
-                of_trait: None,
-                ref self_ty,
-                items: _,
-            }) => {
-                let error = |annotation_span, annotation| {
-                    let mut err = self.err_handler().struct_span_err(
-                        self_ty.span,
-                        &format!("inherent impls cannot be {}", annotation),
-                    );
-                    err.span_label(annotation_span, &format!("{} because of this", annotation));
-                    err.span_label(self_ty.span, "inherent impl for this type");
-                    err
-                };
-
-                self.invalid_visibility(
-                    &item.vis,
-                    Some("place qualifiers on individual impl items instead"),
-                );
-                if let Unsafe::Yes(span) = unsafety {
-                    error(span, "unsafe").code(error_code!(E0197)).emit();
-                }
-                if let ImplPolarity::Negative(span) = polarity {
-                    error(span, "negative").emit();
-                }
-                if let Defaultness::Default(def_span) = defaultness {
-                    error(def_span, "`default`")
-                        .note("only trait implementations may be annotated with `default`")
-                        .emit();
-                }
-                if let Const::Yes(span) = constness {
-                    error(span, "`const`")
-                        .note("only trait implementations may be annotated with `const`")
-                        .emit();
-                }
-            }
-            ItemKind::Fn(box Fn { defaultness, ref sig, ref generics, ref body }) => {
-                self.check_defaultness(item.span, defaultness);
-
-                if body.is_none() {
-                    let msg = "free function without a body";
-                    self.error_item_without_body(item.span, "function", msg, " { <body> }");
-                }
-                self.visit_vis(&item.vis);
-                self.visit_ident(item.ident);
-                let kind =
-                    FnKind::Fn(FnCtxt::Free, item.ident, sig, &item.vis, generics, body.as_deref());
-                self.visit_fn(kind, item.span, item.id);
-                walk_list!(self, visit_attribute, &item.attrs);
-                return; // Avoid visiting again.
-            }
-            ItemKind::ForeignMod(ForeignMod { abi, unsafety, .. }) => {
-                let old_item = mem::replace(&mut self.extern_mod, Some(item));
-                self.invalid_visibility(
-                    &item.vis,
-                    Some("place qualifiers on individual foreign items instead"),
-                );
-                if let Unsafe::Yes(span) = unsafety {
-                    self.err_handler().span_err(span, "extern block cannot be declared unsafe");
-                }
                 if abi.is_none() {
-                    self.maybe_lint_missing_abi(item.span, item.id);
+                    self.handle_missing_abi(*extern_span, item.id);
                 }
-                visit::walk_item(self, item);
-                self.extern_mod = old_item;
-                return; // Avoid visiting again.
+
+                let extern_abi = abi.and_then(|abi| ExternAbi::from_str(abi.symbol.as_str()).ok());
+                self.with_in_extern_mod(*safety, extern_abi, |this| {
+                    visit::walk_item(this, item);
+                });
+                self.extern_mod_span = old_item;
             }
-            ItemKind::Enum(ref def, _) => {
+            ItemKind::Enum(_, _, def) => {
                 for variant in &def.variants {
-                    self.invalid_visibility(&variant.vis, None);
+                    self.visibility_not_permitted(
+                        &variant.vis,
+                        diagnostics::VisibilityNotPermittedNote::EnumVariant,
+                    );
                     for field in variant.data.fields() {
-                        self.invalid_visibility(&field.vis, None);
+                        self.visibility_not_permitted(
+                            &field.vis,
+                            diagnostics::VisibilityNotPermittedNote::EnumVariant,
+                        );
                     }
                 }
+                self.with_tilde_const(Some(TildeConstReason::Enum { span: item.span }), |this| {
+                    visit::walk_item(this, item)
+                });
             }
-            ItemKind::Trait(box Trait { is_auto, ref generics, ref bounds, ref items, .. }) => {
-                if is_auto == IsAuto::Yes {
+            ItemKind::Trait(Trait {
+                constness, is_auto, generics, ident, bounds, items, ..
+            }) => {
+                self.visit_attrs_vis_ident(&item.attrs, &item.vis, ident);
+                if *is_auto == IsAuto::Yes {
+                    // For why we reject `const auto trait`, see rust-lang/rust#149285.
+                    self.deny_const_auto_traits(*constness);
                     // Auto traits cannot have generics, super traits nor contain items.
-                    self.deny_generic_params(generics, item.ident.span);
-                    self.deny_super_traits(bounds, item.ident.span);
-                    self.deny_where_clause(&generics.where_clause, item.ident.span);
-                    self.deny_items(items, item.ident.span);
+                    self.deny_generic_params(generics, ident.span);
+                    self.deny_super_traits(bounds, ident.span);
+                    self.deny_where_clause(&generics.where_clause, ident.span);
+                    self.deny_items(items, ident.span);
                 }
-                self.no_questions_in_bounds(bounds, "supertraits", true);
 
                 // Equivalent of `visit::walk_item` for `ItemKind::Trait` that inserts a bound
                 // context for the supertraits.
-                self.visit_vis(&item.vis);
-                self.visit_ident(item.ident);
-                self.visit_generics(generics);
-                self.with_banned_tilde_const(|this| walk_list!(this, visit_param_bound, bounds));
-                walk_list!(self, visit_assoc_item, items, AssocCtxt::Trait);
-                walk_list!(self, visit_attribute, &item.attrs);
-                return;
+                let disallowed = matches!(constness, ast::Const::No)
+                    .then(|| TildeConstReason::Trait { span: item.span });
+                self.with_tilde_const(disallowed, |this| {
+                    this.visit_generics(generics);
+                    walk_list!(this, visit_param_bound, bounds, BoundKind::SuperTraits)
+                });
+                self.with_in_trait(item.span, *constness, |this| {
+                    walk_list!(this, visit_assoc_item, items, AssocCtxt::Trait);
+                });
             }
-            ItemKind::Mod(unsafety, ref mod_kind) => {
-                if let Unsafe::Yes(span) = unsafety {
-                    self.err_handler().span_err(span, "module cannot be declared unsafe");
+            ItemKind::TraitAlias(TraitAlias { constness, generics, bounds, .. }) => {
+                let disallowed = matches!(constness, ast::Const::No)
+                    .then(|| TildeConstReason::Trait { span: item.span });
+                self.with_tilde_const(disallowed, |this| {
+                    this.visit_generics(generics);
+                    walk_list!(this, visit_param_bound, bounds, BoundKind::SuperTraits)
+                });
+            }
+            ItemKind::Mod(safety, ident, mod_kind) => {
+                if let &Safety::Unsafe(span) = safety {
+                    self.dcx().emit_err(diagnostics::UnsafeItem { span, kind: "module" });
                 }
                 // Ensure that `path` attributes on modules are recorded as used (cf. issue #35584).
                 if !matches!(mod_kind, ModKind::Loaded(_, Inline::Yes, _))
-                    && !self.session.contains_name(&item.attrs, sym::path)
+                    && !attr::contains_name(&item.attrs, sym::path)
                 {
-                    self.check_mod_file_item_asciionly(item.ident);
+                    self.check_mod_file_item_asciionly(*ident);
                 }
+                visit::walk_item(self, item)
             }
-            ItemKind::Struct(ref vdata, ref generics) => match vdata {
-                // Duplicating the `Visitor` logic allows catching all cases
-                // of `Anonymous(Struct, Union)` outside of a field struct or union.
-                //
-                // Inside `visit_ty` the validator catches every `Anonymous(Struct, Union)` it
-                // encounters, and only on `ItemKind::Struct` and `ItemKind::Union`
-                // it uses `visit_ty_common`, which doesn't contain that specific check.
-                VariantData::Struct(ref fields, ..) => {
-                    self.visit_vis(&item.vis);
-                    self.visit_ident(item.ident);
-                    self.visit_generics(generics);
-                    self.with_banned_assoc_ty_bound(|this| {
-                        walk_list!(this, visit_struct_field_def, fields);
-                    });
-                    walk_list!(self, visit_attribute, &item.attrs);
-                    return;
-                }
-                _ => {}
-            },
-            ItemKind::Union(ref vdata, ref generics) => {
-                if vdata.fields().is_empty() {
-                    self.err_handler().span_err(item.span, "unions cannot have zero fields");
-                }
-                match vdata {
-                    VariantData::Struct(ref fields, ..) => {
-                        self.visit_vis(&item.vis);
-                        self.visit_ident(item.ident);
-                        self.visit_generics(generics);
-                        self.with_banned_assoc_ty_bound(|this| {
-                            walk_list!(this, visit_struct_field_def, fields);
-                        });
-                        walk_list!(self, visit_attribute, &item.attrs);
-                        return;
+            ItemKind::Struct(ident, generics, vdata) => {
+                self.with_tilde_const(Some(TildeConstReason::Struct { span: item.span }), |this| {
+                    // Scalable vectors can only be tuple structs
+                    let scalable_vector_attr =
+                        item.attrs.iter().find(|attr| attr.has_name(sym::rustc_scalable_vector));
+                    if let Some(attr) = scalable_vector_attr {
+                        if !matches!(vdata, VariantData::Tuple(..)) {
+                            this.dcx().emit_err(diagnostics::ScalableVectorNotTupleStruct {
+                                span: item.span,
+                            });
+                        }
+                        if !self.sess.target.arch.supports_scalable_vectors()
+                            && !self.sess.opts.actually_rustdoc
+                        {
+                            this.dcx()
+                                .emit_err(diagnostics::ScalableVectorBadArch { span: attr.span });
+                        }
                     }
-                    _ => {}
+
+                    match vdata {
+                        VariantData::Struct { fields, .. } => {
+                            this.visit_attrs_vis_ident(&item.attrs, &item.vis, ident);
+                            this.visit_generics(generics);
+                            walk_list!(this, visit_field_def, fields);
+                        }
+                        _ => visit::walk_item(this, item),
+                    }
+                })
+            }
+            ItemKind::Union(ident, generics, vdata) => {
+                if vdata.fields().is_empty() {
+                    self.dcx().emit_err(diagnostics::FieldlessUnion { span: item.span });
                 }
+                self.with_tilde_const(Some(TildeConstReason::Union { span: item.span }), |this| {
+                    match vdata {
+                        VariantData::Struct { fields, .. } => {
+                            this.visit_attrs_vis_ident(&item.attrs, &item.vis, ident);
+                            this.visit_generics(generics);
+                            walk_list!(this, visit_field_def, fields);
+                        }
+                        _ => visit::walk_item(this, item),
+                    }
+                });
             }
-            ItemKind::Const(def, .., None) => {
-                self.check_defaultness(item.span, def);
-                let msg = "free constant item without body";
-                self.error_item_without_body(item.span, "constant", msg, " = <expr>;");
+            ItemKind::Const(ConstItem { defaultness, ident, rhs_kind, .. }) => {
+                self.check_defaultness(item.span, *defaultness, AllowDefault::No, AllowFinal::No);
+                if !rhs_kind.has_expr() {
+                    self.dcx().emit_err(diagnostics::ConstWithoutBody {
+                        span: item.span,
+                        replace_span: self.ending_semi_or_hi(item.span),
+                    });
+                }
+                if ident.name == kw::Underscore
+                    && !matches!(item.vis.kind, VisibilityKind::Inherited)
+                    && ident.span.eq_ctxt(item.vis.span)
+                {
+                    self.lint_buffer.buffer_lint(
+                        UNUSED_VISIBILITIES,
+                        item.id,
+                        item.vis.span,
+                        diagnostics::UnusedVisibility { span: item.vis.span },
+                    )
+                }
+
+                visit::walk_item(self, item);
             }
-            ItemKind::Static(.., None) => {
-                let msg = "free static item without body";
-                self.error_item_without_body(item.span, "static", msg, " = <expr>;");
+            ItemKind::Static(StaticItem { expr, safety, .. }) => {
+                self.check_item_safety(item.span, *safety);
+                if matches!(safety, Safety::Unsafe(_)) {
+                    self.dcx().emit_err(diagnostics::UnsafeStatic { span: item.span });
+                }
+
+                if expr.is_none() {
+                    self.dcx().emit_err(diagnostics::StaticWithoutBody {
+                        span: item.span,
+                        replace_span: self.ending_semi_or_hi(item.span),
+                    });
+                }
+                visit::walk_item(self, item);
             }
-            ItemKind::TyAlias(box TyAlias {
-                defaultness,
-                where_clauses,
-                ref bounds,
-                ref ty,
-                ..
-            }) => {
-                self.check_defaultness(item.span, defaultness);
+            ItemKind::TyAlias(
+                ty_alias @ TyAlias { defaultness, bounds, after_where_clause, ty, .. },
+            ) => {
+                self.check_defaultness(item.span, *defaultness, AllowDefault::No, AllowFinal::No);
                 if ty.is_none() {
-                    let msg = "free type alias without body";
-                    self.error_item_without_body(item.span, "type", msg, " = <type>;");
+                    self.dcx().emit_err(diagnostics::TyAliasWithoutBody {
+                        span: item.span,
+                        replace_span: self.ending_semi_or_hi(item.span),
+                    });
                 }
                 self.check_type_no_bounds(bounds, "this context");
-                if where_clauses.1.0 {
-                    let mut err = self.err_handler().struct_span_err(
-                        where_clauses.1.1,
-                        "where clauses are not allowed after the type for type aliases",
-                    );
-                    err.note(
-                        "see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information",
-                    );
-                    err.emit();
+
+                if self.features.lazy_type_alias() {
+                    if let Err(err) = self.check_type_alias_where_clause_location(ty_alias) {
+                        self.dcx().emit_err(err);
+                    }
+                } else if after_where_clause.has_where_token {
+                    self.dcx().emit_err(diagnostics::WhereClauseAfterTypeAlias {
+                        span: after_where_clause.span,
+                        help: self.sess.is_nightly_build(),
+                    });
                 }
+                visit::walk_item(self, item);
             }
-            _ => {}
+            _ => visit::walk_item(self, item),
         }
 
-        visit::walk_item(self, item);
+        self.lint_node_id = previous_lint_node_id;
     }
 
-    fn visit_foreign_item(&mut self, fi: &'a ForeignItem) {
+    fn visit_foreign_item(&mut self, fi: &ForeignItem) {
         match &fi.kind {
-            ForeignItemKind::Fn(box Fn { defaultness, sig, body, .. }) => {
-                self.check_defaultness(fi.span, *defaultness);
-                self.check_foreign_fn_bodyless(fi.ident, body.as_deref());
-                self.check_foreign_fn_headerless(fi.ident, fi.span, sig.header);
-                self.check_foreign_item_ascii_only(fi.ident);
+            ForeignItemKind::Fn(Fn { defaultness, ident, sig, body, .. }) => {
+                self.check_defaultness(fi.span, *defaultness, AllowDefault::No, AllowFinal::No);
+                self.check_foreign_fn_bodyless(*ident, body.as_deref());
+                self.check_foreign_fn_headerless(sig.header);
+                self.check_foreign_item_ascii_only(*ident);
+                self.check_extern_fn_signature(
+                    self.extern_mod_abi.unwrap_or(ExternAbi::FALLBACK),
+                    FnCtxt::Foreign,
+                    ident,
+                    sig,
+                );
+
+                if let Some(attr) = attr::find_by_name(fi.attrs(), sym::track_caller)
+                    && self.extern_mod_abi != Some(ExternAbi::Rust)
+                {
+                    self.dcx().emit_err(diagnostics::RequiresRustAbi {
+                        track_caller_span: attr.span,
+                        extern_abi_span: self.current_extern_span(),
+                    });
+                }
             }
-            ForeignItemKind::TyAlias(box TyAlias {
+            ForeignItemKind::TyAlias(TyAlias {
                 defaultness,
+                ident,
                 generics,
-                where_clauses,
+                after_where_clause,
                 bounds,
                 ty,
                 ..
             }) => {
-                self.check_defaultness(fi.span, *defaultness);
-                self.check_foreign_kind_bodyless(fi.ident, "type", ty.as_ref().map(|b| b.span));
+                self.check_defaultness(fi.span, *defaultness, AllowDefault::No, AllowFinal::No);
+                self.check_foreign_kind_bodyless(*ident, "type", ty.as_ref().map(|b| b.span));
                 self.check_type_no_bounds(bounds, "`extern` blocks");
-                self.check_foreign_ty_genericless(generics, where_clauses.0.1);
-                self.check_foreign_item_ascii_only(fi.ident);
+                self.check_foreign_ty_genericless(generics, after_where_clause);
+                self.check_foreign_item_ascii_only(*ident);
             }
-            ForeignItemKind::Static(_, _, body) => {
-                self.check_foreign_kind_bodyless(fi.ident, "static", body.as_ref().map(|b| b.span));
-                self.check_foreign_item_ascii_only(fi.ident);
+            ForeignItemKind::Static(StaticItem { ident, safety, expr, .. }) => {
+                self.check_item_safety(fi.span, *safety);
+                self.check_foreign_kind_bodyless(*ident, "static", expr.as_ref().map(|b| b.span));
+                self.check_foreign_item_ascii_only(*ident);
             }
             ForeignItemKind::MacCall(..) => {}
         }
 
-        visit::walk_foreign_item(self, fi)
+        visit::walk_item(self, fi)
     }
 
     // Mirrors `visit::walk_generic_args`, but tracks relevant state.
-    fn visit_generic_args(&mut self, _: Span, generic_args: &'a GenericArgs) {
-        match *generic_args {
-            GenericArgs::AngleBracketed(ref data) => {
+    fn visit_generic_args(&mut self, generic_args: &GenericArgs) {
+        match generic_args {
+            GenericArgs::AngleBracketed(data) => {
                 self.check_generic_args_before_constraints(data);
 
                 for arg in &data.args {
                     match arg {
                         AngleBracketedArg::Arg(arg) => self.visit_generic_arg(arg),
-                        // Type bindings such as `Item = impl Debug` in `Iterator<Item = Debug>`
-                        // are allowed to contain nested `impl Trait`.
+                        // Associated type bindings such as `Item = impl Debug` in
+                        // `Iterator<Item = Debug>` are allowed to contain nested `impl Trait`.
                         AngleBracketedArg::Constraint(constraint) => {
                             self.with_impl_trait(None, |this| {
-                                this.visit_assoc_constraint_from_generic_args(constraint);
+                                this.visit_assoc_item_constraint(constraint);
                             });
                         }
                     }
                 }
             }
-            GenericArgs::Parenthesized(ref data) => {
+            GenericArgs::Parenthesized(data) => {
                 walk_list!(self, visit_ty, &data.inputs);
                 if let FnRetTy::Ty(ty) = &data.output {
                     // `-> Foo` syntax is essentially an associated type binding,
@@ -1400,10 +1624,11 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     self.with_impl_trait(None, |this| this.visit_ty(ty));
                 }
             }
+            GenericArgs::ParenthesizedElided(_span) => {}
         }
     }
 
-    fn visit_generics(&mut self, generics: &'a Generics) {
+    fn visit_generics(&mut self, generics: &Generics) {
         let mut prev_param_default = None;
         for param in &generics.params {
             match param.kind {
@@ -1414,31 +1639,19 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                 }
                 GenericParamKind::Type { .. } | GenericParamKind::Const { .. } => {
                     if let Some(span) = prev_param_default {
-                        let mut err = self.err_handler().struct_span_err(
-                            span,
-                            "generic parameters with a default must be trailing",
-                        );
-                        err.emit();
+                        self.dcx().emit_err(diagnostics::GenericDefaultTrailing { span });
                         break;
                     }
                 }
             }
         }
 
-        validate_generic_param_order(self.err_handler(), &generics.params, generics.span);
-
-        for predicate in &generics.where_clause.predicates {
-            if let WherePredicate::EqPredicate(ref predicate) = *predicate {
-                deny_equality_constraints(self, predicate, generics);
-            }
-        }
+        validate_generic_param_order(self.dcx(), &generics.params, generics.span);
         walk_list!(self, visit_generic_param, &generics.params);
-        for predicate in &generics.where_clause.predicates {
-            match predicate {
-                WherePredicate::BoundPredicate(bound_pred) => {
-                    // A type binding, eg `for<'c> Foo: Send+Clone+'c`
-                    self.check_late_bound_lifetime_defs(&bound_pred.bound_generic_params);
 
+        for predicate in &generics.where_clause.predicates {
+            match &predicate.kind {
+                WherePredicateKind::BoundPredicate(bound_pred) => {
                     // This is slightly complicated. Our representation for poly-trait-refs contains a single
                     // binder and thus we only allow a single level of quantification. However,
                     // the syntax of Rust permits quantification in two places in where clauses,
@@ -1447,79 +1660,87 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
                     if !bound_pred.bound_generic_params.is_empty() {
                         for bound in &bound_pred.bounds {
                             match bound {
-                                GenericBound::Trait(t, _) => {
+                                GenericBound::Trait(t) => {
                                     if !t.bound_generic_params.is_empty() {
-                                        struct_span_err!(
-                                            self.err_handler(),
-                                            t.span,
-                                            E0316,
-                                            "nested quantification of lifetimes"
-                                        )
-                                        .emit();
+                                        self.dcx().emit_err(diagnostics::NestedLifetimes {
+                                            span: t.span,
+                                        });
                                     }
                                 }
                                 GenericBound::Outlives(_) => {}
+                                GenericBound::Use(..) => {}
                             }
                         }
                     }
                 }
-                _ => {}
+                WherePredicateKind::RegionPredicate(_) => {}
             }
             self.visit_where_predicate(predicate);
         }
     }
 
-    fn visit_generic_param(&mut self, param: &'a GenericParam) {
-        if let GenericParamKind::Lifetime { .. } = param.kind {
-            self.check_lifetime(param.ident);
-        }
-        visit::walk_generic_param(self, param);
-    }
-
-    fn visit_param_bound(&mut self, bound: &'a GenericBound) {
+    fn visit_param_bound(&mut self, bound: &GenericBound, ctxt: BoundKind) {
         match bound {
-            GenericBound::Trait(_, TraitBoundModifier::MaybeConst) => {
-                if !self.is_tilde_const_allowed {
-                    self.err_handler()
-                        .struct_span_err(bound.span(), "`~const` is not allowed here")
-                        .note("only allowed on bounds on traits' associated types and functions, const fns, const impls and its associated functions")
-                        .emit();
+            GenericBound::Trait(trait_ref) => {
+                match (ctxt, trait_ref.modifiers.constness, trait_ref.modifiers.polarity) {
+                    (
+                        BoundKind::TraitObject,
+                        BoundConstness::Always(_),
+                        BoundPolarity::Positive,
+                    ) => {
+                        self.dcx()
+                            .emit_err(diagnostics::ConstBoundTraitObject { span: trait_ref.span });
+                    }
+                    (_, BoundConstness::Maybe(span), BoundPolarity::Positive)
+                        if let Some(reason) = self.disallow_tilde_const =>
+                    {
+                        self.dcx().emit_err(diagnostics::TildeConstDisallowed { span, reason });
+                    }
+                    _ => {}
+                }
+
+                // Negative trait bounds are not allowed to have associated constraints
+                if let BoundPolarity::Negative(_) = trait_ref.modifiers.polarity
+                    && let Some(segment) = trait_ref.trait_ref.path.segments.last()
+                {
+                    match segment.args.as_deref() {
+                        Some(ast::GenericArgs::AngleBracketed(args)) => {
+                            for arg in &args.args {
+                                if let ast::AngleBracketedArg::Constraint(constraint) = arg {
+                                    self.dcx().emit_err(diagnostics::ConstraintOnNegativeBound {
+                                        span: constraint.span,
+                                    });
+                                }
+                            }
+                        }
+                        // The lowered form of parenthesized generic args contains an associated type binding.
+                        Some(ast::GenericArgs::Parenthesized(args)) => {
+                            self.dcx().emit_err(
+                                diagnostics::NegativeBoundWithParentheticalNotation {
+                                    span: args.span,
+                                },
+                            );
+                        }
+                        Some(ast::GenericArgs::ParenthesizedElided(_)) | None => {}
+                    }
                 }
             }
-
-            GenericBound::Trait(_, TraitBoundModifier::MaybeConstMaybe) => {
-                self.err_handler()
-                    .span_err(bound.span(), "`~const` and `?` are mutually exclusive");
-            }
-
-            _ => {}
+            GenericBound::Outlives(_) => {}
+            GenericBound::Use(_, span) => match ctxt {
+                BoundKind::Impl => {}
+                BoundKind::Bound | BoundKind::TraitObject | BoundKind::SuperTraits => {
+                    self.dcx().emit_err(diagnostics::PreciseCapturingNotAllowedHere {
+                        loc: ctxt.descr(),
+                        span: *span,
+                    });
+                }
+            },
         }
 
         visit::walk_param_bound(self, bound)
     }
 
-    fn visit_poly_trait_ref(&mut self, t: &'a PolyTraitRef, m: &'a TraitBoundModifier) {
-        self.check_late_bound_lifetime_defs(&t.bound_generic_params);
-        visit::walk_poly_trait_ref(self, t, m);
-    }
-
-    fn visit_variant_data(&mut self, s: &'a VariantData) {
-        self.with_banned_assoc_ty_bound(|this| visit::walk_struct_def(this, s))
-    }
-
-    fn visit_enum_def(
-        &mut self,
-        enum_definition: &'a EnumDef,
-        generics: &'a Generics,
-        item_id: NodeId,
-        _: Span,
-    ) {
-        self.with_banned_assoc_ty_bound(|this| {
-            visit::walk_enum_def(this, enum_definition, generics, item_id)
-        })
-    }
-
-    fn visit_fn(&mut self, fk: FnKind<'a>, span: Span, id: NodeId) {
+    fn visit_fn(&mut self, fk: FnKind<'_>, attrs: &AttrVec, span: Span, id: NodeId) {
         // Only associated `fn`s can have `self` parameters.
         let self_semantic = match fk.ctxt() {
             Some(FnCtxt::Assoc(_)) => SelfSemantic::Yes,
@@ -1527,329 +1748,290 @@ impl<'a> Visitor<'a> for AstValidator<'a> {
         };
         self.check_fn_decl(fk.decl(), self_semantic);
 
-        self.check_c_variadic_type(fk);
+        if let Some(&FnHeader { safety, .. }) = fk.header() {
+            self.check_item_safety(span, safety);
+        }
 
-        // Functions cannot both be `const async`
-        if let Some(FnHeader {
-            constness: Const::Yes(cspan),
-            asyncness: Async::Yes { span: aspan, .. },
+        if let FnKind::Fn(ctxt, _, fun) = fk {
+            let ext = match fun.sig.header.ext {
+                Extern::None => None,
+                Extern::Implicit(span) => Some((ExternAbi::FALLBACK, span)),
+                Extern::Explicit(str_lit, span) => {
+                    ExternAbi::from_str(str_lit.symbol.as_str()).ok().map(|abi| (abi, span))
+                }
+            };
+
+            if let Some((extern_abi, extern_abi_span)) = ext {
+                // Some ABIs impose special restrictions on the signature.
+                self.check_extern_fn_signature(extern_abi, ctxt, &fun.ident, &fun.sig);
+
+                // #[track_caller] can only be used with the rust ABI.
+                if let Some(attr) = attr::find_by_name(attrs, sym::track_caller)
+                    && extern_abi != ExternAbi::Rust
+                {
+                    self.dcx().emit_err(diagnostics::RequiresRustAbi {
+                        track_caller_span: attr.span,
+                        extern_abi_span,
+                    });
+                }
+            }
+        }
+
+        self.check_c_variadic_type(fk, attrs);
+
+        // Functions cannot both be `const async` or `const gen`
+        if let Some(&FnHeader {
+            constness: Const::Yes(const_span),
+            coroutine_kind: Some(coroutine_kind),
             ..
         }) = fk.header()
         {
-            self.err_handler()
-                .struct_span_err(
-                    vec![*cspan, *aspan],
-                    "functions cannot be both `const` and `async`",
-                )
-                .span_label(*cspan, "`const` because of this")
-                .span_label(*aspan, "`async` because of this")
-                .span_label(span, "") // Point at the fn header.
-                .emit();
+            self.dcx().emit_err(diagnostics::ConstAndCoroutine {
+                spans: vec![coroutine_kind.span(), const_span],
+                const_span,
+                coroutine_span: coroutine_kind.span(),
+                coroutine_kind: coroutine_kind.as_str(),
+                span,
+            });
         }
 
         if let FnKind::Fn(
             _,
             _,
-            FnSig { span: sig_span, header: FnHeader { ext: Extern::Implicit, .. }, .. },
-            _,
-            _,
-            _,
+            Fn {
+                sig: FnSig { header: FnHeader { ext: Extern::Implicit(extern_span), .. }, .. },
+                ..
+            },
         ) = fk
         {
-            self.maybe_lint_missing_abi(*sig_span, id);
+            self.handle_missing_abi(*extern_span, id);
         }
 
         // Functions without bodies cannot have patterns.
-        if let FnKind::Fn(ctxt, _, sig, _, _, None) = fk {
+        if let FnKind::Fn(ctxt, _, Fn { body: None, sig, .. }) = fk {
             Self::check_decl_no_pat(&sig.decl, |span, ident, mut_ident| {
-                let (code, msg, label) = match ctxt {
-                    FnCtxt::Foreign => (
-                        error_code!(E0130),
-                        "patterns aren't allowed in foreign function declarations",
-                        "pattern not allowed in foreign function",
-                    ),
-                    _ => (
-                        error_code!(E0642),
-                        "patterns aren't allowed in functions without bodies",
-                        "pattern not allowed in function without body",
-                    ),
-                };
                 if mut_ident && matches!(ctxt, FnCtxt::Assoc(_)) {
                     if let Some(ident) = ident {
-                        let diag = BuiltinLintDiagnostics::PatternsInFnsWithoutBody(span, ident);
-                        self.lint_buffer.buffer_lint_with_diagnostic(
+                        let is_foreign = matches!(ctxt, FnCtxt::Foreign);
+                        self.lint_buffer.dyn_buffer_lint(
                             PATTERNS_IN_FNS_WITHOUT_BODY,
                             id,
                             span,
-                            msg,
-                            diag,
+                            move |dcx, level| {
+                                let sub = diagnostics::PatternsInFnsWithoutBodySub { ident, span };
+                                if is_foreign {
+                                    diagnostics::PatternsInFnsWithoutBody::Foreign { sub }
+                                } else {
+                                    diagnostics::PatternsInFnsWithoutBody::Bodiless { sub }
+                                }
+                                .into_diag(dcx, level)
+                            },
                         )
                     }
                 } else {
-                    self.err_handler()
-                        .struct_span_err(span, msg)
-                        .span_label(span, label)
-                        .code(code)
-                        .emit();
+                    match ctxt {
+                        FnCtxt::Foreign => {
+                            self.dcx().emit_err(diagnostics::PatternInForeign { span })
+                        }
+                        _ => self.dcx().emit_err(diagnostics::PatternInBodiless { span }),
+                    };
                 }
             });
         }
 
         let tilde_const_allowed =
-            matches!(fk.header(), Some(FnHeader { constness: Const::Yes(_), .. }))
-                || matches!(fk.ctxt(), Some(FnCtxt::Assoc(_)));
+            matches!(fk.header(), Some(FnHeader { constness: ast::Const::Yes(_), .. }))
+                || matches!(fk.ctxt(), Some(FnCtxt::Assoc(_)))
+                    && self
+                        .outer_trait_or_trait_impl
+                        .as_ref()
+                        .and_then(TraitOrImpl::constness)
+                        .is_some();
 
-        self.with_tilde_const(tilde_const_allowed, |this| visit::walk_fn(this, fk, span));
+        let disallowed = (!tilde_const_allowed).then(|| match fk {
+            FnKind::Fn(_, _, f) => TildeConstReason::Function { ident: f.ident.span },
+            FnKind::Closure(..) => TildeConstReason::Closure,
+        });
+        self.with_tilde_const(disallowed, |this| visit::walk_fn(this, fk));
     }
 
-    fn visit_assoc_item(&mut self, item: &'a AssocItem, ctxt: AssocCtxt) {
-        if self.session.contains_name(&item.attrs, sym::no_mangle) {
-            self.check_nomangle_item_asciionly(item.ident, item.span);
+    fn visit_assoc_item(&mut self, item: &AssocItem, ctxt: AssocCtxt) {
+        if let Some(ident) = item.kind.ident()
+            && attr::contains_name(&item.attrs, sym::no_mangle)
+        {
+            self.check_nomangle_item_asciionly(ident, item.span);
         }
 
-        if ctxt == AssocCtxt::Trait || !self.in_trait_impl {
-            self.check_defaultness(item.span, item.kind.defaultness());
-        }
+        let defaultness = item.kind.defaultness();
+        self.check_defaultness(
+            item.span,
+            defaultness,
+            // `default` is allowed on all associated items in impls.
+            AllowDefault::when(matches!(ctxt, AssocCtxt::Impl { .. })),
+            // `final` is allowed on all associated *functions* in traits.
+            AllowFinal::when(
+                ctxt == AssocCtxt::Trait && matches!(item.kind, AssocItemKind::Fn(..)),
+            ),
+        );
 
-        if ctxt == AssocCtxt::Impl {
+        self.check_final_has_body(item, defaultness);
+
+        if let AssocCtxt::Impl { .. } = ctxt {
             match &item.kind {
-                AssocItemKind::Const(_, _, body) => {
-                    self.check_impl_item_provided(item.span, body, "constant", " = <expr>;");
+                AssocItemKind::Const(ConstItem { rhs_kind, .. }) => {
+                    if !rhs_kind.has_expr() {
+                        self.dcx().emit_err(diagnostics::AssocConstWithoutBody {
+                            span: item.span,
+                            replace_span: self.ending_semi_or_hi(item.span),
+                        });
+                    }
                 }
-                AssocItemKind::Fn(box Fn { body, .. }) => {
-                    self.check_impl_item_provided(item.span, body, "function", " { <body> }");
+                AssocItemKind::Fn(Fn { body, .. }) => {
+                    if body.is_none() && !self.is_sdylib_interface {
+                        self.dcx().emit_err(diagnostics::AssocFnWithoutBody {
+                            span: item.span,
+                            replace_span: self.ending_semi_or_hi(item.span),
+                        });
+                    }
                 }
-                AssocItemKind::TyAlias(box TyAlias {
-                    generics,
-                    where_clauses,
-                    where_predicates_split,
-                    bounds,
-                    ty,
-                    ..
-                }) => {
-                    self.check_impl_item_provided(item.span, ty, "type", " = <type>;");
+                AssocItemKind::Type(TyAlias { bounds, ty, .. }) => {
+                    if ty.is_none() {
+                        self.dcx().emit_err(diagnostics::AssocTypeWithoutBody {
+                            span: item.span,
+                            replace_span: self.ending_semi_or_hi(item.span),
+                        });
+                    }
                     self.check_type_no_bounds(bounds, "`impl`s");
-                    if ty.is_some() {
-                        self.check_gat_where(
-                            item.id,
-                            generics.where_clause.predicates.split_at(*where_predicates_split).0,
-                            *where_clauses,
-                        );
-                    }
                 }
                 _ => {}
             }
         }
 
-        if ctxt == AssocCtxt::Trait || self.in_trait_impl {
-            self.invalid_visibility(&item.vis, None);
-            if let AssocItemKind::Fn(box Fn { sig, .. }) = &item.kind {
-                self.check_trait_fn_not_const(sig.header.constness);
-                self.check_trait_fn_not_async(item.span, sig.header.asyncness);
-            }
-        }
-
-        if let AssocItemKind::Const(..) = item.kind {
-            self.check_item_named(item.ident, "const");
-        }
-
-        match item.kind {
-            AssocItemKind::TyAlias(box TyAlias { ref generics, ref bounds, ref ty, .. })
-                if ctxt == AssocCtxt::Trait =>
-            {
-                self.visit_vis(&item.vis);
-                self.visit_ident(item.ident);
-                walk_list!(self, visit_attribute, &item.attrs);
-                self.with_tilde_const_allowed(|this| {
-                    this.visit_generics(generics);
-                    walk_list!(this, visit_param_bound, bounds);
-                });
-                walk_list!(self, visit_ty, ty);
-            }
-            AssocItemKind::Fn(box Fn { ref sig, ref generics, ref body, .. })
-                if self.in_const_trait_impl
-                    || ctxt == AssocCtxt::Trait
-                    || matches!(sig.header.constness, Const::Yes(_)) =>
-            {
-                self.visit_vis(&item.vis);
-                self.visit_ident(item.ident);
-                let kind = FnKind::Fn(
-                    FnCtxt::Assoc(ctxt),
-                    item.ident,
-                    sig,
-                    &item.vis,
-                    generics,
-                    body.as_deref(),
-                );
-                self.visit_fn(kind, item.span, item.id);
-            }
-            _ => self
-                .with_in_trait_impl(false, None, |this| visit::walk_assoc_item(this, item, ctxt)),
-        }
-    }
-}
-
-/// When encountering an equality constraint in a `where` clause, emit an error. If the code seems
-/// like it's setting an associated type, provide an appropriate suggestion.
-fn deny_equality_constraints(
-    this: &mut AstValidator<'_>,
-    predicate: &WhereEqPredicate,
-    generics: &Generics,
-) {
-    let mut err = this.err_handler().struct_span_err(
-        predicate.span,
-        "equality constraints are not yet supported in `where` clauses",
-    );
-    err.span_label(predicate.span, "not supported");
-
-    // Given `<A as Foo>::Bar = RhsTy`, suggest `A: Foo<Bar = RhsTy>`.
-    if let TyKind::Path(Some(qself), full_path) = &predicate.lhs_ty.kind {
-        if let TyKind::Path(None, path) = &qself.ty.kind {
-            match &path.segments[..] {
-                [PathSegment { ident, args: None, .. }] => {
-                    for param in &generics.params {
-                        if param.ident == *ident {
-                            let param = ident;
-                            match &full_path.segments[qself.position..] {
-                                [PathSegment { ident, args, .. }] => {
-                                    // Make a new `Path` from `foo::Bar` to `Foo<Bar = RhsTy>`.
-                                    let mut assoc_path = full_path.clone();
-                                    // Remove `Bar` from `Foo::Bar`.
-                                    assoc_path.segments.pop();
-                                    let len = assoc_path.segments.len() - 1;
-                                    let gen_args = args.as_ref().map(|p| (**p).clone());
-                                    // Build `<Bar = RhsTy>`.
-                                    let arg = AngleBracketedArg::Constraint(AssocConstraint {
-                                        id: rustc_ast::node_id::DUMMY_NODE_ID,
-                                        ident: *ident,
-                                        gen_args,
-                                        kind: AssocConstraintKind::Equality {
-                                            term: predicate.rhs_ty.clone().into(),
-                                        },
-                                        span: ident.span,
-                                    });
-                                    // Add `<Bar = RhsTy>` to `Foo`.
-                                    match &mut assoc_path.segments[len].args {
-                                        Some(args) => match args.deref_mut() {
-                                            GenericArgs::Parenthesized(_) => continue,
-                                            GenericArgs::AngleBracketed(args) => {
-                                                args.args.push(arg);
-                                            }
-                                        },
-                                        empty_args => {
-                                            *empty_args = AngleBracketedArgs {
-                                                span: ident.span,
-                                                args: vec![arg],
-                                            }
-                                            .into();
-                                        }
-                                    }
-                                    err.span_suggestion_verbose(
-                                        predicate.span,
-                                        &format!(
-                                            "if `{}` is an associated type you're trying to set, \
-                                            use the associated type binding syntax",
-                                            ident
-                                        ),
-                                        format!(
-                                            "{}: {}",
-                                            param,
-                                            pprust::path_to_string(&assoc_path)
-                                        ),
-                                        Applicability::MaybeIncorrect,
-                                    );
-                                }
-                                _ => {}
-                            };
-                        }
-                    }
+        if let AssocItemKind::Type(ty_alias) = &item.kind
+            && let Err(err) = self.check_type_alias_where_clause_location(ty_alias)
+        {
+            let sugg = match err.sugg {
+                diagnostics::WhereClauseBeforeTypeAliasSugg::Remove { .. } => None,
+                diagnostics::WhereClauseBeforeTypeAliasSugg::Move { snippet, right, .. } => {
+                    Some((right, snippet))
                 }
-                _ => {}
-            }
-        }
-    }
-    // Given `A: Foo, A::Bar = RhsTy`, suggest `A: Foo<Bar = RhsTy>`.
-    if let TyKind::Path(None, full_path) = &predicate.lhs_ty.kind {
-        if let [potential_param, potential_assoc] = &full_path.segments[..] {
-            for param in &generics.params {
-                if param.ident == potential_param.ident {
-                    for bound in &param.bounds {
-                        if let ast::GenericBound::Trait(trait_ref, TraitBoundModifier::None) = bound
-                        {
-                            if let [trait_segment] = &trait_ref.trait_ref.path.segments[..] {
-                                let assoc = pprust::path_to_string(&ast::Path::from_ident(
-                                    potential_assoc.ident,
-                                ));
-                                let ty = pprust::ty_to_string(&predicate.rhs_ty);
-                                let (args, span) = match &trait_segment.args {
-                                    Some(args) => match args.deref() {
-                                        ast::GenericArgs::AngleBracketed(args) => {
-                                            let Some(arg) = args.args.last() else {
-                                                continue;
-                                            };
-                                            (
-                                                format!(", {} = {}", assoc, ty),
-                                                arg.span().shrink_to_hi(),
-                                            )
-                                        }
-                                        _ => continue,
-                                    },
-                                    None => (
-                                        format!("<{} = {}>", assoc, ty),
-                                        trait_segment.span().shrink_to_hi(),
-                                    ),
-                                };
-                                err.multipart_suggestion(
-                                    &format!(
-                                        "if `{}::{}` is an associated type you're trying to set, \
-                                        use the associated type binding syntax",
-                                        trait_segment.ident, potential_assoc.ident,
-                                    ),
-                                    vec![(span, args), (predicate.span, String::new())],
-                                    Applicability::MaybeIncorrect,
-                                );
+            };
+            let left_sp = self
+                .sess
+                .source_map()
+                .span_extend_prev_while(err.span, char::is_whitespace)
+                .unwrap_or(err.span);
+            self.lint_buffer.dyn_buffer_lint(
+                DEPRECATED_WHERE_CLAUSE_LOCATION,
+                item.id,
+                err.span,
+                move |dcx, level| {
+                    let suggestion = match sugg {
+                        Some((right_sp, sugg)) => {
+                            diagnostics::DeprecatedWhereClauseLocationSugg::MoveToEnd {
+                                left: left_sp,
+                                right: right_sp,
+                                sugg,
                             }
                         }
-                    }
+                        None => diagnostics::DeprecatedWhereClauseLocationSugg::RemoveWhere {
+                            span: err.span,
+                        },
+                    };
+                    diagnostics::DeprecatedWhereClauseLocation { suggestion }.into_diag(dcx, level)
+                },
+            );
+        }
+
+        match &self.outer_trait_or_trait_impl {
+            Some(parent @ (TraitOrImpl::Trait { .. } | TraitOrImpl::TraitImpl { .. })) => {
+                self.visibility_not_permitted(
+                    &item.vis,
+                    diagnostics::VisibilityNotPermittedNote::TraitImpl,
+                );
+                if let AssocItemKind::Fn(Fn { sig, .. }) = &item.kind {
+                    self.check_trait_fn_not_const(sig.header.constness, parent);
+                    self.check_async_fn_in_const_trait_or_impl(sig, parent);
                 }
             }
+            Some(parent @ TraitOrImpl::Impl { constness }) => {
+                if let AssocItemKind::Fn(Fn { sig, .. }) = &item.kind {
+                    self.check_impl_fn_not_const(sig.header.constness, *constness);
+                    self.check_async_fn_in_const_trait_or_impl(sig, parent);
+                }
+            }
+            None => {}
+        }
+
+        if let AssocItemKind::Const(ci) = &item.kind {
+            self.check_item_named(ci.ident, "const");
+        }
+
+        let parent_is_const =
+            self.outer_trait_or_trait_impl.as_ref().and_then(TraitOrImpl::constness).is_some();
+
+        match &item.kind {
+            AssocItemKind::Fn(func)
+                if parent_is_const
+                    || ctxt == AssocCtxt::Trait
+                    || matches!(func.sig.header.constness, Const::Yes(_)) =>
+            {
+                self.visit_attrs_vis_ident(&item.attrs, &item.vis, &func.ident);
+                let kind = FnKind::Fn(FnCtxt::Assoc(ctxt), &item.vis, &*func);
+                self.visit_fn(kind, &item.attrs, item.span, item.id);
+            }
+            AssocItemKind::Type(_) => {
+                let disallowed = (!parent_is_const).then(|| match self.outer_trait_or_trait_impl {
+                    Some(TraitOrImpl::Trait { .. }) => {
+                        TildeConstReason::TraitAssocTy { span: item.span }
+                    }
+                    Some(TraitOrImpl::TraitImpl { .. }) => {
+                        TildeConstReason::TraitImplAssocTy { span: item.span }
+                    }
+                    Some(TraitOrImpl::Impl { .. }) | None => {
+                        TildeConstReason::InherentAssocTy { span: item.span }
+                    }
+                });
+                self.with_tilde_const(disallowed, |this| {
+                    this.with_in_trait_or_impl(None, |this| {
+                        visit::walk_assoc_item(this, item, ctxt)
+                    })
+                })
+            }
+            _ => self.with_in_trait_or_impl(None, |this| visit::walk_assoc_item(this, item, ctxt)),
         }
     }
-    err.note(
-        "see issue #20041 <https://github.com/rust-lang/rust/issues/20041> for more information",
-    );
-    err.emit();
+
+    fn visit_anon_const(&mut self, anon_const: &AnonConst) {
+        self.with_tilde_const(
+            Some(TildeConstReason::AnonConst { span: anon_const.value.span }),
+            |this| visit::walk_anon_const(this, anon_const),
+        )
+    }
 }
 
-pub fn check_crate(session: &Session, krate: &Crate, lints: &mut LintBuffer) -> bool {
+pub fn check_crate(
+    sess: &Session,
+    features: &Features,
+    krate: &Crate,
+    is_sdylib_interface: bool,
+    lints: &mut LintBuffer,
+) -> bool {
     let mut validator = AstValidator {
-        session,
-        extern_mod: None,
-        in_trait_impl: false,
-        in_const_trait_impl: false,
+        sess,
+        features,
+        extern_mod_span: None,
+        outer_trait_or_trait_impl: None,
         has_proc_macro_decls: false,
-        outer_impl_trait: None,
-        is_tilde_const_allowed: false,
-        is_impl_trait_banned: false,
-        is_assoc_ty_bound_banned: false,
-        forbidden_let_reason: Some(ForbiddenLetReason::GenericForbidden),
+        outer_impl_trait_span: None,
+        disallow_tilde_const: Some(TildeConstReason::Item),
+        extern_mod_safety: None,
+        extern_mod_abi: None,
+        lint_node_id: CRATE_NODE_ID,
+        is_sdylib_interface,
         lint_buffer: lints,
     };
     visit::walk_crate(&mut validator, krate);
 
     validator.has_proc_macro_decls
-}
-
-/// Used to forbid `let` expressions in certain syntactic locations.
-#[derive(Clone, Copy)]
-enum ForbiddenLetReason {
-    /// `let` is not valid and the source environment is not important
-    GenericForbidden,
-    /// A let chain with the `||` operator
-    NotSupportedOr(Span),
-    /// A let chain with invalid parentheses
-    ///
-    /// For exemple, `let 1 = 1 && (expr && expr)` is allowed
-    /// but `(let 1 = 1 && (let 1 = 1 && (let 1 = 1))) && let a = 1` is not
-    NotSupportedParentheses(Span),
 }

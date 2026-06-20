@@ -1,120 +1,208 @@
+use rustc_ast::{ExprKind, ItemKind, MetaItem, PatKind, Safety, ast};
+use rustc_expand::base::{Annotatable, ExtCtxt};
+use rustc_span::{Ident, Span, sym};
+use thin_vec::{ThinVec, thin_vec};
+
 use crate::deriving::generic::ty::*;
 use crate::deriving::generic::*;
 use crate::deriving::{path_std, pathvec_std};
 
-use rustc_ast::ptr::P;
-use rustc_ast::{Expr, MetaItem};
-use rustc_expand::base::{Annotatable, ExtCtxt};
-use rustc_span::symbol::{sym, Ident};
-use rustc_span::Span;
-
-pub fn expand_deriving_partial_ord(
-    cx: &mut ExtCtxt<'_>,
+pub(crate) fn expand_deriving_partial_ord(
+    cx: &ExtCtxt<'_>,
     span: Span,
     mitem: &MetaItem,
     item: &Annotatable,
     push: &mut dyn FnMut(Annotatable),
+    is_const: bool,
 ) {
-    let ordering_ty = Literal(path_std!(cmp::Ordering));
-    let ret_ty = Literal(Path::new_(
-        pathvec_std!(option::Option),
-        None,
-        vec![Box::new(ordering_ty)],
-        PathKind::Std,
-    ));
+    let ordering_ty = Path(path_std!(cmp::Ordering));
+    let ret_ty =
+        Path(Path::new_(pathvec_std!(option::Option), vec![Box::new(ordering_ty)], PathKind::Std));
 
-    let inline = cx.meta_word(span, sym::inline);
-    let attrs = vec![cx.attribute(inline)];
+    // Order in which to perform matching
+    let discr_then_data = if let Annotatable::Item(item) = item
+        && let ItemKind::Enum(_, _, def) = &item.kind
+    {
+        let dataful: Vec<bool> = def.variants.iter().map(|v| !v.data.fields().is_empty()).collect();
+        match dataful.iter().filter(|&&b| b).count() {
+            // No data, placing the discriminant check first makes codegen simpler
+            0 => true,
+            1..=2 => false,
+            _ => (0..dataful.len() - 1).any(|i| {
+                if dataful[i]
+                    && let Some(idx) = dataful[i + 1..].iter().position(|v| *v)
+                {
+                    idx >= 2
+                } else {
+                    false
+                }
+            }),
+        }
+    } else {
+        true
+    };
+
+    let container_id = cx.current_expansion.id.expn_data().parent.expect_local();
+    let has_derive_ord = cx.resolver.has_derive_ord(container_id);
+    let is_simple_candidate = |params: &ThinVec<ast::GenericParam>| -> bool {
+        has_derive_ord
+            && !params.iter().any(|param| matches!(param.kind, ast::GenericParamKind::Type { .. }))
+    };
+
+    let default_substructure = combine_substructure(Box::new(|cx, span, substr| {
+        cs_partial_cmp(cx, span, substr, discr_then_data)
+    }));
+    let simple_substructure = combine_substructure(Box::new(|cx, span, _| {
+        cs_partial_cmp_simple(cx, span, cx.expr_ident(span, Ident::new(sym::other, span)))
+    }));
+    let (is_simple, substructure) = match item {
+        Annotatable::Item(annitem) => match &annitem.kind {
+            // For unit structs/zero-variant enums, the default generated code is better.
+            ItemKind::Struct(.., ast::VariantData::Unit(..)) => (false, default_substructure),
+            // Also for single fieldless variant enum
+            ItemKind::Enum(.., enum_def) if enum_def.variants.is_empty() => {
+                (false, default_substructure)
+            }
+            ItemKind::Enum(.., enum_def)
+                if enum_def.variants.len() == 1
+                    && matches!(enum_def.variants[0].data, ast::VariantData::Unit(..)) =>
+            {
+                (false, default_substructure)
+            }
+            ItemKind::Struct(_, ast::Generics { params, .. }, _)
+            | ItemKind::Enum(_, ast::Generics { params, .. }, _)
+                if is_simple_candidate(params) =>
+            {
+                (true, simple_substructure)
+            }
+            _ => (false, default_substructure),
+        },
+        _ => (false, default_substructure),
+    };
 
     let partial_cmp_def = MethodDef {
         name: sym::partial_cmp,
         generics: Bounds::empty(),
-        explicit_self: borrowed_explicit_self(),
-        args: vec![(borrowed_self(), sym::other)],
+        explicit_self: true,
+        nonself_args: vec![(self_ref(), sym::other)],
         ret_ty,
-        attributes: attrs,
-        is_unsafe: false,
-        unify_fieldless_variants: true,
-        combine_substructure: combine_substructure(Box::new(|cx, span, substr| {
-            cs_partial_cmp(cx, span, substr)
-        })),
+        attributes: thin_vec![cx.attr_word(sym::inline, span)],
+        fieldless_variants_strategy: FieldlessVariantsStrategy::Unify,
+        combine_substructure: substructure,
     };
 
     let trait_def = TraitDef {
         span,
-        attributes: vec![],
         path: path_std!(cmp::PartialOrd),
+        skip_path_as_bound: false,
+        needs_copy_as_bound_if_packed: true,
         additional_bounds: vec![],
-        generics: Bounds::empty(),
-        is_unsafe: false,
         supports_unions: false,
         methods: vec![partial_cmp_def],
         associated_types: Vec::new(),
+        is_const,
+        is_staged_api_crate: cx.ecfg.features.staged_api(),
+        safety: Safety::Default,
+        document: true,
     };
-    trait_def.expand(cx, mitem, item, push)
+    trait_def.expand_ext(cx, mitem, item, push, is_simple)
 }
 
-pub fn cs_partial_cmp(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> P<Expr> {
-    let test_id = Ident::new(sym::cmp, span);
-    let ordering = cx.path_global(span, cx.std_path(&[sym::cmp, sym::Ordering, sym::Equal]));
-    let ordering_expr = cx.expr_path(ordering.clone());
-    let equals_expr = cx.expr_some(span, ordering_expr);
+// Special case for the type deriving both `PartialOrd` and `Ord`. Builds:
+// ```
+// Some(::core::cmp::Ord::cmp(self, other))
+// ```
+fn cs_partial_cmp_simple(cx: &ExtCtxt<'_>, span: Span, other_expr: Box<ast::Expr>) -> BlockOrExpr {
+    let ord_cmp_path = cx.std_path(&[sym::cmp, sym::Ord, sym::cmp]);
+    let cmp_expr =
+        cx.expr_call_global(span, ord_cmp_path, thin_vec![cx.expr_self(span), other_expr]);
+    BlockOrExpr::new_expr(cx.expr_some(span, cmp_expr))
+}
 
+fn cs_partial_cmp(
+    cx: &ExtCtxt<'_>,
+    span: Span,
+    substr: &Substructure<'_>,
+    discr_then_data: bool,
+) -> BlockOrExpr {
+    let test_id = Ident::new(sym::cmp, span);
+    let equal_path = cx.path_global(span, cx.std_path(&[sym::cmp, sym::Ordering, sym::Equal]));
     let partial_cmp_path = cx.std_path(&[sym::cmp, sym::PartialOrd, sym::partial_cmp]);
 
     // Builds:
     //
-    // match ::std::cmp::PartialOrd::partial_cmp(&self_field1, &other_field1) {
-    // ::std::option::Option::Some(::std::cmp::Ordering::Equal) =>
-    // match ::std::cmp::PartialOrd::partial_cmp(&self_field2, &other_field2) {
-    // ::std::option::Option::Some(::std::cmp::Ordering::Equal) => {
-    // ...
+    // match ::core::cmp::PartialOrd::partial_cmp(&self.x, &other.x) {
+    //     ::core::option::Option::Some(::core::cmp::Ordering::Equal) =>
+    //         ::core::cmp::PartialOrd::partial_cmp(&self.y, &other.y),
+    //     cmp => cmp,
     // }
-    // cmp => cmp
-    // },
-    // cmp => cmp
-    // }
-    //
-    cs_fold(
+    let expr = cs_fold(
         // foldr nests the if-elses correctly, leaving the first field
         // as the outermost one, and the last as the innermost.
         false,
-        |cx, span, old, self_f, other_fs| {
-            // match new {
-            //     Some(::std::cmp::Ordering::Equal) => old,
-            //     cmp => cmp
-            // }
-
-            let new = {
-                let [other_f] = other_fs else {
-                    cx.span_bug(span, "not exactly 2 arguments in `derive(PartialOrd)`");
-                };
-
-                let args =
-                    vec![cx.expr_addr_of(span, self_f), cx.expr_addr_of(span, other_f.clone())];
-
-                cx.expr_call_global(span, partial_cmp_path.clone(), args)
-            };
-
-            let eq_arm = cx.arm(span, cx.pat_some(span, cx.pat_path(span, ordering.clone())), old);
-            let neq_arm = cx.arm(span, cx.pat_ident(span, test_id), cx.expr_ident(span, test_id));
-
-            cx.expr_match(span, new, vec![eq_arm, neq_arm])
-        },
-        equals_expr,
-        Box::new(|cx, span, (self_args, tag_tuple), _non_self_args| {
-            if self_args.len() != 2 {
-                cx.span_bug(span, "not exactly 2 arguments in `derive(PartialOrd)`")
-            } else {
-                let lft = cx.expr_addr_of(span, cx.expr_ident(span, tag_tuple[0]));
-                let rgt = cx.expr_addr_of(span, cx.expr_ident(span, tag_tuple[1]));
-                let fn_partial_cmp_path =
-                    cx.std_path(&[sym::cmp, sym::PartialOrd, sym::partial_cmp]);
-                cx.expr_call_global(span, fn_partial_cmp_path, vec![lft, rgt])
-            }
-        }),
         cx,
         span,
         substr,
-    )
+        |cx, fold| match fold {
+            CsFold::Single(field) => {
+                let [other_expr] = &field.other_selflike_exprs[..] else {
+                    cx.dcx()
+                        .span_bug(field.span, "not exactly 2 arguments in `derive(PartialOrd)`");
+                };
+                let args = thin_vec![field.self_expr.clone(), other_expr.clone()];
+                cx.expr_call_global(field.span, partial_cmp_path.clone(), args)
+            }
+            CsFold::Combine(span, mut expr1, expr2) => {
+                // When the item is an enum, this expands to
+                // ```
+                // match (expr2) {
+                //     Some(Ordering::Equal) => expr1,
+                //     cmp => cmp
+                // }
+                // ```
+                // where `expr2` is `partial_cmp(self_discr, other_discr)`, and `expr1` is a `match`
+                // against the enum variants. This means that we begin by comparing the enum discriminants,
+                // before either inspecting their contents (if they match), or returning
+                // the `cmp::Ordering` of comparing the enum discriminants.
+                // ```
+                // match partial_cmp(self_discr, other_discr) {
+                //     Some(Ordering::Equal) => match (self, other)  {
+                //         (Self::A(self_0), Self::A(other_0)) => partial_cmp(self_0, other_0),
+                //         (Self::B(self_0), Self::B(other_0)) => partial_cmp(self_0, other_0),
+                //         _ => Some(Ordering::Equal)
+                //     }
+                //     cmp => cmp
+                // }
+                // ```
+                // If we have any certain enum layouts, flipping this results in better codegen
+                // ```
+                // match (self, other) {
+                //     (Self::A(self_0), Self::A(other_0)) => partial_cmp(self_0, other_0),
+                //     _ => partial_cmp(self_discr, other_discr)
+                // }
+                // ```
+                // Reference: https://github.com/rust-lang/rust/pull/103659#issuecomment-1328126354
+
+                if !discr_then_data
+                    && let ExprKind::Match(_, arms, _) = &mut expr1.kind
+                    && let Some(last) = arms.last_mut()
+                    && let PatKind::Wild = last.pat.kind
+                {
+                    last.body = Some(expr2);
+                    expr1
+                } else {
+                    let eq_arm = cx.arm(
+                        span,
+                        cx.pat_some(span, cx.pat_path(span, equal_path.clone())),
+                        expr1,
+                    );
+                    let neq_arm =
+                        cx.arm(span, cx.pat_ident(span, test_id), cx.expr_ident(span, test_id));
+                    cx.expr_match(span, expr2, thin_vec![eq_arm, neq_arm])
+                }
+            }
+            CsFold::Fieldless => cx.expr_some(span, cx.expr_path(equal_path.clone())),
+        },
+    );
+    BlockOrExpr::new_expr(expr)
 }

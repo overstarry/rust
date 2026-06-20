@@ -1,11 +1,10 @@
-// compile-flags: -Clink-arg=-nostartfiles
-// ignore-macos
-// ignore-windows
+//@ check-pass
+//@compile-flags: -Clink-arg=-nostartfiles
+//@ignore-target: windows
 
-#![feature(lang_items, start, libc)]
+#![crate_type = "lib"]
 #![no_std]
-#![allow(clippy::if_same_then_else)]
-#![allow(clippy::redundant_pattern_matching)]
+#![expect(clippy::needless_else, clippy::redundant_pattern_matching)]
 
 use core::panic::PanicInfo;
 
@@ -15,18 +14,9 @@ impl Drop for S {
     fn drop(&mut self) {}
 }
 
-#[start]
-fn main(argc: isize, argv: *const *const u8) -> isize {
+pub fn main(argc: isize, argv: *const *const u8) -> isize {
     if let Some(_) = Some(S) {
     } else {
     }
     0
 }
-
-#[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    loop {}
-}
-
-#[lang = "eh_personality"]
-extern "C" fn eh_personality() {}

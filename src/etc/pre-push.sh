@@ -1,25 +1,43 @@
 #!/usr/bin/env bash
 #
-# Call `tidy --bless` before git push
+# Call `tidy` before git push
 # Copy this script to .git/hooks to activate,
 # and remove it from .git/hooks to deactivate.
 #
 
-set -Eeuo pipefail
+set -Euo pipefail
 
-# https://github.com/rust-lang/rust/issues/77620#issuecomment-705144570
-unset GIT_DIR
-ROOT_DIR="$(git rev-parse --show-toplevel)"
-COMMAND="$ROOT_DIR/x.py test tidy --bless"
+# Check if the push is doing anything other than deleting remote branches
+SKIP=true
+while read LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+    if [[ "$LOCAL_REF" != "(delete)" || \
+          "$LOCAL_SHA" != "0000000000000000000000000000000000000000" ]]; then
+        SKIP=false
+    fi
+done
 
-if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
-  COMMAND="python $COMMAND"
-elif ! command -v python &> /dev/null; then
-  COMMAND="python3 $COMMAND"
+if $SKIP; then
+    echo "Skipping tidy check for branch deletion"
+    exit 0
 fi
 
-echo "Running pre-push script '$COMMAND'"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "error: working tree is dirty, refusing to push"
+    echo "       commit, stash, or discard changes first."
+    echo "You may use \`git push --no-verify\` to skip this check."
+    exit 1
+fi
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+
+echo "Running pre-push script $ROOT_DIR/x test tidy"
 
 cd "$ROOT_DIR"
-
-$COMMAND
+# The env var is necessary for printing diffs in py (fmt/lint) and cpp.
+TIDY_PRINT_DIFF=1 ./x test tidy \
+    --set build.locked-deps=true \
+    --extra-checks auto:py,auto:cpp,auto:js
+if [ $? -ne 0 ]; then
+    echo "You may use \`git push --no-verify\` to skip this check."
+    exit 1
+fi

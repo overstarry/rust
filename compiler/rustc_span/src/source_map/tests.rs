@@ -1,12 +1,14 @@
 use super::*;
 
-use rustc_data_structures::sync::Lrc;
+fn filename(sm: &SourceMap, path: &str) -> FileName {
+    FileName::Real(sm.path_mapping().to_real_filename(sm.working_dir(), PathBuf::from(path)))
+}
 
 fn init_source_map() -> SourceMap {
     let sm = SourceMap::new(FilePathMapping::empty());
-    sm.new_source_file(PathBuf::from("blork.rs").into(), "first line.\nsecond line".to_string());
-    sm.new_source_file(PathBuf::from("empty.rs").into(), String::new());
-    sm.new_source_file(PathBuf::from("blork2.rs").into(), "first line.\nsecond line".to_string());
+    sm.new_source_file(filename(&sm, "blork.rs"), "first line.\nsecond line".to_string());
+    sm.new_source_file(filename(&sm, "empty.rs"), String::new());
+    sm.new_source_file(filename(&sm, "blork2.rs"), "first line.\nsecond line".to_string());
     sm
 }
 
@@ -20,7 +22,7 @@ impl SourceMap {
     ///    * the LHS span must start at or before the RHS span.
     fn merge_spans(&self, sp_lhs: Span, sp_rhs: Span) -> Option<Span> {
         // Ensure we're at the same expansion ID.
-        if sp_lhs.ctxt() != sp_rhs.ctxt() {
+        if !sp_lhs.eq_ctxt(sp_rhs) {
             return None;
         }
 
@@ -50,6 +52,7 @@ impl SourceMap {
     fn bytepos_to_file_charpos(&self, bpos: BytePos) -> CharPos {
         let idx = self.lookup_source_file_idx(bpos);
         let sf = &(*self.files.borrow().source_files)[idx];
+        let bpos = sf.relative_position(bpos);
         sf.bytepos_to_file_charpos(bpos)
     }
 }
@@ -60,15 +63,15 @@ fn t3() {
     let sm = init_source_map();
 
     let srcfbp1 = sm.lookup_byte_offset(BytePos(23));
-    assert_eq!(srcfbp1.sf.name, PathBuf::from("blork.rs").into());
+    assert_eq!(srcfbp1.sf.name, filename(&sm, "blork.rs"));
     assert_eq!(srcfbp1.pos, BytePos(23));
 
     let srcfbp1 = sm.lookup_byte_offset(BytePos(24));
-    assert_eq!(srcfbp1.sf.name, PathBuf::from("empty.rs").into());
+    assert_eq!(srcfbp1.sf.name, filename(&sm, "empty.rs"));
     assert_eq!(srcfbp1.pos, BytePos(0));
 
     let srcfbp2 = sm.lookup_byte_offset(BytePos(25));
-    assert_eq!(srcfbp2.sf.name, PathBuf::from("blork2.rs").into());
+    assert_eq!(srcfbp2.sf.name, filename(&sm, "blork2.rs"));
     assert_eq!(srcfbp2.pos, BytePos(0));
 }
 
@@ -90,12 +93,12 @@ fn t5() {
     let sm = init_source_map();
 
     let loc1 = sm.lookup_char_pos(BytePos(22));
-    assert_eq!(loc1.file.name, PathBuf::from("blork.rs").into());
+    assert_eq!(loc1.file.name, filename(&sm, "blork.rs"));
     assert_eq!(loc1.line, 2);
     assert_eq!(loc1.col, CharPos(10));
 
     let loc2 = sm.lookup_char_pos(BytePos(25));
-    assert_eq!(loc2.file.name, PathBuf::from("blork2.rs").into());
+    assert_eq!(loc2.file.name, filename(&sm, "blork2.rs"));
     assert_eq!(loc2.line, 1);
     assert_eq!(loc2.col, CharPos(0));
 }
@@ -103,14 +106,8 @@ fn t5() {
 fn init_source_map_mbc() -> SourceMap {
     let sm = SourceMap::new(FilePathMapping::empty());
     // "€" is a three-byte UTF8 char.
-    sm.new_source_file(
-        PathBuf::from("blork.rs").into(),
-        "fir€st €€€€ line.\nsecond line".to_string(),
-    );
-    sm.new_source_file(
-        PathBuf::from("blork2.rs").into(),
-        "first line€€.\n€ second line".to_string(),
-    );
+    sm.new_source_file(filename(&sm, "blork.rs"), "fir€st €€€€ line.\nsecond line".to_string());
+    sm.new_source_file(filename(&sm, "blork2.rs"), "first line€€.\n€ second line".to_string());
     sm
 }
 
@@ -139,7 +136,7 @@ fn t7() {
     let span = Span::with_root_ctxt(BytePos(12), BytePos(23));
     let file_lines = sm.span_to_lines(span).unwrap();
 
-    assert_eq!(file_lines.file.name, PathBuf::from("blork.rs").into());
+    assert_eq!(file_lines.file.name, filename(&sm, "blork.rs"));
     assert_eq!(file_lines.lines.len(), 1);
     assert_eq!(file_lines.lines[0].line_index, 1);
 }
@@ -162,7 +159,7 @@ fn span_to_snippet_and_lines_spanning_multiple_lines() {
     let sm = SourceMap::new(FilePathMapping::empty());
     let inputtext = "aaaaa\nbbbbBB\nCCC\nDDDDDddddd\neee\n";
     let selection = "     \n    ~~\n~~~\n~~~~~     \n   \n";
-    sm.new_source_file(Path::new("blork.rs").to_owned().into(), inputtext.to_string());
+    sm.new_source_file(filename(&sm, "blork.rs"), inputtext.to_string());
     let span = span_from_selection(inputtext, selection);
 
     // Check that we are extracting the text we thought we were extracting.
@@ -205,7 +202,7 @@ fn span_merging_fail() {
     let inputtext = "bbbb BB\ncc CCC\n";
     let selection1 = "     ~~\n      \n";
     let selection2 = "       \n   ~~~\n";
-    sm.new_source_file(Path::new("blork.rs").to_owned().into(), inputtext.to_owned());
+    sm.new_source_file(filename(&sm, "blork.rs"), inputtext.to_owned());
     let span1 = span_from_selection(inputtext, selection1);
     let span2 = span_from_selection(inputtext, selection2);
 
@@ -219,7 +216,7 @@ fn t10() {
     let unnormalized = "first line.\r\nsecond line";
     let normalized = "first line.\nsecond line";
 
-    let src_file = sm.new_source_file(PathBuf::from("blork.rs").into(), unnormalized.to_string());
+    let src_file = sm.new_source_file(filename(&sm, "blork.rs"), unnormalized.to_string());
 
     assert_eq!(src_file.src.as_ref().unwrap().as_ref(), normalized);
     assert!(
@@ -230,28 +227,28 @@ fn t10() {
     let SourceFile {
         name,
         src_hash,
-        start_pos,
-        end_pos,
+        checksum_hash,
+        normalized_source_len,
+        unnormalized_source_len,
         lines,
         multibyte_chars,
-        non_narrow_chars,
         normalized_pos,
-        name_hash,
+        stable_id,
         ..
     } = (*src_file).clone();
 
     let imported_src_file = sm.new_imported_source_file(
         name,
         src_hash,
-        name_hash,
-        (end_pos - start_pos).to_usize(),
-        CrateNum::new(0),
-        lines,
+        checksum_hash,
+        stable_id,
+        normalized_source_len.to_u32(),
+        unnormalized_source_len,
+        CrateNum::ZERO,
+        FreezeLock::new(lines.read().clone()),
         multibyte_chars,
-        non_narrow_chars,
         normalized_pos,
-        start_pos,
-        end_pos,
+        0,
     );
 
     assert!(
@@ -260,55 +257,543 @@ fn t10() {
     );
     imported_src_file.add_external_src(|| Some(unnormalized.to_string()));
     assert_eq!(
-        imported_src_file.external_src.borrow().get_source().unwrap().as_ref(),
+        imported_src_file.external_src.borrow().get_source().unwrap(),
         normalized,
         "imported source file should be normalized"
     );
 }
 
-/// Returns the span corresponding to the `n`th occurrence of `substring` in `source_text`.
-trait SourceMapExtension {
-    fn span_substr(
-        &self,
-        file: &Lrc<SourceFile>,
-        source_text: &str,
-        substring: &str,
-        n: usize,
-    ) -> Span;
+// Takes a unix-style path and returns a platform specific path.
+fn path(p: &str) -> PathBuf {
+    path_str(p).into()
 }
 
-impl SourceMapExtension for SourceMap {
-    fn span_substr(
-        &self,
-        file: &Lrc<SourceFile>,
-        source_text: &str,
-        substring: &str,
-        n: usize,
-    ) -> Span {
-        eprintln!(
-            "span_substr(file={:?}/{:?}, substring={:?}, n={})",
-            file.name, file.start_pos, substring, n
-        );
-        let mut i = 0;
-        let mut hi = 0;
-        loop {
-            let offset = source_text[hi..].find(substring).unwrap_or_else(|| {
-                panic!(
-                    "source_text `{}` does not have {} occurrences of `{}`, only {}",
-                    source_text, n, substring, i
-                );
-            });
-            let lo = hi + offset;
-            hi = lo + substring.len();
-            if i == n {
-                let span = Span::with_root_ctxt(
-                    BytePos(lo as u32 + file.start_pos.0),
-                    BytePos(hi as u32 + file.start_pos.0),
-                );
-                assert_eq!(&self.span_to_snippet(span).unwrap()[..], substring);
-                return span;
-            }
-            i += 1;
-        }
+// Takes a unix-style path and returns a platform specific path.
+fn path_str(p: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        return p.into();
     }
+
+    #[cfg(windows)]
+    {
+        let mut path = p.replace('/', "\\");
+        if let Some(rest) = path.strip_prefix('\\') {
+            path = ["X:\\", rest].concat();
+        }
+
+        path
+    }
+}
+
+fn map_path_prefix(mapping: &FilePathMapping, p: &str) -> String {
+    // It's important that we convert to a string here because that's what
+    // later stages do too (e.g. in the backend), and comparing `Path` values
+    // won't catch some differences at the string level, e.g. "abc" and "abc/"
+    // compare as equal.
+    mapping.map_prefix(path(p)).0.to_string_lossy().to_string()
+}
+
+fn reverse_map_prefix(mapping: &FilePathMapping, p: &str) -> Option<String> {
+    mapping.reverse_map_prefix_heuristically(&path(p)).map(|q| q.to_string_lossy().to_string())
+}
+
+#[test]
+fn path_prefix_remapping() {
+    // Relative to relative
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc/def"), path("foo"))],
+            RemapPathScopeComponents::all(),
+        );
+
+        assert_eq!(map_path_prefix(mapping, "abc/def/src/main.rs"), path_str("foo/src/main.rs"));
+        assert_eq!(map_path_prefix(mapping, "abc/def"), path_str("foo"));
+    }
+
+    // Relative to absolute
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc/def"), path("/foo"))],
+            RemapPathScopeComponents::all(),
+        );
+
+        assert_eq!(map_path_prefix(mapping, "abc/def/src/main.rs"), path_str("/foo/src/main.rs"));
+        assert_eq!(map_path_prefix(mapping, "abc/def"), path_str("/foo"));
+    }
+
+    // Absolute to relative
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("/abc/def"), path("foo"))],
+            RemapPathScopeComponents::all(),
+        );
+
+        assert_eq!(map_path_prefix(mapping, "/abc/def/src/main.rs"), path_str("foo/src/main.rs"));
+        assert_eq!(map_path_prefix(mapping, "/abc/def"), path_str("foo"));
+    }
+
+    // Absolute to absolute
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("/abc/def"), path("/foo"))],
+            RemapPathScopeComponents::all(),
+        );
+
+        assert_eq!(map_path_prefix(mapping, "/abc/def/src/main.rs"), path_str("/foo/src/main.rs"));
+        assert_eq!(map_path_prefix(mapping, "/abc/def"), path_str("/foo"));
+    }
+}
+
+#[test]
+fn to_real_filename_with_full_scopes() {
+    // "virtual" working directory is relative path
+    let mapping = &FilePathMapping::new(
+        vec![(path("/foo"), path("FOO")), (path("/bar"), path("BAR"))],
+        RemapPathScopeComponents::all(),
+    );
+    let working_directory = path("/foo");
+    let working_directory = mapping.to_real_filename(&RealFileName::empty(), working_directory);
+
+    assert_eq!(working_directory.path(RemapPathScopeComponents::DIAGNOSTICS), path("FOO"));
+    assert_eq!(working_directory.path(RemapPathScopeComponents::MACRO), path("FOO"));
+    assert_eq!(working_directory.path(RemapPathScopeComponents::DEBUGINFO), path("FOO"));
+
+    // Absolute path
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/foo/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/foo/src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/foo/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("FOO/src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("FOO/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::all()
+        }
+    );
+
+    // Absolute path with unrelated working directory
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/bar/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/bar/src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/bar/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("BAR/src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("BAR/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::all()
+        }
+    );
+
+    // Absolute path that does not match any prefix
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/quux/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/quux/src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/quux/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("/quux/src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("/quux/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::all()
+        }
+    );
+
+    // Relative path
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/foo/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("FOO/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::all()
+        }
+    );
+
+    // Relative path with `./`
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("./src/main.rs"),),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("./src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/foo/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("./src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("FOO/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::all()
+        }
+    );
+
+    // Relative path that does not match any prefix
+    assert_eq!(
+        mapping.to_real_filename(
+            &mapping.to_real_filename(&RealFileName::empty(), path("/abc")),
+            path("quux/src/main.rs"),
+        ),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("quux/src/main.rs"),
+                working_directory: path("/abc"),
+                embeddable_name: path("/abc/quux/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("quux/src/main.rs"),
+                working_directory: path("/abc"),
+                embeddable_name: path("/abc/quux/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::empty()
+        }
+    );
+}
+
+#[test]
+fn to_real_filename_with_mixed_scopes() {
+    // "virtual" working directory is relative path
+    let mapping = &FilePathMapping::new(
+        vec![(path("/foo"), path("FOO")), (path("/bar"), path("BAR"))],
+        RemapPathScopeComponents::OBJECT,
+    );
+    let working_directory = path("/foo");
+    let working_directory = mapping.to_real_filename(&RealFileName::empty(), working_directory);
+
+    assert_eq!(working_directory.path(RemapPathScopeComponents::DIAGNOSTICS), path("/foo"));
+    assert_eq!(working_directory.path(RemapPathScopeComponents::MACRO), path("FOO"));
+    assert_eq!(working_directory.path(RemapPathScopeComponents::DEBUGINFO), path("FOO"));
+
+    // Absolute path
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/foo/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/foo/src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/foo/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("FOO/src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("FOO/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::OBJECT
+        }
+    );
+
+    // Absolute path with unrelated working directory
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/bar/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/bar/src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/bar/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("BAR/src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("BAR/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::OBJECT
+        }
+    );
+
+    // Absolute path without remapping
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/quux/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/quux/src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/quux/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("/quux/src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("/quux/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::OBJECT
+        }
+    );
+
+    // Relative path
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("src/main.rs"),
+                working_directory: path("/foo"),
+                embeddable_name: path("/foo/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("src/main.rs"),
+                working_directory: path("FOO"),
+                embeddable_name: path("FOO/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::OBJECT
+        }
+    );
+
+    // Relative path that does not match any prefix
+    assert_eq!(
+        mapping.to_real_filename(
+            &mapping.to_real_filename(&RealFileName::empty(), path("/abc")),
+            path("quux/src/main.rs"),
+        ),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("quux/src/main.rs"),
+                working_directory: path("/abc"),
+                embeddable_name: path("/abc/quux/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("quux/src/main.rs"),
+                working_directory: path("/abc"),
+                embeddable_name: path("/abc/quux/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::empty()
+        }
+    );
+}
+#[test]
+fn to_real_filename_without_remapped_cwd() {
+    // "virtual" working directory is relative path
+    let mapping = &FilePathMapping::new(
+        vec![(path("/foo"), path("FOO")), (path("/cwd/bar"), path("CWDBAR"))],
+        RemapPathScopeComponents::OBJECT,
+    );
+    let working_directory = path("/cwd");
+    let working_directory = mapping.to_real_filename(&RealFileName::empty(), working_directory);
+
+    assert_eq!(working_directory.path(RemapPathScopeComponents::DIAGNOSTICS), path("/cwd"));
+    assert_eq!(working_directory.path(RemapPathScopeComponents::MACRO), path("/cwd"));
+    assert_eq!(working_directory.path(RemapPathScopeComponents::DEBUGINFO), path("/cwd"));
+
+    // Absolute path
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/foo/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/foo/src/main.rs"),
+                working_directory: path("/cwd"),
+                embeddable_name: path("/foo/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("FOO/src/main.rs"),
+                working_directory: path("/cwd"),
+                embeddable_name: path("FOO/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::OBJECT
+        }
+    );
+
+    // Absolute path with unrelated root
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/bar/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/bar/src/main.rs"),
+                working_directory: path("/cwd"),
+                embeddable_name: path("/bar/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("/bar/src/main.rs"),
+                working_directory: path("/cwd"),
+                embeddable_name: path("/bar/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::empty()
+        }
+    );
+
+    // Absolute path with cwd
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("/cwd/bar/src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("/cwd/bar/src/main.rs"),
+                working_directory: path("/cwd"),
+                embeddable_name: path("/cwd/bar/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("CWDBAR/src/main.rs"),
+                working_directory: path("/cwd"),
+                embeddable_name: path("CWDBAR/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::OBJECT
+        }
+    );
+
+    // Relative path
+    assert_eq!(
+        mapping.to_real_filename(&working_directory, path("src/main.rs")),
+        RealFileName {
+            local: Some(InnerRealFileName {
+                name: path("src/main.rs"),
+                working_directory: path("/cwd"),
+                embeddable_name: path("/cwd/src/main.rs")
+            }),
+            maybe_remapped: InnerRealFileName {
+                name: path("src/main.rs"),
+                working_directory: path("/cwd"),
+                embeddable_name: path("/cwd/src/main.rs")
+            },
+            scopes: RemapPathScopeComponents::empty()
+        }
+    );
+}
+
+#[test]
+fn path_prefix_remapping_reverse() {
+    // Ignores options without alphanumeric chars.
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc"), path("/")), (path("def"), path("."))],
+            RemapPathScopeComponents::all(),
+        );
+
+        assert_eq!(reverse_map_prefix(mapping, "/hello.rs"), None);
+        assert_eq!(reverse_map_prefix(mapping, "./hello.rs"), None);
+    }
+
+    // Returns `None` if multiple options match.
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc"), path("/redacted")), (path("def"), path("/redacted"))],
+            RemapPathScopeComponents::all(),
+        );
+
+        assert_eq!(reverse_map_prefix(mapping, "/redacted/hello.rs"), None);
+    }
+
+    // Distinct reverse mappings.
+    {
+        let mapping = &FilePathMapping::new(
+            vec![(path("abc"), path("/redacted")), (path("def/ghi"), path("/fake/dir"))],
+            RemapPathScopeComponents::all(),
+        );
+
+        assert_eq!(
+            reverse_map_prefix(mapping, "/redacted/path/hello.rs"),
+            Some(path_str("abc/path/hello.rs"))
+        );
+        assert_eq!(
+            reverse_map_prefix(mapping, "/fake/dir/hello.rs"),
+            Some(path_str("def/ghi/hello.rs"))
+        );
+    }
+}
+
+#[test]
+fn test_next_point() {
+    let sm = SourceMap::new(FilePathMapping::empty());
+    sm.new_source_file(filename(&sm, "example.rs"), "a…b".to_string());
+
+    // Dummy spans don't advance.
+    let span = DUMMY_SP;
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 0);
+    assert_eq!(span.hi().0, 0);
+
+    // Span advance respect multi-byte character
+    let span = Span::with_root_ctxt(BytePos(0), BytePos(1));
+    assert_eq!(sm.span_to_snippet(span), Ok("a".to_string()));
+    let span = sm.next_point(span);
+    assert_eq!(sm.span_to_snippet(span), Ok("…".to_string()));
+    assert_eq!(span.lo().0, 1);
+    assert_eq!(span.hi().0, 4);
+
+    // An empty span pointing just before a multi-byte character should
+    // advance to contain the multi-byte character.
+    let span = Span::with_root_ctxt(BytePos(1), BytePos(1));
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 1);
+    assert_eq!(span.hi().0, 4);
+
+    let span = Span::with_root_ctxt(BytePos(1), BytePos(4));
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 4);
+    assert_eq!(span.hi().0, 5);
+
+    // Reaching to the end of file, return a span that will get error with `span_to_snippet`
+    let span = Span::with_root_ctxt(BytePos(4), BytePos(5));
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 5);
+    assert_eq!(span.hi().0, 6);
+    assert!(sm.span_to_snippet(span).is_err());
+
+    // Reaching to the end of file, return a span that will get error with `span_to_snippet`
+    let span = Span::with_root_ctxt(BytePos(5), BytePos(5));
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 5);
+    assert_eq!(span.hi().0, 6);
+    assert!(sm.span_to_snippet(span).is_err());
+}
+
+#[test]
+fn test_span_followed_by_stops_at_end_of_file() {
+    let sm = SourceMap::new(FilePathMapping::empty());
+    sm.new_source_file(filename(&sm, "example.rs"), "x".to_string());
+
+    let span = Span::with_root_ctxt(BytePos(0), BytePos(1));
+    assert_eq!(sm.span_followed_by(span, "y"), None);
+}
+
+#[test]
+fn test_span_followed_by_skips_whitespace() {
+    let sm = SourceMap::new(FilePathMapping::empty());
+    sm.new_source_file(filename(&sm, "example.rs"), "x \n yz".to_string());
+
+    let span = Span::with_root_ctxt(BytePos(0), BytePos(1));
+    let span = sm.span_followed_by(span, "yz").unwrap();
+    assert_eq!(sm.span_to_snippet(span), Ok("yz".to_string()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_binary_file_handles_lying_stat() {
+    // read_binary_file tries to read the contents of a file into an Arc<[u8]> while
+    // never having two copies of the data in memory at once. This is an optimization
+    // to support include_bytes! with large files. But since Rust allocators are
+    // sensitive to alignment, our implementation can't be bootstrapped off calling
+    // std::fs::read. So we test that we have the same behavior even on files where
+    // fs::metadata lies.
+
+    // stat always says that /proc/self/cmdline is length 0, but it isn't.
+    let cmdline = Path::new("/proc/self/cmdline");
+    let len = std::fs::metadata(cmdline).unwrap().len() as usize;
+    let real = std::fs::read(cmdline).unwrap();
+    assert!(len < real.len());
+    let bin = RealFileLoader.read_binary_file(cmdline).unwrap();
+    assert_eq!(&real[..], &bin[..]);
+
+    // stat always says that /sys/devices/system/cpu/kernel_max is the size of a block.
+    let kernel_max = Path::new("/sys/devices/system/cpu/kernel_max");
+    let len = std::fs::metadata(kernel_max).unwrap().len() as usize;
+    let real = std::fs::read(kernel_max).unwrap();
+    assert!(len > real.len());
+    let bin = RealFileLoader.read_binary_file(kernel_max).unwrap();
+    assert_eq!(&real[..], &bin[..]);
 }

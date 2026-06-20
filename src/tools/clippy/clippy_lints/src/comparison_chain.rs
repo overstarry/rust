@@ -1,9 +1,12 @@
-use clippy_utils::diagnostics::span_lint_and_help;
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::sugg::Sugg;
 use clippy_utils::ty::implements_trait;
-use clippy_utils::{get_trait_def_id, if_sequence, in_constant, is_else_clause, paths, SpanlessEq};
+use clippy_utils::{SpanlessEq, if_sequence, is_else_clause, is_in_const_context};
+use rustc_errors::Applicability;
 use rustc_hir::{BinOpKind, Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_lint_pass, declare_tool_lint};
+use rustc_session::declare_lint_pass;
+use rustc_span::{SyntaxContext, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -13,10 +16,6 @@ declare_clippy_lint! {
     /// ### Why is this bad?
     /// `if` is not guaranteed to be exhaustive and conditionals can get
     /// repetitive
-    ///
-    /// ### Known problems
-    /// The match statement may be slower due to the compiler
-    /// not inlining the call to cmp. See issue [#5354](https://github.com/rust-lang/rust-clippy/issues/5354)
     ///
     /// ### Example
     /// ```rust,ignore
@@ -34,8 +33,7 @@ declare_clippy_lint! {
     /// }
     /// ```
     ///
-    /// Could be written:
-    ///
+    /// Use instead:
     /// ```rust,ignore
     /// use std::cmp::Ordering;
     /// # fn a() {}
@@ -51,7 +49,7 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "1.40.0"]
     pub COMPARISON_CHAIN,
-    style,
+    pedantic,
     "`if`s that can be rewritten with `match` and `cmp`"
 }
 
@@ -68,13 +66,17 @@ impl<'tcx> LateLintPass<'tcx> for ComparisonChain {
             return;
         }
 
-        if in_constant(cx, expr.hir_id) {
+        if is_in_const_context(cx) {
             return;
         }
 
         // Check that there exists at least one explicit else condition
-        let (conds, _) = if_sequence(expr);
+        let (conds, blocks) = if_sequence(expr);
         if conds.len() < 2 {
+            return;
+        }
+
+        if blocks.len() < 3 {
             return;
         }
 
@@ -88,8 +90,10 @@ impl<'tcx> LateLintPass<'tcx> for ComparisonChain {
 
                 // Check that both sets of operands are equal
                 let mut spanless_eq = SpanlessEq::new(cx);
-                let same_fixed_operands = spanless_eq.eq_expr(lhs1, lhs2) && spanless_eq.eq_expr(rhs1, rhs2);
-                let same_transposed_operands = spanless_eq.eq_expr(lhs1, rhs2) && spanless_eq.eq_expr(rhs1, lhs2);
+                let same_fixed_operands = spanless_eq.eq_expr(SyntaxContext::root(), lhs1, lhs2)
+                    && spanless_eq.eq_expr(SyntaxContext::root(), rhs1, rhs2);
+                let same_transposed_operands = spanless_eq.eq_expr(SyntaxContext::root(), lhs1, rhs2)
+                    && spanless_eq.eq_expr(SyntaxContext::root(), rhs1, lhs2);
 
                 if !same_fixed_operands && !same_transposed_operands {
                     return;
@@ -107,7 +111,10 @@ impl<'tcx> LateLintPass<'tcx> for ComparisonChain {
 
                 // Check that the type being compared implements `core::cmp::Ord`
                 let ty = cx.typeck_results().expr_ty(lhs1);
-                let is_ord = get_trait_def_id(cx, &paths::ORD).map_or(false, |id| implements_trait(cx, ty, id, &[]));
+                let is_ord = cx
+                    .tcx
+                    .get_diagnostic_item(sym::Ord)
+                    .is_some_and(|id| implements_trait(cx, ty, id, &[]));
 
                 if !is_ord {
                     return;
@@ -117,13 +124,20 @@ impl<'tcx> LateLintPass<'tcx> for ComparisonChain {
                 return;
             }
         }
-        span_lint_and_help(
+        let ExprKind::Binary(_, lhs, rhs) = conds[0].kind else {
+            unreachable!();
+        };
+
+        let lhs = Sugg::hir(cx, lhs, "..").maybe_paren();
+        let rhs = Sugg::hir(cx, rhs, "..").addr();
+        span_lint_and_sugg(
             cx,
             COMPARISON_CHAIN,
             expr.span,
             "`if` chain can be rewritten with `match`",
-            None,
-            "consider rewriting the `if` chain to use `cmp` and `match`",
+            "consider rewriting the `if` chain with `match`",
+            format!("match {lhs}.cmp({rhs}) {{...}}"),
+            Applicability::HasPlaceholders,
         );
     }
 }

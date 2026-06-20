@@ -1,5 +1,11 @@
+//@ check-pass
+
 #![feature(stmt_expr_attributes)]
-#![allow(clippy::never_loop, clippy::while_immutable_condition)]
+#![expect(
+    clippy::never_loop,
+    clippy::redundant_pattern_matching,
+    clippy::while_immutable_condition
+)]
 
 fn main() {
     #[clippy::author]

@@ -109,6 +109,7 @@ fn as_str_match_mismatch() {
     match var.to_ascii_lowercase().as_str() {
         "foo" => {},
         "Bar" => {},
+        //~^ match_str_case_mismatch
         _ => {},
     }
 }
@@ -119,6 +120,7 @@ fn non_alphabetic_mismatch() {
     match var.to_ascii_lowercase().as_str() {
         "1234567890" => {},
         "~!@#$%^&*()-_=+Foo" => {},
+        //~^ match_str_case_mismatch
         "\n\r\t\x7F" => {},
         _ => {},
     }
@@ -131,6 +133,7 @@ fn unicode_cased_mismatch() {
         "水" => {},
         "νερό" => {},
         "Воды" => {},
+        //~^ match_str_case_mismatch
         "물" => {},
         _ => {},
     }
@@ -142,6 +145,7 @@ fn titlecase_mismatch() {
     match var.to_lowercase().as_str() {
         "fooǉ" => {},
         "barǲ" => {},
+        //~^ match_str_case_mismatch
         _ => {},
     }
 }
@@ -152,6 +156,7 @@ fn no_case_equivalent_mismatch() {
     match var.to_uppercase().as_str() {
         "FOOɕ" => {},
         "bARʁ" => {},
+        //~^ match_str_case_mismatch
         _ => {},
     }
 }
@@ -162,6 +167,7 @@ fn addrof_unary_match_mismatch() {
     match &*var.to_ascii_lowercase() {
         "foo" => {},
         "Bar" => {},
+        //~^ match_str_case_mismatch
         _ => {},
     }
 }
@@ -177,6 +183,7 @@ fn alternating_chain_mismatch() {
     {
         "FOO" => {},
         "bAR" => {},
+        //~^ match_str_case_mismatch
         _ => {},
     }
 }

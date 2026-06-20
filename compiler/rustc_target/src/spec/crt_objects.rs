@@ -40,11 +40,10 @@
 //! but not gcc's. As a result rustc cannot link with C++ static libraries (#36710)
 //! when linking in self-contained mode.
 
-use crate::spec::LinkOutputKind;
-use rustc_serialize::json::{Json, ToJson};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::str::FromStr;
+
+use crate::spec::LinkOutputKind;
 
 pub type CrtObjects = BTreeMap<LinkOutputKind, Vec<Cow<'static, str>>>;
 
@@ -63,7 +62,7 @@ pub(super) fn all(obj: &'static str) -> CrtObjects {
     ])
 }
 
-pub(super) fn pre_musl_fallback() -> CrtObjects {
+pub(super) fn pre_musl_self_contained() -> CrtObjects {
     new(&[
         (LinkOutputKind::DynamicNoPicExe, &["crt1.o", "crti.o", "crtbegin.o"]),
         (LinkOutputKind::DynamicPicExe, &["Scrt1.o", "crti.o", "crtbeginS.o"]),
@@ -74,7 +73,7 @@ pub(super) fn pre_musl_fallback() -> CrtObjects {
     ])
 }
 
-pub(super) fn post_musl_fallback() -> CrtObjects {
+pub(super) fn post_musl_self_contained() -> CrtObjects {
     new(&[
         (LinkOutputKind::DynamicNoPicExe, &["crtend.o", "crtn.o"]),
         (LinkOutputKind::DynamicPicExe, &["crtendS.o", "crtn.o"]),
@@ -85,7 +84,18 @@ pub(super) fn post_musl_fallback() -> CrtObjects {
     ])
 }
 
-pub(super) fn pre_mingw_fallback() -> CrtObjects {
+pub(super) fn pre_mingw_self_contained() -> CrtObjects {
+    new(&[
+        (LinkOutputKind::DynamicNoPicExe, &["crt2.o"]),
+        (LinkOutputKind::DynamicPicExe, &["crt2.o"]),
+        (LinkOutputKind::StaticNoPicExe, &["crt2.o"]),
+        (LinkOutputKind::StaticPicExe, &["crt2.o"]),
+        (LinkOutputKind::DynamicDylib, &["dllcrt2.o"]),
+        (LinkOutputKind::StaticDylib, &["dllcrt2.o"]),
+    ])
+}
+
+pub(super) fn pre_i686_mingw_self_contained() -> CrtObjects {
     new(&[
         (LinkOutputKind::DynamicNoPicExe, &["crt2.o", "rsbegin.o"]),
         (LinkOutputKind::DynamicPicExe, &["crt2.o", "rsbegin.o"]),
@@ -96,19 +106,19 @@ pub(super) fn pre_mingw_fallback() -> CrtObjects {
     ])
 }
 
-pub(super) fn post_mingw_fallback() -> CrtObjects {
+pub(super) fn post_i686_mingw_self_contained() -> CrtObjects {
     all("rsend.o")
 }
 
-pub(super) fn pre_mingw() -> CrtObjects {
+pub(super) fn pre_i686_mingw() -> CrtObjects {
     all("rsbegin.o")
 }
 
-pub(super) fn post_mingw() -> CrtObjects {
+pub(super) fn post_i686_mingw() -> CrtObjects {
     all("rsend.o")
 }
 
-pub(super) fn pre_wasi_fallback() -> CrtObjects {
+pub(super) fn pre_wasi_self_contained() -> CrtObjects {
     // Use crt1-command.o instead of crt1.o to enable support for new-style
     // commands. See https://reviews.llvm.org/D81689 for more info.
     new(&[
@@ -120,38 +130,6 @@ pub(super) fn pre_wasi_fallback() -> CrtObjects {
     ])
 }
 
-pub(super) fn post_wasi_fallback() -> CrtObjects {
+pub(super) fn post_wasi_self_contained() -> CrtObjects {
     new(&[])
-}
-
-/// Which logic to use to determine whether to fall back to the "self-contained" mode or not.
-#[derive(Clone, Copy, PartialEq, Hash, Debug)]
-pub enum CrtObjectsFallback {
-    Musl,
-    Mingw,
-    Wasm,
-}
-
-impl FromStr for CrtObjectsFallback {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<CrtObjectsFallback, ()> {
-        Ok(match s {
-            "musl" => CrtObjectsFallback::Musl,
-            "mingw" => CrtObjectsFallback::Mingw,
-            "wasm" => CrtObjectsFallback::Wasm,
-            _ => return Err(()),
-        })
-    }
-}
-
-impl ToJson for CrtObjectsFallback {
-    fn to_json(&self) -> Json {
-        match *self {
-            CrtObjectsFallback::Musl => "musl",
-            CrtObjectsFallback::Mingw => "mingw",
-            CrtObjectsFallback::Wasm => "wasm",
-        }
-        .to_json()
-    }
 }

@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![expect(clippy::extra_unused_lifetimes)]
 #![warn(clippy::multiple_inherent_impl)]
 
 struct MyStruct;
@@ -8,10 +8,13 @@ impl MyStruct {
 }
 
 impl MyStruct {
+    //~^ multiple_inherent_impl
+
     fn second() {}
 }
 
 impl<'a> MyStruct {
+    //~^ multiple_inherent_impl
     fn lifetimed() {}
 }
 
@@ -22,6 +25,8 @@ mod submod {
     }
 
     impl super::MyStruct {
+        //~^ multiple_inherent_impl
+
         fn third() {}
     }
 }
@@ -42,6 +47,8 @@ impl WithArgs<u64> {
     fn f2() {}
 }
 impl WithArgs<u64> {
+    //~^ multiple_inherent_impl
+
     fn f3() {}
 }
 
@@ -62,6 +69,77 @@ struct OneAllowedImpl;
 impl OneAllowedImpl {}
 #[allow(clippy::multiple_inherent_impl)]
 impl OneAllowedImpl {}
-impl OneAllowedImpl {} // Lint, only one of the three blocks is allowed.
+impl OneAllowedImpl {}
+//~^ multiple_inherent_impl
+
+#[expect(clippy::multiple_inherent_impl)]
+struct ExpectedFulfilled;
+
+impl ExpectedFulfilled {}
+impl ExpectedFulfilled {}
+
+struct OneExpected;
+impl OneExpected {}
+#[expect(clippy::multiple_inherent_impl)]
+impl OneExpected {}
+impl OneExpected {}
+//~^ multiple_inherent_impl
+
+// issue #8714
+struct Lifetime<'s> {
+    s: &'s str,
+}
+
+impl Lifetime<'_> {}
+impl Lifetime<'_> {}
+//~^ multiple_inherent_impl
+
+impl<'a> Lifetime<'a> {}
+impl<'a> Lifetime<'a> {}
+//~^ multiple_inherent_impl
+
+impl<'b> Lifetime<'b> {} // false negative?
+
+impl Lifetime<'static> {}
+
+struct Generic<G> {
+    g: Vec<G>,
+}
+
+impl<G> Generic<G> {}
+impl<G> Generic<G> {}
+//~^ multiple_inherent_impl
+
+use std::fmt::Debug;
+
+#[derive(Debug)]
+struct GenericWithBounds<T: Debug>(T);
+
+impl<T: Debug> GenericWithBounds<T> {
+    fn make_one(_one: T) -> Self {
+        todo!()
+    }
+}
+
+impl<T: Debug> GenericWithBounds<T> {
+    //~^ multiple_inherent_impl
+    fn make_two(_two: T) -> Self {
+        todo!()
+    }
+}
+
+struct MultipleTraitBounds<T>(T);
+
+impl<T: Debug> MultipleTraitBounds<T> {
+    fn debug_fn() {}
+}
+
+impl<T: Clone> MultipleTraitBounds<T> {
+    fn clone_fn() {}
+}
+
+impl<T: Debug + Clone> MultipleTraitBounds<T> {
+    fn debug_clone_fn() {}
+}
 
 fn main() {}

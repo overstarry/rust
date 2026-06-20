@@ -1,24 +1,24 @@
-// run-rustfix
 #![warn(clippy::manual_ok_or)]
-#![allow(clippy::blacklisted_name)]
-#![allow(clippy::redundant_closure)]
-#![allow(dead_code)]
-#![allow(unused_must_use)]
+#![expect(clippy::disallowed_names, clippy::redundant_closure)]
 
 fn main() {
     // basic case
     let foo: Option<i32> = None;
     foo.map_or(Err("error"), |v| Ok(v));
+    //~^ manual_ok_or
 
     // eta expansion case
     foo.map_or(Err("error"), Ok);
+    //~^ manual_ok_or
 
     // turbo fish syntax
     None::<i32>.map_or(Err("error"), |v| Ok(v));
+    //~^ manual_ok_or
 
     // multiline case
     #[rustfmt::skip]
     foo.map_or(Err::<i32, &str>(
+    //~^ manual_ok_or
         &format!(
             "{}{}{}{}{}{}{}",
             "Alice", "Bob", "Sarah", "Marc", "Sandra", "Eric", "Jenifer")
@@ -33,7 +33,15 @@ fn main() {
     foo.map_or(Ok::<i32, &str>(1), |v| Ok(v));
 
     // not applicable, expr is not a `Result` value
-    foo.map_or(42, |v| v);
+    foo.map_or(42, |v| v + 1);
+
+    // not applicable, closure isn't `Ok` wrapping
+    let bar: Option<Result<i32, &str>> = None;
+    #[allow(clippy::map_or_identity)]
+    bar.map_or(Err("error"), |v| v);
+
+    // not applicable, closure isn't using value
+    foo.map_or(Err("error"), |_| Ok(42));
 
     // TODO patterns not covered yet
     match foo {

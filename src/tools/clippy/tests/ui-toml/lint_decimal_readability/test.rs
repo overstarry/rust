@@ -1,5 +1,5 @@
 #![allow(clippy::excessive_precision)]
-#[deny(clippy::unreadable_literal)]
+#![warn(clippy::unreadable_literal)]
 
 fn allow_inconsistent_digit_grouping() {
     #![allow(clippy::inconsistent_digit_grouping)]
@@ -7,8 +7,6 @@ fn allow_inconsistent_digit_grouping() {
 }
 
 fn main() {
-    allow_inconsistent_digit_grouping();
-
     let _pass1 = 100_200_300.100_200_300;
     let _pass2 = 1.123456789;
     let _pass3 = 1.0;
@@ -17,7 +15,9 @@ fn main() {
 
     // due to clippy::inconsistent-digit-grouping
     let _fail1 = 100_200_300.123456789;
+    //~^ inconsistent_digit_grouping
 
     // fail due to the integer part
     let _fail2 = 100200300.300200100;
+    //~^ unreadable_literal
 }

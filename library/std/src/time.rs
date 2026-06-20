@@ -1,6 +1,6 @@
 //! Temporal quantification.
 //!
-//! # Examples:
+//! # Examples
 //!
 //! There are multiple ways to create a new [`Duration`]:
 //!
@@ -31,20 +31,15 @@
 
 #![stable(feature = "time", since = "1.3.0")]
 
-#[cfg(test)]
-mod tests;
+#[stable(feature = "time", since = "1.3.0")]
+pub use core::time::Duration;
+#[stable(feature = "duration_checked_float", since = "1.66.0")]
+pub use core::time::TryFromFloatSecsError;
 
 use crate::error::Error;
 use crate::fmt;
 use crate::ops::{Add, AddAssign, Sub, SubAssign};
-use crate::sys::time;
-use crate::sys_common::FromInner;
-
-#[stable(feature = "time", since = "1.3.0")]
-pub use core::time::Duration;
-
-#[unstable(feature = "duration_checked_float", issue = "83400")]
-pub use core::time::FromFloatSecsError;
+use crate::sys::{FromInner, IntoInner, time};
 
 /// A measurement of a monotonically nondecreasing clock.
 /// Opaque and useful only with [`Duration`].
@@ -58,6 +53,8 @@ pub use core::time::FromFloatSecsError;
 /// some seconds may be longer than others). An instant may jump forwards or
 /// experience time dilation (slow down or speed up), but it will never go
 /// backwards.
+/// As part of this non-guarantee it is also not specified whether system suspends count as
+/// elapsed time or not. The behavior varies across platforms and Rust versions.
 ///
 /// Instants are opaque types that can only be compared to one another. There is
 /// no method to get "the number of seconds" from an instant. Instead, it only
@@ -95,10 +92,16 @@ pub use core::time::FromFloatSecsError;
 /// use std::time::{Instant, Duration};
 ///
 /// let now = Instant::now();
-/// let max_nanoseconds = u64::MAX / 1_000_000_000;
-/// let duration = Duration::new(max_nanoseconds, 0);
+/// let days_per_10_millennia = 365_2425;
+/// let solar_seconds_per_day = 60 * 60 * 24;
+/// let millennium_in_solar_seconds = 31_556_952_000;
+/// assert_eq!(millennium_in_solar_seconds, days_per_10_millennia * solar_seconds_per_day / 10);
+///
+/// let duration = Duration::new(millennium_in_solar_seconds, 0);
 /// println!("{:?}", now + duration);
 /// ```
+///
+/// For cross-platform code, you can comfortably use durations of up to around one hundred years.
 ///
 /// # Underlying System calls
 ///
@@ -108,20 +111,18 @@ pub use core::time::FromFloatSecsError;
 /// |  Platform |               System call                                            |
 /// |-----------|----------------------------------------------------------------------|
 /// | SGX       | [`insecure_time` usercall]. More information on [timekeeping in SGX] |
-/// | UNIX      | [clock_gettime (Monotonic Clock)]                                    |
-/// | Darwin    | [mach_absolute_time]                                                 |
-/// | VXWorks   | [clock_gettime (Monotonic Clock)]                                    |
+/// | UNIX      | [clock_gettime] with `CLOCK_MONOTONIC`                               |
+/// | WASI      | [clock_gettime] with `CLOCK_MONOTONIC`                               |
+/// | Darwin    | [clock_gettime] with `CLOCK_UPTIME_RAW`                              |
+/// | VXWorks   | [clock_gettime] with `CLOCK_MONOTONIC`                               |
 /// | SOLID     | `get_tim`                                                            |
-/// | WASI      | [__wasi_clock_time_get (Monotonic Clock)]                            |
 /// | Windows   | [QueryPerformanceCounter]                                            |
 ///
 /// [currently]: crate::io#platform-specific-behavior
 /// [QueryPerformanceCounter]: https://docs.microsoft.com/en-us/windows/win32/api/profileapi/nf-profileapi-queryperformancecounter
 /// [`insecure_time` usercall]: https://edp.fortanix.com/docs/api/fortanix_sgx_abi/struct.Usercalls.html#method.insecure_time
 /// [timekeeping in SGX]: https://edp.fortanix.com/docs/concepts/rust-std/#codestdtimecode
-/// [__wasi_clock_time_get (Monotonic Clock)]: https://github.com/WebAssembly/WASI/blob/master/phases/snapshot/docs.md#clock_time_get
-/// [clock_gettime (Monotonic Clock)]: https://linux.die.net/man/3/clock_gettime
-/// [mach_absolute_time]: https://developer.apple.com/library/archive/documentation/Darwin/Conceptual/KernelProgramming/services/services.html
+/// [clock_gettime]: https://pubs.opengroup.org/onlinepubs/9799919799/functions/clock_getres.html
 ///
 /// **Disclaimer:** These system calls might change over time.
 ///
@@ -136,12 +137,12 @@ pub use core::time::FromFloatSecsError;
 /// if available, which is the case for all [tier 1] platforms.
 /// In practice such guarantees are – under rare circumstances – broken by hardware, virtualization
 /// or operating system bugs. To work around these bugs and platforms not offering monotonic clocks
-/// [`duration_since`], [`elapsed`] and [`sub`] saturate to zero. In older Rust versions this
-/// lead to a panic instead. [`checked_duration_since`] can be used to detect and handle situations
-/// where monotonicity is violated, or `Instant`s are subtracted in the wrong order.
+/// [`duration_since`], [`elapsed`] and [`sub`](#impl-Sub-for-Instant) saturate to zero. In older
+/// Rust versions this lead to a panic instead. [`checked_duration_since`] can be used to detect and
+/// handle situations where monotonicity is violated, or `Instant`s are subtracted in the wrong order.
 ///
 /// This workaround obscures programming errors where earlier and later instants are accidentally
-/// swapped. For this reason future rust versions may reintroduce panics.
+/// swapped. For this reason future Rust versions may reintroduce panics.
 ///
 /// [tier 1]: https://doc.rust-lang.org/rustc/platform-support.html
 /// [`duration_since`]: Instant::duration_since
@@ -151,6 +152,7 @@ pub use core::time::FromFloatSecsError;
 ///
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[stable(feature = "time2", since = "1.8.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "Instant")]
 pub struct Instant(time::Instant);
 
 /// A measurement of the system clock, useful for talking to
@@ -176,6 +178,14 @@ pub struct Instant(time::Instant);
 /// The size of a `SystemTime` struct may vary depending on the target operating
 /// system.
 ///
+/// A `SystemTime` does not count leap seconds.
+/// `SystemTime::now()`'s behavior around a leap second
+/// is the same as the operating system's wall clock.
+/// The precise behavior near a leap second
+/// (e.g. whether the clock appears to run slow or fast, or stop, or jump)
+/// depends on platform and configuration,
+/// so should not be relied on.
+///
 /// Example:
 ///
 /// ```no_run
@@ -193,8 +203,8 @@ pub struct Instant(time::Instant);
 ///            println!("{}", elapsed.as_secs());
 ///        }
 ///        Err(e) => {
-///            // an error occurred!
-///            println!("Error: {e:?}");
+///            // the system clock went backwards!
+///            println!("Great Scott! {e:?}");
 ///        }
 ///    }
 /// }
@@ -213,18 +223,16 @@ pub struct Instant(time::Instant);
 /// |-----------|----------------------------------------------------------------------|
 /// | SGX       | [`insecure_time` usercall]. More information on [timekeeping in SGX] |
 /// | UNIX      | [clock_gettime (Realtime Clock)]                                     |
-/// | Darwin    | [gettimeofday]                                                       |
+/// | WASI      | [clock_gettime (Realtime Clock)]                                     |
+/// | Darwin    | [clock_gettime (Realtime Clock)]                                     |
 /// | VXWorks   | [clock_gettime (Realtime Clock)]                                     |
 /// | SOLID     | `SOLID_RTC_ReadTime`                                                 |
-/// | WASI      | [__wasi_clock_time_get (Realtime Clock)]                             |
 /// | Windows   | [GetSystemTimePreciseAsFileTime] / [GetSystemTimeAsFileTime]         |
 ///
 /// [currently]: crate::io#platform-specific-behavior
 /// [`insecure_time` usercall]: https://edp.fortanix.com/docs/api/fortanix_sgx_abi/struct.Usercalls.html#method.insecure_time
 /// [timekeeping in SGX]: https://edp.fortanix.com/docs/concepts/rust-std/#codestdtimecode
-/// [gettimeofday]: https://man7.org/linux/man-pages/man2/gettimeofday.2.html
-/// [clock_gettime (Realtime Clock)]: https://linux.die.net/man/3/clock_gettime
-/// [__wasi_clock_time_get (Realtime Clock)]: https://github.com/WebAssembly/WASI/blob/master/phases/snapshot/docs.md#clock_time_get
+/// [clock_gettime (Realtime Clock)]: https://pubs.opengroup.org/onlinepubs/9799919799/functions/clock_getres.html
 /// [GetSystemTimePreciseAsFileTime]: https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimepreciseasfiletime
 /// [GetSystemTimeAsFileTime]: https://docs.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getsystemtimeasfiletime
 ///
@@ -234,6 +242,7 @@ pub struct Instant(time::Instant);
 /// > structure cannot represent the new point in time.
 ///
 /// [`add`]: SystemTime::add
+/// [`UNIX_EPOCH`]: SystemTime::UNIX_EPOCH
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[stable(feature = "time2", since = "1.8.0")]
 pub struct SystemTime(time::SystemTime);
@@ -272,6 +281,7 @@ impl Instant {
     /// ```
     #[must_use]
     #[stable(feature = "time2", since = "1.8.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "instant_now")]
     pub fn now() -> Instant {
         Instant(time::Instant::now())
     }
@@ -281,7 +291,7 @@ impl Instant {
     ///
     /// # Panics
     ///
-    /// Previous rust versions panicked when `earlier` was later than `self`. Currently this
+    /// Previous Rust versions panicked when `earlier` was later than `self`. Currently this
     /// method saturates. Future versions may reintroduce the panic in some circumstances.
     /// See [Monotonicity].
     ///
@@ -352,11 +362,11 @@ impl Instant {
         self.checked_duration_since(earlier).unwrap_or_default()
     }
 
-    /// Returns the amount of time elapsed since this instant was created.
+    /// Returns the amount of time elapsed since this instant.
     ///
     /// # Panics
     ///
-    /// Previous rust versions panicked when self was earlier than the current time. Currently this
+    /// Previous Rust versions panicked when the current time was earlier than self. Currently this
     /// method returns a Duration of zero in that case. Future versions may reintroduce the panic.
     /// See [Monotonicity].
     ///
@@ -394,6 +404,15 @@ impl Instant {
     pub fn checked_sub(&self, duration: Duration) -> Option<Instant> {
         self.0.checked_sub_duration(&duration).map(Instant)
     }
+
+    // Used by platform specific `sleep_until` implementations such as the one used on Linux.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(unused, reason = "not every platform has a specific `sleep_until`")
+    )]
+    pub(crate) fn into_inner(self) -> time::Instant {
+        self.0
+    }
 }
 
 #[stable(feature = "time2", since = "1.8.0")]
@@ -404,6 +423,7 @@ impl Add<Duration> for Instant {
     ///
     /// This function may panic if the resulting point in time cannot be represented by the
     /// underlying data structure. See [`Instant::checked_add`] for a version without panic.
+    #[track_caller]
     fn add(self, other: Duration) -> Instant {
         self.checked_add(other).expect("overflow when adding duration to instant")
     }
@@ -420,6 +440,7 @@ impl AddAssign<Duration> for Instant {
 impl Sub<Duration> for Instant {
     type Output = Instant;
 
+    #[track_caller]
     fn sub(self, other: Duration) -> Instant {
         self.checked_sub(other).expect("overflow when subtracting duration from instant")
     }
@@ -441,7 +462,7 @@ impl Sub<Instant> for Instant {
     ///
     /// # Panics
     ///
-    /// Previous rust versions panicked when `other` was later than `self`. Currently this
+    /// Previous Rust versions panicked when `other` was later than `self`. Currently this
     /// method saturates. Future versions may reintroduce the panic in some circumstances.
     /// See [Monotonicity].
     ///
@@ -461,12 +482,20 @@ impl fmt::Debug for Instant {
 impl SystemTime {
     /// An anchor in time which can be used to create new `SystemTime` instances or
     /// learn about where in time a `SystemTime` lies.
+    //
+    // NOTE! this documentation is duplicated, here and in std::time::UNIX_EPOCH.
+    // The two copies are not quite identical, because of the difference in naming.
     ///
     /// This constant is defined to be "1970-01-01 00:00:00 UTC" on all systems with
     /// respect to the system clock. Using `duration_since` on an existing
     /// `SystemTime` instance can tell how far away from this point in time a
     /// measurement lies, and using `UNIX_EPOCH + duration` can be used to create a
     /// `SystemTime` instance to represent another fixed point in time.
+    ///
+    /// `duration_since(UNIX_EPOCH).unwrap().as_secs()` returns
+    /// the number of non-leap seconds since the start of 1970 UTC.
+    /// This is a POSIX `time_t` (as a `u64`),
+    /// and is the same time representation as used in many Internet protocols.
     ///
     /// # Examples
     ///
@@ -480,6 +509,83 @@ impl SystemTime {
     /// ```
     #[stable(feature = "assoc_unix_epoch", since = "1.28.0")]
     pub const UNIX_EPOCH: SystemTime = UNIX_EPOCH;
+
+    /// Represents the maximum value representable by [`SystemTime`] on this platform.
+    ///
+    /// This value differs a lot between platforms, but it is always the case
+    /// that any positive addition of a [`Duration`], whose value is greater
+    /// than or equal to the time precision of the operating system, to
+    /// [`SystemTime::MAX`] will fail.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(time_systemtime_limits)]
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// // Adding zero will change nothing.
+    /// assert_eq!(SystemTime::MAX.checked_add(Duration::ZERO), Some(SystemTime::MAX));
+    ///
+    /// // But adding just one second will already fail ...
+    /// //
+    /// // Keep in mind that this in fact may succeed, if the Duration is
+    /// // smaller than the time precision of the operating system, which
+    /// // happens to be 1ns on most operating systems, with Windows being the
+    /// // notable exception by using 100ns, hence why this example uses 1s.
+    /// assert_eq!(SystemTime::MAX.checked_add(Duration::new(1, 0)), None);
+    ///
+    /// // Utilize this for saturating arithmetic to improve error handling.
+    /// // In this case, we will use a certificate with a timestamp in the
+    /// // future as a practical example.
+    /// let configured_offset = Duration::from_secs(60 * 60 * 24);
+    /// let valid_after =
+    ///     SystemTime::now()
+    ///         .checked_add(configured_offset)
+    ///         .unwrap_or(SystemTime::MAX);
+    /// ```
+    #[unstable(feature = "time_systemtime_limits", issue = "149067")]
+    pub const MAX: SystemTime = SystemTime(time::SystemTime::MAX);
+
+    /// Represents the minimum value representable by [`SystemTime`] on this platform.
+    ///
+    /// This value differs a lot between platforms, but it is always the case
+    /// that any positive subtraction of a [`Duration`] from, whose value is
+    /// greater than or equal to the time precision of the operating system, to
+    /// [`SystemTime::MIN`] will fail.
+    ///
+    /// Depending on the platform, this may be either less than or equal to
+    /// [`SystemTime::UNIX_EPOCH`], depending on whether the operating system
+    /// supports the representation of timestamps before the Unix epoch or not.
+    /// However, it is always guaranteed that a [`SystemTime::UNIX_EPOCH`] fits
+    /// between a [`SystemTime::MIN`] and [`SystemTime::MAX`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(time_systemtime_limits)]
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// // Subtracting zero will change nothing.
+    /// assert_eq!(SystemTime::MIN.checked_sub(Duration::ZERO), Some(SystemTime::MIN));
+    ///
+    /// // But subtracting just one second will already fail.
+    /// //
+    /// // Keep in mind that this in fact may succeed, if the Duration is
+    /// // smaller than the time precision of the operating system, which
+    /// // happens to be 1ns on most operating systems, with Windows being the
+    /// // notable exception by using 100ns, hence why this example uses 1s.
+    /// assert_eq!(SystemTime::MIN.checked_sub(Duration::new(1, 0)), None);
+    ///
+    /// // Utilize this for saturating arithmetic to improve error handling.
+    /// // In this case, we will use a cache expiry as a practical example.
+    /// let configured_expiry = Duration::from_secs(60 * 3);
+    /// let expiry_threshold =
+    ///     SystemTime::now()
+    ///         .checked_sub(configured_expiry)
+    ///         .unwrap_or(SystemTime::MIN);
+    /// ```
+    #[unstable(feature = "time_systemtime_limits", issue = "149067")]
+    pub const MIN: SystemTime = SystemTime(time::SystemTime::MIN);
 
     /// Returns the system time corresponding to "now".
     ///
@@ -525,8 +631,8 @@ impl SystemTime {
         self.0.sub_time(&earlier.0).map_err(SystemTimeError)
     }
 
-    /// Returns the difference between the clock time when this
-    /// system time was created, and the current clock time.
+    /// Returns the difference from this system time to the
+    /// current clock time.
     ///
     /// This function may fail as the underlying system clock is susceptible to
     /// drift and updates (e.g., the system clock could go backwards), so this
@@ -558,6 +664,9 @@ impl SystemTime {
     /// Returns `Some(t)` where `t` is the time `self + duration` if `t` can be represented as
     /// `SystemTime` (which means it's inside the bounds of the underlying data structure), `None`
     /// otherwise.
+    ///
+    /// In the case that the `duration` is smaller than the time precision of the operating
+    /// system, `Some(self)` will be returned.
     #[stable(feature = "time_checked_add", since = "1.34.0")]
     pub fn checked_add(&self, duration: Duration) -> Option<SystemTime> {
         self.0.checked_add_duration(&duration).map(SystemTime)
@@ -566,9 +675,62 @@ impl SystemTime {
     /// Returns `Some(t)` where `t` is the time `self - duration` if `t` can be represented as
     /// `SystemTime` (which means it's inside the bounds of the underlying data structure), `None`
     /// otherwise.
+    ///
+    /// In the case that the `duration` is smaller than the time precision of the operating
+    /// system, `Some(self)` will be returned.
     #[stable(feature = "time_checked_add", since = "1.34.0")]
     pub fn checked_sub(&self, duration: Duration) -> Option<SystemTime> {
         self.0.checked_sub_duration(&duration).map(SystemTime)
+    }
+
+    /// Saturating [`SystemTime`] addition, computing `self + duration`,
+    /// returning [`SystemTime::MAX`] if overflow occurred.
+    ///
+    /// In the case that the `duration` is smaller than the time precision of
+    /// the operating system, `self` will be returned.
+    #[unstable(feature = "time_saturating_systemtime", issue = "151199")]
+    pub fn saturating_add(&self, duration: Duration) -> SystemTime {
+        self.checked_add(duration).unwrap_or(SystemTime::MAX)
+    }
+
+    /// Saturating [`SystemTime`] subtraction, computing `self - duration`,
+    /// returning [`SystemTime::MIN`] if overflow occurred.
+    ///
+    /// In the case that the `duration` is smaller than the time precision of
+    /// the operating system, `self` will be returned.
+    #[unstable(feature = "time_saturating_systemtime", issue = "151199")]
+    pub fn saturating_sub(&self, duration: Duration) -> SystemTime {
+        self.checked_sub(duration).unwrap_or(SystemTime::MIN)
+    }
+
+    /// Saturating computation of time elapsed from an earlier point in time,
+    /// returning [`Duration::ZERO`] in the case that `earlier` is later or
+    /// equal to `self`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(time_saturating_systemtime)]
+    /// use std::time::{Duration, SystemTime};
+    ///
+    /// let now = SystemTime::now();
+    /// let prev = now.saturating_sub(Duration::new(1, 0));
+    ///
+    /// // now - prev should return non-zero.
+    /// assert_eq!(now.saturating_duration_since(prev), Duration::new(1, 0));
+    /// assert!(now.duration_since(prev).is_ok());
+    ///
+    /// // prev - now should return zero (and fail with the non-saturating).
+    /// assert_eq!(prev.saturating_duration_since(now), Duration::ZERO);
+    /// assert!(prev.duration_since(now).is_err());
+    ///
+    /// // now - now should return zero (and work with the non-saturating).
+    /// assert_eq!(now.saturating_duration_since(now), Duration::ZERO);
+    /// assert!(now.duration_since(now).is_ok());
+    /// ```
+    #[unstable(feature = "time_saturating_systemtime", issue = "151199")]
+    pub fn saturating_duration_since(&self, earlier: SystemTime) -> Duration {
+        self.duration_since(earlier).unwrap_or(Duration::ZERO)
     }
 }
 
@@ -580,8 +742,9 @@ impl Add<Duration> for SystemTime {
     ///
     /// This function may panic if the resulting point in time cannot be represented by the
     /// underlying data structure. See [`SystemTime::checked_add`] for a version without panic.
+    #[track_caller]
     fn add(self, dur: Duration) -> SystemTime {
-        self.checked_add(dur).expect("overflow when adding duration to instant")
+        self.checked_add(dur).expect("overflow when adding duration to `SystemTime`")
     }
 }
 
@@ -596,8 +759,9 @@ impl AddAssign<Duration> for SystemTime {
 impl Sub<Duration> for SystemTime {
     type Output = SystemTime;
 
+    #[track_caller]
     fn sub(self, dur: Duration) -> SystemTime {
-        self.checked_sub(dur).expect("overflow when subtracting duration from instant")
+        self.checked_sub(dur).expect("overflow when subtracting duration from `SystemTime`")
     }
 }
 
@@ -617,12 +781,20 @@ impl fmt::Debug for SystemTime {
 
 /// An anchor in time which can be used to create new `SystemTime` instances or
 /// learn about where in time a `SystemTime` lies.
+//
+// NOTE! this documentation is duplicated, here and in SystemTime::UNIX_EPOCH.
+// The two copies are not quite identical, because of the difference in naming.
 ///
 /// This constant is defined to be "1970-01-01 00:00:00 UTC" on all systems with
 /// respect to the system clock. Using `duration_since` on an existing
 /// [`SystemTime`] instance can tell how far away from this point in time a
 /// measurement lies, and using `UNIX_EPOCH + duration` can be used to create a
 /// [`SystemTime`] instance to represent another fixed point in time.
+///
+/// `duration_since(UNIX_EPOCH).unwrap().as_secs()` returns
+/// the number of non-leap seconds since the start of 1970 UTC.
+/// This is a POSIX `time_t` (as a `u64`),
+/// and is the same time representation as used in many Internet protocols.
 ///
 /// # Examples
 ///
@@ -667,12 +839,7 @@ impl SystemTimeError {
 }
 
 #[stable(feature = "time2", since = "1.8.0")]
-impl Error for SystemTimeError {
-    #[allow(deprecated)]
-    fn description(&self) -> &str {
-        "other time was not earlier than self"
-    }
-}
+impl Error for SystemTimeError {}
 
 #[stable(feature = "time2", since = "1.8.0")]
 impl fmt::Display for SystemTimeError {
@@ -684,5 +851,11 @@ impl fmt::Display for SystemTimeError {
 impl FromInner<time::SystemTime> for SystemTime {
     fn from_inner(time: time::SystemTime) -> SystemTime {
         SystemTime(time)
+    }
+}
+
+impl IntoInner<time::SystemTime> for SystemTime {
+    fn into_inner(self) -> time::SystemTime {
+        self.0
     }
 }

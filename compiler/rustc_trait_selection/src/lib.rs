@@ -1,4 +1,4 @@
-//! This crates defines the trait resolution method.
+//! This crate defines the trait resolution method.
 //!
 //! - **Traits.** Trait resolution is implemented in the `traits` module.
 //!
@@ -10,34 +10,25 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![allow(rustc::potential_query_instability)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bool_to_option)]
-#![feature(box_patterns)]
-#![feature(control_flow_enum)]
-#![feature(crate_visibility_modifier)]
-#![cfg_attr(bootstrap, feature(derive_default_enum))]
-#![feature(drain_filter)]
-#![feature(hash_drain_filter)]
-#![feature(label_break_value)]
-#![feature(let_chains)]
-#![feature(let_else)]
+// tidy-alphabetical-start
+#![cfg_attr(bootstrap, feature(strip_circumfix))]
+#![feature(associated_type_defaults)]
+#![feature(default_field_values)]
+#![feature(deref_patterns)]
+#![feature(hash_set_entry)]
+#![feature(iter_intersperse)]
+#![feature(iterator_try_reduce)]
 #![feature(never_type)]
+#![feature(try_blocks)]
+#![feature(unwrap_infallible)]
+#![feature(yeet_expr)]
 #![recursion_limit = "512"] // For rustdoc
+// tidy-alphabetical-end
 
-#[macro_use]
-extern crate rustc_macros;
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[macro_use]
-extern crate rustc_data_structures;
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate rustc_middle;
-#[macro_use]
-extern crate smallvec;
-
-pub mod autoderef;
+pub mod diagnostics;
+pub mod error_reporting;
 pub mod infer;
 pub mod opaque_types;
+pub mod regions;
+pub mod solve;
 pub mod traits;

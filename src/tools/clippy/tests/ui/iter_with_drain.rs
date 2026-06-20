@@ -1,28 +1,31 @@
-// run-rustfix
-// will emits unused mut warnings after fixing
-#![allow(unused_mut)]
-// will emits needless collect warnings after fixing
-#![allow(clippy::needless_collect)]
 #![warn(clippy::iter_with_drain)]
+#![expect(clippy::drain_collect)]
+
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 fn full() {
     let mut a = vec!["aaa".to_string(), "bbb".to_string()];
     let mut a: BinaryHeap<_> = a.drain(..).collect();
+    //~^ iter_with_drain
     let mut a: HashSet<_> = a.drain().collect();
     let mut a: VecDeque<_> = a.drain().collect();
     let mut a: Vec<_> = a.drain(..).collect();
+    //~^ iter_with_drain
     let mut a: HashMap<_, _> = a.drain(..).map(|x| (x.clone(), x)).collect();
+    //~^ iter_with_drain
     let _: Vec<(String, String)> = a.drain().collect();
 }
 
 fn closed() {
     let mut a = vec!["aaa".to_string(), "bbb".to_string()];
     let mut a: BinaryHeap<_> = a.drain(0..).collect();
+    //~^ iter_with_drain
     let mut a: HashSet<_> = a.drain().collect();
     let mut a: VecDeque<_> = a.drain().collect();
     let mut a: Vec<_> = a.drain(..a.len()).collect();
+    //~^ iter_with_drain
     let mut a: HashMap<_, _> = a.drain(0..a.len()).map(|x| (x.clone(), x)).collect();
+    //~^ iter_with_drain
     let _: Vec<(String, String)> = a.drain().collect();
 }
 
@@ -39,6 +42,15 @@ fn should_not_help() {
     let _: Vec<_> = b.drain(0..a.len()).collect();
 }
 
+fn _closed_range(mut x: Vec<String>) {
+    let _: Vec<String> = x.drain(0..=x.len()).collect();
+}
+
+fn _with_mut(x: &mut Vec<String>, y: &mut VecDeque<String>) {
+    let _: Vec<String> = x.drain(..).collect();
+    let _: Vec<String> = y.drain(..).collect();
+}
+
 #[derive(Default)]
 struct Bomb {
     fire: Vec<u8>,
@@ -48,9 +60,4 @@ fn should_not_help_0(bomb: &mut Bomb) {
     let _: Vec<u8> = bomb.fire.drain(..).collect();
 }
 
-fn main() {
-    full();
-    closed();
-    should_not_help();
-    should_not_help_0(&mut Bomb::default());
-}
+fn main() {}

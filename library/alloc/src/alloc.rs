@@ -2,40 +2,45 @@
 
 #![stable(feature = "alloc_module", since = "1.28.0")]
 
-#[cfg(not(test))]
-use core::intrinsics;
-use core::intrinsics::{min_align_of_val, size_of_val};
-
-use core::ptr::Unique;
-#[cfg(not(test))]
-use core::ptr::{self, NonNull};
-
 #[stable(feature = "alloc_module", since = "1.28.0")]
 #[doc(inline)]
 pub use core::alloc::*;
+use core::mem::Alignment;
+use core::ptr::{self, NonNull};
+use core::{cmp, hint};
 
-use core::marker::Destruct;
-
-#[cfg(test)]
-mod tests;
-
-extern "Rust" {
-    // These are the magic symbols to call the global allocator.  rustc generates
-    // them to call `__rg_alloc` etc. if there is a `#[global_allocator]` attribute
+unsafe extern "Rust" {
+    // These are the magic symbols to call the global allocator. rustc generates
+    // them to call the global allocator if there is a `#[global_allocator]` attribute
     // (the code expanding that attribute macro generates those functions), or to call
-    // the default implementations in libstd (`__rdl_alloc` etc. in `library/std/src/alloc.rs`)
+    // the default implementations in std (`__rdl_alloc` etc. in `library/std/src/alloc.rs`)
     // otherwise.
-    // The rustc fork of LLVM also special-cases these function names to be able to optimize them
-    // like `malloc`, `realloc`, and `free`, respectively.
     #[rustc_allocator]
-    #[rustc_allocator_nounwind]
-    fn __rust_alloc(size: usize, align: usize) -> *mut u8;
-    #[rustc_allocator_nounwind]
-    fn __rust_dealloc(ptr: *mut u8, size: usize, align: usize);
-    #[rustc_allocator_nounwind]
-    fn __rust_realloc(ptr: *mut u8, old_size: usize, align: usize, new_size: usize) -> *mut u8;
-    #[rustc_allocator_nounwind]
-    fn __rust_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+    #[rustc_nounwind]
+    #[rustc_std_internal_symbol]
+    #[rustc_allocator_zeroed_variant = "__rust_alloc_zeroed"]
+    fn __rust_alloc(size: usize, align: Alignment) -> *mut u8;
+    #[rustc_deallocator]
+    #[rustc_nounwind]
+    #[rustc_std_internal_symbol]
+    fn __rust_dealloc(ptr: NonNull<u8>, size: usize, align: Alignment);
+    #[rustc_reallocator]
+    #[rustc_nounwind]
+    #[rustc_std_internal_symbol]
+    fn __rust_realloc(
+        ptr: NonNull<u8>,
+        old_size: usize,
+        align: Alignment,
+        new_size: usize,
+    ) -> *mut u8;
+    #[rustc_allocator_zeroed]
+    #[rustc_nounwind]
+    #[rustc_std_internal_symbol]
+    fn __rust_alloc_zeroed(size: usize, align: Alignment) -> *mut u8;
+
+    #[rustc_nounwind]
+    #[rustc_std_internal_symbol]
+    fn __rust_no_alloc_shim_is_unstable_v2();
 }
 
 /// The global memory allocator.
@@ -48,19 +53,17 @@ extern "Rust" {
 /// accessed through the [free functions in `alloc`](self#functions).
 #[unstable(feature = "allocator_api", issue = "32838")]
 #[derive(Copy, Clone, Default, Debug)]
-#[cfg(not(test))]
+// the compiler needs to know when a Box uses the global allocator vs a custom one
+#[lang = "global_alloc_ty"]
 pub struct Global;
 
-#[cfg(test)]
-pub use std::alloc::Global;
-
-/// Allocate memory with the global allocator.
+/// Allocates memory with the global allocator.
 ///
 /// This function forwards calls to the [`GlobalAlloc::alloc`] method
 /// of the allocator registered with the `#[global_allocator]` attribute
 /// if there is one, or the `std` crate’s default.
 ///
-/// This function is expected to be deprecated in favor of the `alloc` method
+/// This function is expected to be deprecated in favor of the `allocate` method
 /// of the [`Global`] type when it and the [`Allocator`] trait become stable.
 ///
 /// # Safety
@@ -70,11 +73,14 @@ pub use std::alloc::Global;
 /// # Examples
 ///
 /// ```
-/// use std::alloc::{alloc, dealloc, Layout};
+/// use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 ///
 /// unsafe {
 ///     let layout = Layout::new::<u16>();
 ///     let ptr = alloc(layout);
+///     if ptr.is_null() {
+///         handle_alloc_error(layout);
+///     }
 ///
 ///     *(ptr as *mut u16) = 42;
 ///     assert_eq!(*(ptr as *mut u16), 42);
@@ -85,17 +91,24 @@ pub use std::alloc::Global;
 #[stable(feature = "global_alloc", since = "1.28.0")]
 #[must_use = "losing the pointer will leak memory"]
 #[inline]
+#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub unsafe fn alloc(layout: Layout) -> *mut u8 {
-    unsafe { __rust_alloc(layout.size(), layout.align()) }
+    unsafe {
+        // Make sure we don't accidentally allow omitting the allocator shim in
+        // stable code until it is actually stabilized.
+        __rust_no_alloc_shim_is_unstable_v2();
+
+        __rust_alloc(layout.size(), layout.alignment())
+    }
 }
 
-/// Deallocate memory with the global allocator.
+/// Deallocates memory with the global allocator.
 ///
 /// This function forwards calls to the [`GlobalAlloc::dealloc`] method
 /// of the allocator registered with the `#[global_allocator]` attribute
 /// if there is one, or the `std` crate’s default.
 ///
-/// This function is expected to be deprecated in favor of the `dealloc` method
+/// This function is expected to be deprecated in favor of the `deallocate` method
 /// of the [`Global`] type when it and the [`Allocator`] trait become stable.
 ///
 /// # Safety
@@ -103,17 +116,25 @@ pub unsafe fn alloc(layout: Layout) -> *mut u8 {
 /// See [`GlobalAlloc::dealloc`].
 #[stable(feature = "global_alloc", since = "1.28.0")]
 #[inline]
+#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
-    unsafe { __rust_dealloc(ptr, layout.size(), layout.align()) }
+    unsafe { dealloc_nonnull(NonNull::new_unchecked(ptr), layout) }
 }
 
-/// Reallocate memory with the global allocator.
+/// Same as [`dealloc`] but when you already have a non-null pointer
+#[inline]
+#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+unsafe fn dealloc_nonnull(ptr: NonNull<u8>, layout: Layout) {
+    unsafe { __rust_dealloc(ptr, layout.size(), layout.alignment()) }
+}
+
+/// Reallocates memory with the global allocator.
 ///
 /// This function forwards calls to the [`GlobalAlloc::realloc`] method
 /// of the allocator registered with the `#[global_allocator]` attribute
 /// if there is one, or the `std` crate’s default.
 ///
-/// This function is expected to be deprecated in favor of the `realloc` method
+/// This function is expected to be deprecated in favor of the `grow` and `shrink` methods
 /// of the [`Global`] type when it and the [`Allocator`] trait become stable.
 ///
 /// # Safety
@@ -122,17 +143,25 @@ pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
 #[stable(feature = "global_alloc", since = "1.28.0")]
 #[must_use = "losing the pointer will leak memory"]
 #[inline]
+#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    unsafe { __rust_realloc(ptr, layout.size(), layout.align(), new_size) }
+    unsafe { realloc_nonnull(NonNull::new_unchecked(ptr), layout, new_size) }
 }
 
-/// Allocate zero-initialized memory with the global allocator.
+/// Same as [`realloc`] but when you already have a non-null pointer
+#[inline]
+#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+unsafe fn realloc_nonnull(ptr: NonNull<u8>, layout: Layout, new_size: usize) -> *mut u8 {
+    unsafe { __rust_realloc(ptr, layout.size(), layout.alignment(), new_size) }
+}
+
+/// Allocates zero-initialized memory with the global allocator.
 ///
 /// This function forwards calls to the [`GlobalAlloc::alloc_zeroed`] method
 /// of the allocator registered with the `#[global_allocator]` attribute
 /// if there is one, or the `std` crate’s default.
 ///
-/// This function is expected to be deprecated in favor of the `alloc_zeroed` method
+/// This function is expected to be deprecated in favor of the `allocate_zeroed` method
 /// of the [`Global`] type when it and the [`Allocator`] trait become stable.
 ///
 /// # Safety
@@ -142,11 +171,14 @@ pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 
 /// # Examples
 ///
 /// ```
-/// use std::alloc::{alloc_zeroed, dealloc, Layout};
+/// use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 ///
 /// unsafe {
 ///     let layout = Layout::new::<u16>();
 ///     let ptr = alloc_zeroed(layout);
+///     if ptr.is_null() {
+///         handle_alloc_error(layout);
+///     }
 ///
 ///     assert_eq!(*(ptr as *mut u16), 0);
 ///
@@ -156,28 +188,52 @@ pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 
 #[stable(feature = "global_alloc", since = "1.28.0")]
 #[must_use = "losing the pointer will leak memory"]
 #[inline]
+#[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
-    unsafe { __rust_alloc_zeroed(layout.size(), layout.align()) }
+    unsafe {
+        // Make sure we don't accidentally allow omitting the allocator shim in
+        // stable code until it is actually stabilized.
+        __rust_no_alloc_shim_is_unstable_v2();
+
+        __rust_alloc_zeroed(layout.size(), layout.alignment())
+    }
 }
 
-#[cfg(not(test))]
 impl Global {
     #[inline]
-    fn alloc_impl(&self, layout: Layout, zeroed: bool) -> Result<NonNull<[u8]>, AllocError> {
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    fn alloc_impl_runtime(layout: Layout, zeroed: bool) -> Result<NonNull<[u8]>, AllocError> {
         match layout.size() {
-            0 => Ok(NonNull::slice_from_raw_parts(layout.dangling(), 0)),
+            0 => Ok(layout.dangling_ptr().cast_slice(0)),
             // SAFETY: `layout` is non-zero in size,
             size => unsafe {
                 let raw_ptr = if zeroed { alloc_zeroed(layout) } else { alloc(layout) };
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
-                Ok(NonNull::slice_from_raw_parts(ptr, size))
+                Ok(ptr.cast_slice(size))
             },
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    fn deallocate_impl_runtime(ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() != 0 {
+            // SAFETY:
+            // * We have checked that `layout` is non-zero in size.
+            // * The caller is obligated to provide a layout that "fits", and in this case,
+            //   "fit" always means a layout that is equal to the original, because our
+            //   `allocate()`, `grow()`, and `shrink()` implementations never returns a larger
+            //   allocation than requested.
+            // * Other conditions must be upheld by the caller, as per `Allocator::deallocate()`'s
+            //   safety documentation.
+            unsafe { dealloc_nonnull(ptr, layout) }
         }
     }
 
     // SAFETY: Same as `Allocator::grow`
     #[inline]
-    unsafe fn grow_impl(
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    fn grow_impl_runtime(
         &self,
         ptr: NonNull<u8>,
         old_layout: Layout,
@@ -198,14 +254,14 @@ impl Global {
                 let new_size = new_layout.size();
 
                 // `realloc` probably checks for `new_size >= old_layout.size()` or something similar.
-                intrinsics::assume(new_size >= old_layout.size());
+                hint::assert_unchecked(new_size >= old_layout.size());
 
-                let raw_ptr = realloc(ptr.as_ptr(), old_layout, new_size);
+                let raw_ptr = realloc_nonnull(ptr, old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
                 if zeroed {
                     raw_ptr.add(old_size).write_bytes(0, new_size - old_size);
                 }
-                Ok(NonNull::slice_from_raw_parts(ptr, new_size))
+                Ok(ptr.cast_slice(new_size))
             },
 
             // SAFETY: because `new_layout.size()` must be greater than or equal to `old_size`,
@@ -221,58 +277,16 @@ impl Global {
             },
         }
     }
-}
 
-#[unstable(feature = "allocator_api", issue = "32838")]
-#[cfg(not(test))]
-unsafe impl Allocator for Global {
+    // SAFETY: Same as `Allocator::grow`
     #[inline]
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.alloc_impl(layout, false)
-    }
-
-    #[inline]
-    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.alloc_impl(layout, true)
-    }
-
-    #[inline]
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        if layout.size() != 0 {
-            // SAFETY: `layout` is non-zero in size,
-            // other conditions must be upheld by the caller
-            unsafe { dealloc(ptr.as_ptr(), layout) }
-        }
-    }
-
-    #[inline]
-    unsafe fn grow(
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    fn shrink_impl_runtime(
         &self,
         ptr: NonNull<u8>,
         old_layout: Layout,
         new_layout: Layout,
-    ) -> Result<NonNull<[u8]>, AllocError> {
-        // SAFETY: all conditions must be upheld by the caller
-        unsafe { self.grow_impl(ptr, old_layout, new_layout, false) }
-    }
-
-    #[inline]
-    unsafe fn grow_zeroed(
-        &self,
-        ptr: NonNull<u8>,
-        old_layout: Layout,
-        new_layout: Layout,
-    ) -> Result<NonNull<[u8]>, AllocError> {
-        // SAFETY: all conditions must be upheld by the caller
-        unsafe { self.grow_impl(ptr, old_layout, new_layout, true) }
-    }
-
-    #[inline]
-    unsafe fn shrink(
-        &self,
-        ptr: NonNull<u8>,
-        old_layout: Layout,
-        new_layout: Layout,
+        _zeroed: bool,
     ) -> Result<NonNull<[u8]>, AllocError> {
         debug_assert!(
             new_layout.size() <= old_layout.size(),
@@ -283,17 +297,17 @@ unsafe impl Allocator for Global {
             // SAFETY: conditions must be upheld by the caller
             0 => unsafe {
                 self.deallocate(ptr, old_layout);
-                Ok(NonNull::slice_from_raw_parts(new_layout.dangling(), 0))
+                Ok(new_layout.dangling_ptr().cast_slice(0))
             },
 
             // SAFETY: `new_size` is non-zero. Other conditions must be upheld by the caller
             new_size if old_layout.align() == new_layout.align() => unsafe {
                 // `realloc` probably checks for `new_size <= old_layout.size()` or something similar.
-                intrinsics::assume(new_size <= old_layout.size());
+                hint::assert_unchecked(new_size <= old_layout.size());
 
-                let raw_ptr = realloc(ptr.as_ptr(), old_layout, new_size);
+                let raw_ptr = realloc_nonnull(ptr, old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
-                Ok(NonNull::slice_from_raw_parts(ptr, new_size))
+                Ok(ptr.cast_slice(new_size))
             },
 
             // SAFETY: because `new_size` must be smaller than or equal to `old_layout.size()`,
@@ -309,130 +323,256 @@ unsafe impl Allocator for Global {
             },
         }
     }
-}
 
-/// The allocator for unique pointers.
-#[cfg(all(not(no_global_oom_handling), not(test)))]
-#[lang = "exchange_malloc"]
-#[inline]
-unsafe fn exchange_malloc(size: usize, align: usize) -> *mut u8 {
-    let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
-    match Global.allocate(layout) {
-        Ok(ptr) => ptr.as_mut_ptr(),
-        Err(_) => handle_alloc_error(layout),
+    // SAFETY: Same as `Allocator::allocate`
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    const fn alloc_impl(&self, layout: Layout, zeroed: bool) -> Result<NonNull<[u8]>, AllocError> {
+        core::intrinsics::const_eval_select(
+            (layout, zeroed),
+            Global::alloc_impl_const,
+            Global::alloc_impl_runtime,
+        )
+    }
+
+    // SAFETY: Same as `Allocator::deallocate`
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    const unsafe fn deallocate_impl(&self, ptr: NonNull<u8>, layout: Layout) {
+        core::intrinsics::const_eval_select(
+            (ptr, layout),
+            Global::deallocate_impl_const,
+            Global::deallocate_impl_runtime,
+        )
+    }
+
+    // SAFETY: Same as `Allocator::grow`
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    const unsafe fn grow_impl(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+        zeroed: bool,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        core::intrinsics::const_eval_select(
+            (self, ptr, old_layout, new_layout, zeroed),
+            Global::grow_shrink_impl_const,
+            Global::grow_impl_runtime,
+        )
+    }
+
+    // SAFETY: Same as `Allocator::shrink`
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    const unsafe fn shrink_impl(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        core::intrinsics::const_eval_select(
+            (self, ptr, old_layout, new_layout, false),
+            Global::grow_shrink_impl_const,
+            Global::shrink_impl_runtime,
+        )
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    const fn alloc_impl_const(layout: Layout, zeroed: bool) -> Result<NonNull<[u8]>, AllocError> {
+        match layout.size() {
+            0 => Ok(layout.dangling_ptr().cast_slice(0)),
+            // SAFETY: `layout` is non-zero in size,
+            size => unsafe {
+                let raw_ptr = core::intrinsics::const_allocate(layout.size(), layout.align());
+                let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
+                if zeroed {
+                    // SAFETY: the pointer returned by `const_allocate` is valid to write to.
+                    ptr.write_bytes(0, size);
+                }
+                Ok(ptr.cast_slice(size))
+            },
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    const fn deallocate_impl_const(ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() != 0 {
+            // SAFETY: We checked for nonzero size; other preconditions must be upheld by caller.
+            unsafe {
+                core::intrinsics::const_deallocate(ptr.as_ptr(), layout.size(), layout.align());
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+    const fn grow_shrink_impl_const(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+        zeroed: bool,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        let new_ptr = self.alloc_impl(new_layout, zeroed)?;
+        // SAFETY: both pointers are valid and this operations is in bounds.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                ptr.as_ptr(),
+                new_ptr.as_mut_ptr(),
+                cmp::min(old_layout.size(), new_layout.size()),
+            );
+        }
+        unsafe {
+            self.deallocate_impl(ptr, old_layout);
+        }
+        Ok(new_ptr)
     }
 }
 
-#[cfg_attr(not(test), lang = "box_free")]
-#[inline]
-#[rustc_const_unstable(feature = "const_box", issue = "92521")]
-// This signature has to be the same as `Box`, otherwise an ICE will happen.
-// When an additional parameter to `Box` is added (like `A: Allocator`), this has to be added here as
-// well.
-// For example if `Box` is changed to  `struct Box<T: ?Sized, A: Allocator>(Unique<T>, A)`,
-// this function has to be changed to `fn box_free<T: ?Sized, A: Allocator>(Unique<T>, A)` as well.
-pub(crate) const unsafe fn box_free<T: ?Sized, A: ~const Allocator + ~const Destruct>(
-    ptr: Unique<T>,
-    alloc: A,
-) {
-    unsafe {
-        let size = size_of_val(ptr.as_ref());
-        let align = min_align_of_val(ptr.as_ref());
-        let layout = Layout::from_size_align_unchecked(size, align);
-        alloc.deallocate(From::from(ptr.cast()), layout)
+#[unstable(feature = "allocator_api", issue = "32838")]
+#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+const unsafe impl Allocator for Global {
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.alloc_impl(layout, false)
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        self.alloc_impl(layout, true)
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: all conditions must be upheld by the caller
+        unsafe { self.deallocate_impl(ptr, layout) }
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: all conditions must be upheld by the caller
+        unsafe { self.grow_impl(ptr, old_layout, new_layout, false) }
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    unsafe fn grow_zeroed(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: all conditions must be upheld by the caller
+        unsafe { self.grow_impl(ptr, old_layout, new_layout, true) }
+    }
+
+    #[inline]
+    #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+    unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        // SAFETY: all conditions must be upheld by the caller
+        unsafe { self.shrink_impl(ptr, old_layout, new_layout) }
     }
 }
 
 // # Allocation error handler
 
 #[cfg(not(no_global_oom_handling))]
-extern "Rust" {
-    // This is the magic symbol to call the global alloc error handler.  rustc generates
+unsafe extern "Rust" {
+    // This is the magic symbol to call the global alloc error handler. rustc generates
     // it to call `__rg_oom` if there is a `#[alloc_error_handler]`, or to call the
-    // default implementations below (`__rdl_oom`) otherwise.
+    // default implementations below (`__rdl_alloc_error_handler`) otherwise.
+    #[rustc_std_internal_symbol]
     fn __rust_alloc_error_handler(size: usize, align: usize) -> !;
 }
 
-/// Abort on memory allocation error or failure.
+/// Signals a memory allocation error.
 ///
-/// Callers of memory allocation APIs wishing to abort computation
+/// Callers of memory allocation APIs wishing to cease execution
 /// in response to an allocation error are encouraged to call this function,
-/// rather than directly invoking `panic!` or similar.
+/// rather than directly invoking [`panic!`] or similar.
 ///
-/// The default behavior of this function is to print a message to standard error
-/// and abort the process.
-/// It can be replaced with [`set_alloc_error_hook`] and [`take_alloc_error_hook`].
+/// This function is guaranteed to diverge (not return normally with a value), but depending on
+/// global configuration, it may either panic (resulting in unwinding or aborting as per
+/// configuration for all panics), or abort the process (with no unwinding).
+///
+/// The default behavior is:
+///
+///  * If the binary links against `std` (typically the case), then
+///   print a message to standard error and abort the process.
+///   This behavior can be replaced with [`set_alloc_error_hook`] and [`take_alloc_error_hook`].
+///   Future versions of Rust may panic by default instead.
+///
+/// * If the binary does not link against `std` (all of its crates are marked
+///   [`#![no_std]`][no_std]), then call [`panic!`] with a message.
+///   [The panic handler] applies as to any panic.
 ///
 /// [`set_alloc_error_hook`]: ../../std/alloc/fn.set_alloc_error_hook.html
 /// [`take_alloc_error_hook`]: ../../std/alloc/fn.take_alloc_error_hook.html
+/// [The panic handler]: https://doc.rust-lang.org/reference/runtime.html#the-panic_handler-attribute
+/// [no_std]: https://doc.rust-lang.org/reference/names/preludes.html#the-no_std-attribute
 #[stable(feature = "global_alloc", since = "1.28.0")]
 #[rustc_const_unstable(feature = "const_alloc_error", issue = "92523")]
-#[cfg(all(not(no_global_oom_handling), not(test)))]
+#[cfg(not(no_global_oom_handling))]
 #[cold]
+#[optimize(size)]
 pub const fn handle_alloc_error(layout: Layout) -> ! {
     const fn ct_error(_: Layout) -> ! {
         panic!("allocation failed");
     }
 
+    #[inline]
     fn rt_error(layout: Layout) -> ! {
         unsafe {
             __rust_alloc_error_handler(layout.size(), layout.align());
         }
     }
 
-    unsafe { core::intrinsics::const_eval_select((layout,), ct_error, rt_error) }
+    #[cfg(not(panic = "immediate-abort"))]
+    {
+        core::intrinsics::const_eval_select((layout,), ct_error, rt_error)
+    }
+
+    #[cfg(panic = "immediate-abort")]
+    ct_error(layout)
 }
 
-// For alloc test `std::alloc::handle_alloc_error` can be used directly.
-#[cfg(all(not(no_global_oom_handling), test))]
-pub use std::alloc::handle_alloc_error;
-
-#[cfg(all(not(no_global_oom_handling), not(any(target_os = "hermit", test))))]
+#[cfg(not(no_global_oom_handling))]
 #[doc(hidden)]
 #[allow(unused_attributes)]
 #[unstable(feature = "alloc_internals", issue = "none")]
 pub mod __alloc_error_handler {
-    use crate::alloc::Layout;
-
-    // called via generated `__rust_alloc_error_handler`
-
-    // if there is no `#[alloc_error_handler]`
+    // called via generated `__rust_alloc_error_handler` if there is no
+    // `#[alloc_error_handler]`.
     #[rustc_std_internal_symbol]
-    pub unsafe extern "C-unwind" fn __rdl_oom(size: usize, _align: usize) -> ! {
-        panic!("memory allocation of {size} bytes failed")
-    }
-
-    // if there is an `#[alloc_error_handler]`
-    #[rustc_std_internal_symbol]
-    pub unsafe extern "C-unwind" fn __rg_oom(size: usize, align: usize) -> ! {
-        let layout = unsafe { Layout::from_size_align_unchecked(size, align) };
-        extern "Rust" {
-            #[lang = "oom"]
-            fn oom_impl(layout: Layout) -> !;
-        }
-        unsafe { oom_impl(layout) }
-    }
-}
-
-/// Specialize clones into pre-allocated, uninitialized memory.
-/// Used by `Box::clone` and `Rc`/`Arc::make_mut`.
-pub(crate) trait WriteCloneIntoRaw: Sized {
-    unsafe fn write_clone_into_raw(&self, target: *mut Self);
-}
-
-impl<T: Clone> WriteCloneIntoRaw for T {
-    #[inline]
-    default unsafe fn write_clone_into_raw(&self, target: *mut Self) {
-        // Having allocated *first* may allow the optimizer to create
-        // the cloned value in-place, skipping the local and move.
-        unsafe { target.write(self.clone()) };
-    }
-}
-
-impl<T: Copy> WriteCloneIntoRaw for T {
-    #[inline]
-    unsafe fn write_clone_into_raw(&self, target: *mut Self) {
-        // We can always copy in-place, without ever involving a local value.
-        unsafe { target.copy_from_nonoverlapping(self, 1) };
+    pub unsafe fn __rdl_alloc_error_handler(size: usize, _align: usize) -> ! {
+        core::panicking::panic_nounwind_fmt(
+            format_args!("memory allocation of {size} bytes failed"),
+            /* force_no_backtrace */ false,
+        )
     }
 }

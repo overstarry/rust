@@ -1,5 +1,5 @@
 #![warn(clippy::derive_ord_xor_partial_ord)]
-#![allow(clippy::unnecessary_wraps)]
+#![expect(clippy::non_canonical_partial_ord_impl)]
 
 use std::cmp::Ordering;
 
@@ -19,6 +19,8 @@ impl PartialOrd<u64> for DeriveBoth {
 }
 
 #[derive(Ord, PartialEq, Eq)]
+//~^ derive_ord_xor_partial_ord
+
 struct DeriveOrd;
 
 impl PartialOrd for DeriveOrd {
@@ -28,6 +30,8 @@ impl PartialOrd for DeriveOrd {
 }
 
 #[derive(Ord, PartialEq, Eq)]
+//~^ derive_ord_xor_partial_ord
+
 struct DeriveOrdWithExplicitTypeVariable;
 
 impl PartialOrd<DeriveOrdWithExplicitTypeVariable> for DeriveOrdWithExplicitTypeVariable {
@@ -40,6 +44,8 @@ impl PartialOrd<DeriveOrdWithExplicitTypeVariable> for DeriveOrdWithExplicitType
 struct DerivePartialOrd;
 
 impl std::cmp::Ord for DerivePartialOrd {
+    //~^ derive_ord_xor_partial_ord
+
     fn cmp(&self, other: &Self) -> Ordering {
         Ordering::Less
     }
@@ -60,6 +66,8 @@ mod use_ord {
     struct DerivePartialOrdInUseOrd;
 
     impl Ord for DerivePartialOrdInUseOrd {
+        //~^ derive_ord_xor_partial_ord
+
         fn cmp(&self, other: &Self) -> Ordering {
             Ordering::Less
         }
@@ -67,3 +75,32 @@ mod use_ord {
 }
 
 fn main() {}
+
+mod issue15708 {
+    use std::cmp::{Ord, Ordering};
+
+    // Check that the lint posts on the type definition node
+    #[expect(clippy::derive_ord_xor_partial_ord)]
+    #[derive(PartialOrd, PartialEq, Eq)]
+    struct DerivePartialOrdInUseOrd;
+
+    impl Ord for DerivePartialOrdInUseOrd {
+        fn cmp(&self, other: &Self) -> Ordering {
+            Ordering::Less
+        }
+    }
+}
+
+mod issue16298 {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+    struct Normalized<S>(S);
+
+    impl<S: Eq> Eq for Normalized<S> {}
+
+    #[expect(clippy::derive_ord_xor_partial_ord)]
+    impl<S: Eq + PartialOrd> Ord for Normalized<S> {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.partial_cmp(other).unwrap()
+        }
+    }
+}

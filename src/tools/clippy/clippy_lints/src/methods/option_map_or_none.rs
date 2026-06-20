@@ -1,16 +1,14 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::is_none_expr;
+use clippy_utils::res::{MaybeDef, MaybeQPath};
 use clippy_utils::source::snippet;
-use clippy_utils::ty::is_type_diagnostic_item;
-use clippy_utils::{is_lang_ctor, path_def_id};
 use rustc_errors::Applicability;
 use rustc_hir as hir;
-use rustc_hir::LangItem::{OptionNone, OptionSome};
+use rustc_hir::LangItem::OptionSome;
 use rustc_lint::LateContext;
-use rustc_middle::ty::DefIdTree;
 use rustc_span::symbol::sym;
 
-use super::OPTION_MAP_OR_NONE;
-use super::RESULT_MAP_OR_INTO_OPTION;
+use super::{OPTION_MAP_OR_NONE, RESULT_MAP_OR_INTO_OPTION};
 
 // The expression inside a closure may or may not have surrounding braces
 // which causes problems when generating a suggestion.
@@ -39,8 +37,8 @@ pub(super) fn check<'tcx>(
     def_arg: &'tcx hir::Expr<'_>,
     map_arg: &'tcx hir::Expr<'_>,
 ) {
-    let is_option = is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(recv), sym::Option);
-    let is_result = is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(recv), sym::Result);
+    let is_option = cx.typeck_results().expr_ty(recv).is_diag_item(cx, sym::Option);
+    let is_result = cx.typeck_results().expr_ty(recv).is_diag_item(cx, sym::Result);
 
     // There are two variants of this `map_or` lint:
     // (1) using `map_or` as an adapter from `Result<T,E>` to `Option<T>`
@@ -51,72 +49,56 @@ pub(super) fn check<'tcx>(
         return;
     }
 
-    let default_arg_is_none = if let hir::ExprKind::Path(ref qpath) = def_arg.kind {
-        is_lang_ctor(cx, qpath, OptionNone)
-    } else {
-        return;
-    };
-
-    if !default_arg_is_none {
+    if !is_none_expr(cx, def_arg) {
         // nothing to lint!
         return;
     }
 
-    let f_arg_is_some = if let hir::ExprKind::Path(ref qpath) = map_arg.kind {
-        is_lang_ctor(cx, qpath, OptionSome)
-    } else {
-        false
-    };
+    let f_arg_is_some = map_arg.res(cx).ctor_parent(cx).is_lang_item(cx, OptionSome);
 
     if is_option {
         let self_snippet = snippet(cx, recv.span, "..");
-        if_chain! {
-        if let hir::ExprKind::Closure(_, _, id, span, _) = map_arg.kind;
-            let arg_snippet = snippet(cx, span, "..");
-            let body = cx.tcx.hir().body(id);
-                if let Some((func, [arg_char])) = reduce_unit_expression(&body.value);
-                if let Some(id) = path_def_id(cx, func).and_then(|ctor_id| cx.tcx.parent(ctor_id));
-                if Some(id) == cx.tcx.lang_items().option_some_variant();
-                then {
-                    let func_snippet = snippet(cx, arg_char.span, "..");
-                    let msg = "called `map_or(None, ..)` on an `Option` value. This can be done more directly by calling \
-                       `map(..)` instead";
-                    return span_lint_and_sugg(
-                        cx,
-                        OPTION_MAP_OR_NONE,
-                        expr.span,
-                        msg,
-                        "try using `map` instead",
-                        format!("{0}.map({1} {2})", self_snippet, arg_snippet,func_snippet),
-                        Applicability::MachineApplicable,
-                    );
-                }
-
+        if let hir::ExprKind::Closure(&hir::Closure { body, fn_decl_span, .. }) = map_arg.kind
+            && let arg_snippet = snippet(cx, fn_decl_span, "..")
+            && let body = cx.tcx.hir_body(body)
+            && let Some((func, [arg_char])) = reduce_unit_expression(body.value)
+            && let Some(id) = func.res(cx).opt_def_id().map(|ctor_id| cx.tcx.parent(ctor_id))
+            && Some(id) == cx.tcx.lang_items().option_some_variant()
+        {
+            let func_snippet = snippet(cx, arg_char.span, "..");
+            let msg = "called `map_or(None, ..)` on an `Option` value";
+            return span_lint_and_sugg(
+                cx,
+                OPTION_MAP_OR_NONE,
+                expr.span,
+                msg,
+                "consider using `map`",
+                format!("{self_snippet}.map({arg_snippet} {func_snippet})"),
+                Applicability::MachineApplicable,
+            );
         }
 
         let func_snippet = snippet(cx, map_arg.span, "..");
-        let msg = "called `map_or(None, ..)` on an `Option` value. This can be done more directly by calling \
-                       `and_then(..)` instead";
-        return span_lint_and_sugg(
+        let msg = "called `map_or(None, ..)` on an `Option` value";
+        span_lint_and_sugg(
             cx,
             OPTION_MAP_OR_NONE,
             expr.span,
             msg,
-            "try using `and_then` instead",
-            format!("{0}.and_then({1})", self_snippet, func_snippet),
+            "consider using `and_then`",
+            format!("{self_snippet}.and_then({func_snippet})"),
             Applicability::MachineApplicable,
         );
     } else if f_arg_is_some {
-        let msg = "called `map_or(None, Some)` on a `Result` value. This can be done more directly by calling \
-                       `ok()` instead";
+        let msg = "called `map_or(None, Some)` on a `Result` value";
         let self_snippet = snippet(cx, recv.span, "..");
-        return span_lint_and_sugg(
+        span_lint_and_sugg(
             cx,
             RESULT_MAP_OR_INTO_OPTION,
             expr.span,
             msg,
-            "try using `ok` instead",
-            format!("{0}.ok()", self_snippet),
+            "consider using `ok`",
+            format!("{self_snippet}.ok()"),
             Applicability::MachineApplicable,
         );
     }

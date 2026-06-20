@@ -1,5 +1,5 @@
-#![allow(clippy::redundant_clone, clippy::unnecessary_operation)]
-#![warn(clippy::manual_non_exhaustive, clippy::borrow_as_ptr, clippy::manual_bits)]
+#![allow(clippy::incompatible_msrv, clippy::redundant_clone, clippy::unnecessary_operation)]
+#![warn(clippy::borrow_as_ptr, clippy::manual_bits, clippy::manual_non_exhaustive)]
 
 use std::mem::{size_of, size_of_val};
 use std::ops::Deref;
@@ -41,7 +41,7 @@ fn match_like_matches() {
 fn match_same_arms() {
     match (1, 2, 3) {
         (1, .., 3) => 42,
-        (.., 3) => 42, //~ ERROR match arms have same body
+        (.., 3) => 42,
         _ => 0,
     };
 }
@@ -49,7 +49,7 @@ fn match_same_arms() {
 fn match_same_arms2() {
     let _ = match Some(42) {
         Some(_) => 24,
-        None => 24, //~ ERROR match arms have same body
+        None => 24,
     };
 }
 
@@ -72,6 +72,7 @@ fn check_index_refutable_slice() {
 fn map_clone_suggest_copied() {
     // This should still trigger the lint but suggest `cloned()` instead of `copied()`
     let _: Option<u64> = Some(&16).map(|b| *b);
+    //~^ map_clone
 }
 
 fn borrow_as_ptr() {
@@ -87,12 +88,4 @@ fn manual_bits() {
     size_of_val(&0u32) * 8;
 }
 
-fn main() {
-    option_as_ref_deref();
-    match_like_matches();
-    match_same_arms();
-    match_same_arms2();
-    manual_strip_msrv();
-    check_index_refutable_slice();
-    borrow_as_ptr();
-}
+fn main() {}

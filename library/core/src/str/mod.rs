@@ -13,124 +13,121 @@ mod iter;
 mod traits;
 mod validations;
 
-use self::pattern::Pattern;
-use self::pattern::{DoubleEndedSearcher, ReverseSearcher, Searcher};
-
+use self::pattern::{DoubleEndedSearcher, Pattern, ReverseSearcher, Searcher};
 use crate::char::{self, EscapeDebugExtArgs};
-use crate::mem;
+use crate::hint::assert_unchecked;
+use crate::range::Range;
 use crate::slice::{self, SliceIndex};
+use crate::ub_checks::assert_unsafe_precondition;
+use crate::{ascii, mem};
 
 pub mod pattern;
 
-#[unstable(feature = "str_internals", issue = "none")]
-#[allow(missing_docs)]
-pub mod lossy;
-
+mod lossy;
+#[unstable(feature = "str_from_raw_parts", issue = "119206")]
+pub use converts::{from_raw_parts, from_raw_parts_mut};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use converts::{from_utf8, from_utf8_unchecked};
-
 #[stable(feature = "str_mut_extras", since = "1.20.0")]
 pub use converts::{from_utf8_mut, from_utf8_unchecked_mut};
-
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use error::{ParseBoolError, Utf8Error};
-
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use traits::FromStr;
-
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use iter::{Bytes, CharIndices, Chars, Lines, SplitWhitespace};
-
+#[stable(feature = "encode_utf16", since = "1.8.0")]
+pub use iter::EncodeUtf16;
 #[stable(feature = "rust1", since = "1.0.0")]
 #[allow(deprecated)]
 pub use iter::LinesAny;
-
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use iter::{RSplit, RSplitTerminator, Split, SplitTerminator};
-
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use iter::{RSplitN, SplitN};
-
-#[stable(feature = "str_matches", since = "1.2.0")]
-pub use iter::{Matches, RMatches};
-
-#[stable(feature = "str_match_indices", since = "1.5.0")]
-pub use iter::{MatchIndices, RMatchIndices};
-
-#[stable(feature = "encode_utf16", since = "1.8.0")]
-pub use iter::EncodeUtf16;
-
-#[stable(feature = "str_escape", since = "1.34.0")]
-pub use iter::{EscapeDebug, EscapeDefault, EscapeUnicode};
-
 #[stable(feature = "split_ascii_whitespace", since = "1.34.0")]
 pub use iter::SplitAsciiWhitespace;
-
 #[stable(feature = "split_inclusive", since = "1.51.0")]
 pub use iter::SplitInclusive;
-
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use iter::{Bytes, CharIndices, Chars, Lines, SplitWhitespace};
+#[stable(feature = "str_escape", since = "1.34.0")]
+pub use iter::{EscapeDebug, EscapeDefault, EscapeUnicode};
+#[stable(feature = "str_match_indices", since = "1.5.0")]
+pub use iter::{MatchIndices, RMatchIndices};
+use iter::{MatchIndicesInternal, MatchesInternal, SplitInternal, SplitNInternal};
+#[stable(feature = "str_matches", since = "1.2.0")]
+pub use iter::{Matches, RMatches};
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use iter::{RSplit, RSplitTerminator, Split, SplitTerminator};
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use iter::{RSplitN, SplitN};
+#[stable(feature = "utf8_chunks", since = "1.79.0")]
+pub use lossy::{Utf8Chunk, Utf8Chunks};
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use traits::FromStr;
 #[unstable(feature = "str_internals", issue = "none")]
 pub use validations::{next_code_point, utf8_char_width};
-
-use iter::MatchIndicesInternal;
-use iter::SplitInternal;
-use iter::{MatchesInternal, SplitNInternal};
 
 #[inline(never)]
 #[cold]
 #[track_caller]
 #[rustc_allow_const_fn_unstable(const_eval_select)]
+#[cfg(not(panic = "immediate-abort"))]
 const fn slice_error_fail(s: &str, begin: usize, end: usize) -> ! {
-    // SAFETY: panics for both branches
-    unsafe {
-        crate::intrinsics::const_eval_select(
-            (s, begin, end),
-            slice_error_fail_ct,
-            slice_error_fail_rt,
-        )
-    }
+    crate::intrinsics::const_eval_select((s, begin, end), slice_error_fail_ct, slice_error_fail_rt)
 }
 
+#[cfg(panic = "immediate-abort")]
+const fn slice_error_fail(s: &str, begin: usize, end: usize) -> ! {
+    slice_error_fail_ct(s, begin, end)
+}
+
+#[track_caller]
 const fn slice_error_fail_ct(_: &str, _: usize, _: usize) -> ! {
     panic!("failed to slice string");
 }
 
+#[track_caller]
 fn slice_error_fail_rt(s: &str, begin: usize, end: usize) -> ! {
-    const MAX_DISPLAY_LENGTH: usize = 256;
-    let trunc_len = s.floor_char_boundary(MAX_DISPLAY_LENGTH);
-    let s_trunc = &s[..trunc_len];
-    let ellipsis = if trunc_len < s.len() { "[...]" } else { "" };
+    let len = s.len();
 
-    // 1. out of bounds
-    if begin > s.len() || end > s.len() {
-        let oob_index = if begin > s.len() { begin } else { end };
-        panic!("byte index {oob_index} is out of bounds of `{s_trunc}`{ellipsis}");
+    // 1. begin is OOB.
+    if begin > len {
+        panic!("start byte index {begin} is out of bounds for string of length {len}");
     }
 
-    // 2. begin <= end
-    assert!(
-        begin <= end,
-        "begin <= end ({} <= {}) when slicing `{}`{}",
-        begin,
-        end,
-        s_trunc,
-        ellipsis
-    );
+    // 2. end is OOB.
+    if end > len {
+        panic!("end byte index {end} is out of bounds for string of length {len}");
+    }
 
-    // 3. character boundary
-    let index = if !s.is_char_boundary(begin) { begin } else { end };
-    // find the character
-    let char_start = s.floor_char_boundary(index);
-    // `char_start` must be less than len and a char boundary
-    let ch = s[char_start..].chars().next().unwrap();
-    let char_range = char_start..char_start + ch.len_utf8();
-    panic!(
-        "byte index {} is not a char boundary; it is inside {:?} (bytes {:?}) of `{}`{}",
-        index, ch, char_range, s_trunc, ellipsis
-    );
+    // 3. range is backwards.
+    if begin > end {
+        panic!("byte range starts at {begin} but ends at {end}");
+    }
+
+    // 4. begin is inside a character.
+    if !s.is_char_boundary(begin) {
+        let floor = s.floor_char_boundary(begin);
+        let ceil = s.ceil_char_boundary(begin);
+        let range = floor..ceil;
+        let ch = s[floor..ceil].chars().next().unwrap();
+        panic!(
+            "start byte index {begin} is not a char boundary; it is inside {ch:?} (bytes {range:?} of string)"
+        )
+    }
+
+    // 5. end is inside a character.
+    if !s.is_char_boundary(end) {
+        let floor = s.floor_char_boundary(end);
+        let ceil = s.ceil_char_boundary(end);
+        let range = floor..ceil;
+        let ch = s[floor..ceil].chars().next().unwrap();
+        panic!(
+            "end byte index {end} is not a char boundary; it is inside {ch:?} (bytes {range:?} of string)"
+        )
+    }
+
+    // 6. end is OOB and range is inclusive (end == len).
+    // This test cannot be combined with 2. above because for cases like
+    // `"abcαβγ"[4..9]` the error is that 4 is inside 'α', not that 9 is OOB.
+    debug_assert_eq!(end, len);
+    panic!("end byte index {end} is out of bounds for string of length {len}");
 }
 
-#[cfg(not(test))]
 impl str {
     /// Returns the length of `self`.
     ///
@@ -141,8 +138,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let len = "foo".len();
     /// assert_eq!(3, len);
@@ -152,6 +147,8 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "const_str_len", since = "1.39.0")]
+    #[rustc_diagnostic_item = "str_len"]
+    #[rustc_no_implicit_autorefs]
     #[must_use]
     #[inline]
     pub const fn len(&self) -> usize {
@@ -162,8 +159,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s = "";
     /// assert!(s.is_empty());
@@ -173,10 +168,180 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "const_str_is_empty", since = "1.39.0")]
+    #[rustc_no_implicit_autorefs]
     #[must_use]
     #[inline]
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Converts a slice of bytes to a string slice.
+    ///
+    /// A string slice ([`&str`]) is made of bytes ([`u8`]), and a byte slice
+    /// ([`&[u8]`][byteslice]) is made of bytes, so this function converts between
+    /// the two. Not all byte slices are valid string slices, however: [`&str`] requires
+    /// that it is valid UTF-8. `from_utf8()` checks to ensure that the bytes are valid
+    /// UTF-8, and then does the conversion.
+    ///
+    /// [`&str`]: str
+    /// [byteslice]: prim@slice
+    ///
+    /// If you are sure that the byte slice is valid UTF-8, and you don't want to
+    /// incur the overhead of the validity check, there is an unsafe version of
+    /// this function, [`from_utf8_unchecked`], which has the same
+    /// behavior but skips the check.
+    ///
+    /// If you need a `String` instead of a `&str`, consider
+    /// [`String::from_utf8`][string].
+    ///
+    /// [string]: ../std/string/struct.String.html#method.from_utf8
+    ///
+    /// Because you can stack-allocate a `[u8; N]`, and you can take a
+    /// [`&[u8]`][byteslice] of it, this function is one way to have a
+    /// stack-allocated string. There is an example of this in the
+    /// examples section below.
+    ///
+    /// [byteslice]: slice
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the slice is not UTF-8 with a description as to why the
+    /// provided slice is not UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// // some bytes, in a vector
+    /// let sparkle_heart = vec![240, 159, 146, 150];
+    ///
+    /// // We can use the ? (try) operator to check if the bytes are valid
+    /// let sparkle_heart = str::from_utf8(&sparkle_heart)?;
+    ///
+    /// assert_eq!("💖", sparkle_heart);
+    /// # Ok::<_, std::str::Utf8Error>(())
+    /// ```
+    ///
+    /// Incorrect bytes:
+    ///
+    /// ```
+    /// // some invalid bytes, in a vector
+    /// let sparkle_heart = vec![0, 159, 146, 150];
+    ///
+    /// assert!(str::from_utf8(&sparkle_heart).is_err());
+    /// ```
+    ///
+    /// See the docs for [`Utf8Error`] for more details on the kinds of
+    /// errors that can be returned.
+    ///
+    /// A "stack allocated string":
+    ///
+    /// ```
+    /// // some bytes, in a stack-allocated array
+    /// let sparkle_heart = [240, 159, 146, 150];
+    ///
+    /// // We know these bytes are valid, so just use `unwrap()`.
+    /// let sparkle_heart: &str = str::from_utf8(&sparkle_heart).unwrap();
+    ///
+    /// assert_eq!("💖", sparkle_heart);
+    /// ```
+    #[stable(feature = "inherent_str_constructors", since = "1.87.0")]
+    #[rustc_const_stable(feature = "inherent_str_constructors", since = "1.87.0")]
+    #[rustc_diagnostic_item = "str_inherent_from_utf8"]
+    pub const fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
+        converts::from_utf8(v)
+    }
+
+    /// Converts a mutable slice of bytes to a mutable string slice.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// // "Hello, Rust!" as a mutable vector
+    /// let mut hellorust = vec![72, 101, 108, 108, 111, 44, 32, 82, 117, 115, 116, 33];
+    ///
+    /// // As we know these bytes are valid, we can use `unwrap()`
+    /// let outstr = str::from_utf8_mut(&mut hellorust).unwrap();
+    ///
+    /// assert_eq!("Hello, Rust!", outstr);
+    /// ```
+    ///
+    /// Incorrect bytes:
+    ///
+    /// ```
+    /// // Some invalid bytes in a mutable vector
+    /// let mut invalid = vec![128, 223];
+    ///
+    /// assert!(str::from_utf8_mut(&mut invalid).is_err());
+    /// ```
+    /// See the docs for [`Utf8Error`] for more details on the kinds of
+    /// errors that can be returned.
+    #[stable(feature = "inherent_str_constructors", since = "1.87.0")]
+    #[rustc_const_stable(feature = "const_str_from_utf8", since = "1.87.0")]
+    #[rustc_diagnostic_item = "str_inherent_from_utf8_mut"]
+    pub const fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
+        converts::from_utf8_mut(v)
+    }
+
+    /// Converts a slice of bytes to a string slice without checking
+    /// that the string contains valid UTF-8.
+    ///
+    /// See the safe version, [`from_utf8`], for more information.
+    ///
+    /// # Safety
+    ///
+    /// The bytes passed in must be valid UTF-8.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// // some bytes, in a vector
+    /// let sparkle_heart = vec![240, 159, 146, 150];
+    ///
+    /// let sparkle_heart = unsafe {
+    ///     str::from_utf8_unchecked(&sparkle_heart)
+    /// };
+    ///
+    /// assert_eq!("💖", sparkle_heart);
+    /// ```
+    #[inline]
+    #[must_use]
+    #[stable(feature = "inherent_str_constructors", since = "1.87.0")]
+    #[rustc_const_stable(feature = "inherent_str_constructors", since = "1.87.0")]
+    #[rustc_diagnostic_item = "str_inherent_from_utf8_unchecked"]
+    pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
+        // SAFETY: converts::from_utf8_unchecked has the same safety requirements as this function.
+        unsafe { converts::from_utf8_unchecked(v) }
+    }
+
+    /// Converts a slice of bytes to a string slice without checking
+    /// that the string contains valid UTF-8; mutable version.
+    ///
+    /// See the immutable version, [`from_utf8_unchecked()`] for documentation and safety requirements.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// let mut heart = vec![240, 159, 146, 150];
+    /// let heart = unsafe { str::from_utf8_unchecked_mut(&mut heart) };
+    ///
+    /// assert_eq!("💖", heart);
+    /// ```
+    #[inline]
+    #[must_use]
+    #[stable(feature = "inherent_str_constructors", since = "1.87.0")]
+    #[rustc_const_stable(feature = "inherent_str_constructors", since = "1.87.0")]
+    #[rustc_diagnostic_item = "str_inherent_from_utf8_unchecked_mut"]
+    pub const unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
+        // SAFETY: converts::from_utf8_unchecked_mut has the same safety requirements as this function.
+        unsafe { converts::from_utf8_unchecked_mut(v) }
     }
 
     /// Checks that `index`-th byte is the first byte in a UTF-8 code point
@@ -204,7 +369,7 @@ impl str {
     /// ```
     #[must_use]
     #[stable(feature = "is_char_boundary", since = "1.9.0")]
-    #[rustc_const_unstable(feature = "const_is_char_boundary", issue = "none")]
+    #[rustc_const_stable(feature = "const_is_char_boundary", since = "1.86.0")]
     #[inline]
     pub const fn is_char_boundary(&self, index: usize) -> bool {
         // 0 is always ok.
@@ -215,8 +380,8 @@ impl str {
             return true;
         }
 
-        match self.as_bytes().get(index) {
-            // For `None` we have two options:
+        if index >= self.len() {
+            // For `true` we have two options:
             //
             // - index == self.len()
             //   Empty strings are valid, so return true
@@ -225,13 +390,13 @@ impl str {
             //
             // The check is placed exactly here, because it improves generated
             // code on higher opt-levels. See PR #84751 for more details.
-            None => index == self.len(),
-
-            Some(&b) => b.is_utf8_char_boundary(),
+            index == self.len()
+        } else {
+            self.as_bytes()[index].is_utf8_char_boundary()
         }
     }
 
-    /// Finds the closest `x` not exceeding `index` where `is_char_boundary(x)` is `true`.
+    /// Finds the closest `x` not exceeding `index` where [`is_char_boundary(x)`] is `true`.
     ///
     /// This method can help you truncate a string so that it's still valid UTF-8, but doesn't
     /// exceed a given number of bytes. Note that this is done purely at the character level
@@ -239,10 +404,11 @@ impl str {
     /// split. For example, the emoji 🧑‍🔬 (scientist) could be split so that the string only
     /// includes 🧑 (person) instead.
     ///
+    /// [`is_char_boundary(x)`]: Self::is_char_boundary
+    ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(round_char_boundary)]
     /// let s = "❤️🧡💛💚💙💜";
     /// assert_eq!(s.len(), 26);
     /// assert!(!s.is_char_boundary(13));
@@ -251,37 +417,55 @@ impl str {
     /// assert_eq!(closest, 10);
     /// assert_eq!(&s[..closest], "❤️🧡");
     /// ```
-    #[unstable(feature = "round_char_boundary", issue = "93743")]
+    #[stable(feature = "round_char_boundary", since = "1.91.0")]
+    #[rustc_const_stable(feature = "round_char_boundary", since = "1.91.0")]
     #[inline]
-    pub fn floor_char_boundary(&self, index: usize) -> usize {
+    pub const fn floor_char_boundary(&self, index: usize) -> usize {
         if index >= self.len() {
-            self.len()
-        } else {
-            let lower_bound = index.saturating_sub(3);
-            let new_index = self.as_bytes()[lower_bound..=index]
-                .iter()
-                .rposition(|b| b.is_utf8_char_boundary());
-
-            // SAFETY: we know that the character boundary will be within four bytes
-            unsafe { lower_bound + new_index.unwrap_unchecked() }
+            return self.len();
         }
+        if self.as_bytes()[index].is_utf8_char_boundary() {
+            return index;
+        }
+        // Unlike `ceil_char_boundary`, the loop is unrolled manually to prevent the compiler from
+        // generating excessive unrolled loop bodies when `index` is statically known.
+
+        // The first byte of `&str` must always be a char boundary, so we can assume `i > 0` below
+        // for any `i` where `self.as_bytes()[i]` is not a char boundary.
+        debug_assert!(self.as_bytes()[0].is_utf8_char_boundary());
+
+        // SAFETY: `self.as_bytes()[0]` is always a char boundary with valid `&str`
+        unsafe { assert_unchecked(index >= 1) };
+        if self.as_bytes()[index - 1].is_utf8_char_boundary() {
+            return index - 1;
+        }
+
+        // SAFETY: `self.as_bytes()[0]` is always a char boundary with valid `&str`
+        unsafe { assert_unchecked(index >= 2) };
+        if self.as_bytes()[index - 2].is_utf8_char_boundary() {
+            return index - 2;
+        }
+
+        // `self.as_bytes()[0]` is always a char boundary with valid `&str`
+        debug_assert!(index >= 3);
+        // The character boundary will be within four bytes of the index
+        debug_assert!(self.as_bytes()[index - 3].is_utf8_char_boundary());
+        index - 3
     }
 
-    /// Finds the closest `x` not below `index` where `is_char_boundary(x)` is `true`.
+    /// Finds the closest `x` not below `index` where [`is_char_boundary(x)`] is `true`.
+    ///
+    /// If `index` is greater than the length of the string, this returns the length of the string.
     ///
     /// This method is the natural complement to [`floor_char_boundary`]. See that method
     /// for more details.
     ///
     /// [`floor_char_boundary`]: str::floor_char_boundary
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index > self.len()`.
+    /// [`is_char_boundary(x)`]: Self::is_char_boundary
     ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(round_char_boundary)]
     /// let s = "❤️🧡💛💚💙💜";
     /// assert_eq!(s.len(), 26);
     /// assert!(!s.is_char_boundary(13));
@@ -290,17 +474,25 @@ impl str {
     /// assert_eq!(closest, 14);
     /// assert_eq!(&s[..closest], "❤️🧡💛");
     /// ```
-    #[unstable(feature = "round_char_boundary", issue = "93743")]
+    #[stable(feature = "round_char_boundary", since = "1.91.0")]
+    #[rustc_const_stable(feature = "round_char_boundary", since = "1.91.0")]
     #[inline]
-    pub fn ceil_char_boundary(&self, index: usize) -> usize {
-        if index > self.len() {
-            slice_error_fail(self, index, index)
+    pub const fn ceil_char_boundary(&self, index: usize) -> usize {
+        if index >= self.len() {
+            self.len()
         } else {
-            let upper_bound = Ord::min(index + 4, self.len());
-            self.as_bytes()[index..upper_bound]
-                .iter()
-                .position(|b| b.is_utf8_char_boundary())
-                .map_or(upper_bound, |pos| pos + index)
+            let mut i = index;
+            while !self.as_bytes()[i].is_utf8_char_boundary() {
+                i += 1;
+                if i >= self.len() {
+                    break;
+                }
+            }
+
+            // The character boundary will be within four bytes of the index
+            debug_assert!(i <= index + 3);
+
+            i
         }
     }
 
@@ -308,8 +500,6 @@ impl str {
     /// into a string slice, use the [`from_utf8`] function.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let bytes = "bors".as_bytes();
@@ -362,11 +552,12 @@ impl str {
     /// assert_eq!("🍔∈🌏", s);
     /// ```
     #[stable(feature = "str_mut_extras", since = "1.20.0")]
+    #[rustc_const_stable(feature = "const_str_as_mut", since = "1.83.0")]
     #[must_use]
     #[inline(always)]
-    pub unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
+    pub const unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: the cast from `&str` to `&[u8]` is safe since `str`
-        // has the same layout as `&[u8]` (only libstd can make this guarantee).
+        // has the same layout as `&[u8]` (only std can make this guarantee).
         // The pointer dereference is safe since it comes from a mutable reference which
         // is guaranteed to be valid for writes.
         unsafe { &mut *(self as *mut str as *mut [u8]) }
@@ -385,16 +576,16 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s = "Hello";
     /// let ptr = s.as_ptr();
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_const_stable(feature = "rustc_str_as_ptr", since = "1.32.0")]
+    #[rustc_never_returns_null_ptr]
+    #[rustc_as_ptr]
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const fn as_ptr(&self) -> *const u8 {
         self as *const str as *const u8
     }
@@ -408,9 +599,13 @@ impl str {
     /// It is your responsibility to make sure that the string slice only gets
     /// modified in a way that it remains valid UTF-8.
     #[stable(feature = "str_as_mut_ptr", since = "1.36.0")]
+    #[rustc_const_stable(feature = "const_str_as_mut", since = "1.83.0")]
+    #[rustc_never_returns_null_ptr]
+    #[rustc_as_ptr]
     #[must_use]
-    #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+    #[inline(always)]
+    #[rustc_no_writable]
+    pub const fn as_mut_ptr(&mut self) -> *mut u8 {
         self as *mut str as *mut u8
     }
 
@@ -434,9 +629,9 @@ impl str {
     /// assert!(v.get(..42).is_none());
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
+    #[rustc_const_unstable(feature = "const_index", issue = "143775")]
     #[inline]
-    pub const fn get<I: ~const SliceIndex<str>>(&self, i: I) -> Option<&I::Output> {
+    pub const fn get<I: [const] SliceIndex<str>>(&self, i: I) -> Option<&I::Output> {
         i.get(self)
     }
 
@@ -467,9 +662,9 @@ impl str {
     /// assert_eq!("HEllo", v);
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
+    #[rustc_const_unstable(feature = "const_index", issue = "143775")]
     #[inline]
-    pub const fn get_mut<I: ~const SliceIndex<str>>(&mut self, i: I) -> Option<&mut I::Output> {
+    pub const fn get_mut<I: [const] SliceIndex<str>>(&mut self, i: I) -> Option<&mut I::Output> {
         i.get_mut(self)
     }
 
@@ -500,9 +695,8 @@ impl str {
     /// }
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
     #[inline]
-    pub const unsafe fn get_unchecked<I: ~const SliceIndex<str>>(&self, i: I) -> &I::Output {
+    pub unsafe fn get_unchecked<I: SliceIndex<str>>(&self, i: I) -> &I::Output {
         // SAFETY: the caller must uphold the safety contract for `get_unchecked`;
         // the slice is dereferenceable because `self` is a safe reference.
         // The returned pointer is safe because impls of `SliceIndex` have to guarantee that it is.
@@ -536,12 +730,8 @@ impl str {
     /// }
     /// ```
     #[stable(feature = "str_checked_slicing", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_slice_index", issue = "none")]
     #[inline]
-    pub const unsafe fn get_unchecked_mut<I: ~const SliceIndex<str>>(
-        &mut self,
-        i: I,
-    ) -> &mut I::Output {
+    pub unsafe fn get_unchecked_mut<I: SliceIndex<str>>(&mut self, i: I) -> &mut I::Output {
         // SAFETY: the caller must uphold the safety contract for `get_unchecked_mut`;
         // the slice is dereferenceable because `self` is a safe reference.
         // The returned pointer is safe because impls of `SliceIndex` have to guarantee that it is.
@@ -575,8 +765,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s = "Löwe 老虎 Léopard";
     ///
@@ -591,7 +779,7 @@ impl str {
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(since = "1.29.0", reason = "use `get_unchecked(begin..end)` instead")]
+    #[deprecated(since = "1.29.0", note = "use `get_unchecked(begin..end)` instead")]
     #[must_use]
     #[inline]
     pub unsafe fn slice_unchecked(&self, begin: usize, end: usize) -> &str {
@@ -603,6 +791,7 @@ impl str {
 
     /// Creates a string slice from another string slice, bypassing safety
     /// checks.
+    ///
     /// This is generally not recommended, use with caution! For a safe
     /// alternative see [`str`] and [`IndexMut`].
     ///
@@ -625,7 +814,7 @@ impl str {
     /// * `begin` and `end` must be byte positions within the string slice.
     /// * `begin` and `end` must lie on UTF-8 sequence boundaries.
     #[stable(feature = "str_slice_mut", since = "1.5.0")]
-    #[rustc_deprecated(since = "1.29.0", reason = "use `get_unchecked_mut(begin..end)` instead")]
+    #[deprecated(since = "1.29.0", note = "use `get_unchecked_mut(begin..end)` instead")]
     #[inline]
     pub unsafe fn slice_mut_unchecked(&mut self, begin: usize, end: usize) -> &mut str {
         // SAFETY: the caller must uphold the safety contract for `get_unchecked_mut`;
@@ -634,7 +823,7 @@ impl str {
         unsafe { &mut *(begin..end).get_unchecked_mut(self) }
     }
 
-    /// Divide one string slice into two at an index.
+    /// Divides one string slice into two at an index.
     ///
     /// The argument, `mid`, should be a byte offset from the start of the
     /// string. It must also be on the boundary of a UTF-8 code point.
@@ -649,12 +838,11 @@ impl str {
     ///
     /// # Panics
     ///
-    /// Panics if `mid` is not on a UTF-8 code point boundary, or if it is
-    /// past the end of the last code point of the string slice.
+    /// Panics if `mid` is not on a UTF-8 code point boundary, or if it is past
+    /// the end of the last code point of the string slice.  For a non-panicking
+    /// alternative see [`split_at_checked`](str::split_at_checked).
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let s = "Per Martin-Löf";
@@ -667,17 +855,15 @@ impl str {
     #[inline]
     #[must_use]
     #[stable(feature = "str_split_at", since = "1.4.0")]
-    pub fn split_at(&self, mid: usize) -> (&str, &str) {
-        // is_char_boundary checks that the index is in [0, .len()]
-        if self.is_char_boundary(mid) {
-            // SAFETY: just checked that `mid` is on a char boundary.
-            unsafe { (self.get_unchecked(0..mid), self.get_unchecked(mid..self.len())) }
-        } else {
-            slice_error_fail(self, 0, mid)
+    #[rustc_const_stable(feature = "const_str_split_at", since = "1.86.0")]
+    pub const fn split_at(&self, mid: usize) -> (&str, &str) {
+        match self.split_at_checked(mid) {
+            None => slice_error_fail(self, 0, mid),
+            Some(pair) => pair,
         }
     }
 
-    /// Divide one mutable string slice into two at an index.
+    /// Divides one mutable string slice into two at an index.
     ///
     /// The argument, `mid`, should be a byte offset from the start of the
     /// string. It must also be on the boundary of a UTF-8 code point.
@@ -691,12 +877,11 @@ impl str {
     ///
     /// # Panics
     ///
-    /// Panics if `mid` is not on a UTF-8 code point boundary, or if it is
-    /// past the end of the last code point of the string slice.
+    /// Panics if `mid` is not on a UTF-8 code point boundary, or if it is past
+    /// the end of the last code point of the string slice.  For a non-panicking
+    /// alternative see [`split_at_mut_checked`](str::split_at_mut_checked).
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let mut s = "Per Martin-Löf".to_string();
@@ -711,20 +896,132 @@ impl str {
     #[inline]
     #[must_use]
     #[stable(feature = "str_split_at", since = "1.4.0")]
-    pub fn split_at_mut(&mut self, mid: usize) -> (&mut str, &mut str) {
+    #[rustc_const_stable(feature = "const_str_split_at", since = "1.86.0")]
+    pub const fn split_at_mut(&mut self, mid: usize) -> (&mut str, &mut str) {
         // is_char_boundary checks that the index is in [0, .len()]
         if self.is_char_boundary(mid) {
-            let len = self.len();
-            let ptr = self.as_mut_ptr();
             // SAFETY: just checked that `mid` is on a char boundary.
-            unsafe {
-                (
-                    from_utf8_unchecked_mut(slice::from_raw_parts_mut(ptr, mid)),
-                    from_utf8_unchecked_mut(slice::from_raw_parts_mut(ptr.add(mid), len - mid)),
-                )
-            }
+            unsafe { self.split_at_mut_unchecked(mid) }
         } else {
             slice_error_fail(self, 0, mid)
+        }
+    }
+
+    /// Divides one string slice into two at an index.
+    ///
+    /// The argument, `mid`, should be a valid byte offset from the start of the
+    /// string. It must also be on the boundary of a UTF-8 code point. The
+    /// method returns `None` if that’s not the case.
+    ///
+    /// The two slices returned go from the start of the string slice to `mid`,
+    /// and from `mid` to the end of the string slice.
+    ///
+    /// To get mutable string slices instead, see the [`split_at_mut_checked`]
+    /// method.
+    ///
+    /// [`split_at_mut_checked`]: str::split_at_mut_checked
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let s = "Per Martin-Löf";
+    ///
+    /// let (first, last) = s.split_at_checked(3).unwrap();
+    /// assert_eq!("Per", first);
+    /// assert_eq!(" Martin-Löf", last);
+    ///
+    /// assert_eq!(None, s.split_at_checked(13));  // Inside “ö”
+    /// assert_eq!(None, s.split_at_checked(16));  // Beyond the string length
+    /// ```
+    #[inline]
+    #[must_use]
+    #[stable(feature = "split_at_checked", since = "1.80.0")]
+    #[rustc_const_stable(feature = "const_str_split_at", since = "1.86.0")]
+    pub const fn split_at_checked(&self, mid: usize) -> Option<(&str, &str)> {
+        // is_char_boundary checks that the index is in [0, .len()]
+        if self.is_char_boundary(mid) {
+            // SAFETY: just checked that `mid` is on a char boundary.
+            Some(unsafe { self.split_at_unchecked(mid) })
+        } else {
+            None
+        }
+    }
+
+    /// Divides one mutable string slice into two at an index.
+    ///
+    /// The argument, `mid`, should be a valid byte offset from the start of the
+    /// string. It must also be on the boundary of a UTF-8 code point. The
+    /// method returns `None` if that’s not the case.
+    ///
+    /// The two slices returned go from the start of the string slice to `mid`,
+    /// and from `mid` to the end of the string slice.
+    ///
+    /// To get immutable string slices instead, see the [`split_at_checked`] method.
+    ///
+    /// [`split_at_checked`]: str::split_at_checked
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let mut s = "Per Martin-Löf".to_string();
+    /// if let Some((first, last)) = s.split_at_mut_checked(3) {
+    ///     first.make_ascii_uppercase();
+    ///     assert_eq!("PER", first);
+    ///     assert_eq!(" Martin-Löf", last);
+    /// }
+    /// assert_eq!("PER Martin-Löf", s);
+    ///
+    /// assert_eq!(None, s.split_at_mut_checked(13));  // Inside “ö”
+    /// assert_eq!(None, s.split_at_mut_checked(16));  // Beyond the string length
+    /// ```
+    #[inline]
+    #[must_use]
+    #[stable(feature = "split_at_checked", since = "1.80.0")]
+    #[rustc_const_stable(feature = "const_str_split_at", since = "1.86.0")]
+    pub const fn split_at_mut_checked(&mut self, mid: usize) -> Option<(&mut str, &mut str)> {
+        // is_char_boundary checks that the index is in [0, .len()]
+        if self.is_char_boundary(mid) {
+            // SAFETY: just checked that `mid` is on a char boundary.
+            Some(unsafe { self.split_at_mut_unchecked(mid) })
+        } else {
+            None
+        }
+    }
+
+    /// Divides one string slice into two at an index.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `mid` is a valid byte offset from the start
+    /// of the string and falls on the boundary of a UTF-8 code point.
+    #[inline]
+    const unsafe fn split_at_unchecked(&self, mid: usize) -> (&str, &str) {
+        let len = self.len();
+        let ptr = self.as_ptr();
+        // SAFETY: caller guarantees `mid` is on a char boundary.
+        unsafe {
+            (
+                from_utf8_unchecked(slice::from_raw_parts(ptr, mid)),
+                from_utf8_unchecked(slice::from_raw_parts(ptr.add(mid), len - mid)),
+            )
+        }
+    }
+
+    /// Divides one string slice into two at an index.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `mid` is a valid byte offset from the start
+    /// of the string and falls on the boundary of a UTF-8 code point.
+    const unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut str, &mut str) {
+        let len = self.len();
+        let ptr = self.as_mut_ptr();
+        // SAFETY: caller guarantees `mid` is on a char boundary.
+        unsafe {
+            (
+                from_utf8_unchecked_mut(slice::from_raw_parts_mut(ptr, mid)),
+                from_utf8_unchecked_mut(slice::from_raw_parts_mut(ptr.add(mid), len - mid)),
+            )
         }
     }
 
@@ -777,6 +1074,7 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
+    #[rustc_diagnostic_item = "str_chars"]
     pub fn chars(&self) -> Chars<'_> {
         Chars { iter: self.as_bytes().iter() }
     }
@@ -826,7 +1124,7 @@ impl str {
     /// assert_eq!(Some((0, 'y')), char_indices.next()); // not (0, 'y̆')
     /// assert_eq!(Some((1, '\u{0306}')), char_indices.next());
     ///
-    /// // note the 3 here - the last character took up two bytes
+    /// // note the 3 here - the previous character took up two bytes
     /// assert_eq!(Some((3, 'e')), char_indices.next());
     /// assert_eq!(Some((4, 's')), char_indices.next());
     ///
@@ -838,14 +1136,12 @@ impl str {
         CharIndices { front_offset: 0, iter: self.chars() }
     }
 
-    /// An iterator over the bytes of a string slice.
+    /// Returns an iterator over the bytes of a string slice.
     ///
     /// As a string slice consists of a sequence of bytes, we can iterate
     /// through a string slice by byte. This method returns such an iterator.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let mut bytes = "bors".bytes();
@@ -900,10 +1196,16 @@ impl str {
     ///
     /// assert_eq!(None, iter.next());
     /// ```
+    ///
+    /// If the string is empty or all whitespace, the iterator yields no string slices:
+    /// ```
+    /// assert_eq!("".split_whitespace().next(), None);
+    /// assert_eq!("   ".split_whitespace().next(), None);
+    /// ```
     #[must_use = "this returns the split string as an iterator, \
                   without modifying the original"]
     #[stable(feature = "split_whitespace", since = "1.1.0")]
-    #[cfg_attr(not(test), rustc_diagnostic_item = "str_split_whitespace")]
+    #[rustc_diagnostic_item = "str_split_whitespace"]
     #[inline]
     pub fn split_whitespace(&self) -> SplitWhitespace<'_> {
         SplitWhitespace { inner: self.split(IsWhitespace).filter(IsNotEmpty) }
@@ -914,7 +1216,11 @@ impl str {
     /// The iterator returned will return string slices that are sub-slices of
     /// the original string slice, separated by any amount of ASCII whitespace.
     ///
+    /// This uses the same definition as [`char::is_ascii_whitespace`].
     /// To split by Unicode `Whitespace` instead, use [`split_whitespace`].
+    /// Note that because of this difference in definition, even if `s.is_ascii()`
+    /// is `true`, `s.split_ascii_whitespace()` behavior will differ from `s.split_whitespace()`
+    /// if `s` contains U+000B VERTICAL TAB.
     ///
     /// [`split_whitespace`]: str::split_whitespace
     ///
@@ -932,7 +1238,8 @@ impl str {
     /// assert_eq!(None, iter.next());
     /// ```
     ///
-    /// All kinds of ASCII whitespace are considered:
+    /// Various kinds of ASCII whitespace are considered
+    /// (see [`char::is_ascii_whitespace`]):
     ///
     /// ```
     /// let mut iter = " Mary   had\ta little  \n\t lamb".split_ascii_whitespace();
@@ -944,6 +1251,12 @@ impl str {
     ///
     /// assert_eq!(None, iter.next());
     /// ```
+    ///
+    /// If the string is empty or all ASCII whitespace, the iterator yields no string slices:
+    /// ```
+    /// assert_eq!("".split_ascii_whitespace().next(), None);
+    /// assert_eq!("   ".split_ascii_whitespace().next(), None);
+    /// ```
     #[must_use = "this returns the split string as an iterator, \
                   without modifying the original"]
     #[stable(feature = "split_ascii_whitespace", since = "1.34.0")]
@@ -954,32 +1267,41 @@ impl str {
         SplitAsciiWhitespace { inner }
     }
 
-    /// An iterator over the lines of a string, as string slices.
+    /// Returns an iterator over the lines of a string, as string slices.
     ///
-    /// Lines are ended with either a newline (`\n`) or a carriage return with
-    /// a line feed (`\r\n`).
+    /// Lines are split at line endings that are either newlines (`\n`) or
+    /// sequences of a carriage return followed by a line feed (`\r\n`).
+    ///
+    /// Line terminators are not included in the lines returned by the iterator.
+    ///
+    /// Note that any carriage return (`\r`) not immediately followed by a
+    /// line feed (`\n`) does not split a line. These carriage returns are
+    /// thereby included in the produced lines.
     ///
     /// The final line ending is optional. A string that ends with a final line
     /// ending will return the same lines as an otherwise identical string
     /// without a final line ending.
+    ///
+    /// An empty string returns an empty iterator.
     ///
     /// # Examples
     ///
     /// Basic usage:
     ///
     /// ```
-    /// let text = "foo\r\nbar\n\nbaz\n";
+    /// let text = "foo\r\nbar\n\nbaz\r";
     /// let mut lines = text.lines();
     ///
     /// assert_eq!(Some("foo"), lines.next());
     /// assert_eq!(Some("bar"), lines.next());
     /// assert_eq!(Some(""), lines.next());
-    /// assert_eq!(Some("baz"), lines.next());
+    /// // Trailing carriage return is included in the last line
+    /// assert_eq!(Some("baz\r"), lines.next());
     ///
     /// assert_eq!(None, lines.next());
     /// ```
     ///
-    /// The final line ending isn't required:
+    /// The final line does not require any ending:
     ///
     /// ```
     /// let text = "foo\nbar\n\r\nbaz";
@@ -992,26 +1314,34 @@ impl str {
     ///
     /// assert_eq!(None, lines.next());
     /// ```
+    ///
+    /// An empty string returns an empty iterator:
+    ///
+    /// ```
+    /// let text = "";
+    /// let mut lines = text.lines();
+    ///
+    /// assert_eq!(lines.next(), None);
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn lines(&self) -> Lines<'_> {
-        Lines(self.split_terminator('\n').map(LinesAnyMap))
+        Lines(self.split_inclusive('\n').map(LinesMap))
     }
 
-    /// An iterator over the lines of a string.
+    /// Returns an iterator over the lines of a string.
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(since = "1.4.0", reason = "use lines() instead now")]
+    #[deprecated(since = "1.4.0", note = "use lines() instead now", suggestion = "lines")]
     #[inline]
     #[allow(deprecated)]
     pub fn lines_any(&self) -> LinesAny<'_> {
         LinesAny(self.lines())
     }
 
-    /// Returns an iterator of `u16` over the string encoded as UTF-16.
+    /// Returns an iterator of `u16` over the string encoded
+    /// as native endian UTF-16 (without byte-order mark).
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let text = "Zażółć gęślą jaźń";
@@ -1041,8 +1371,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let bananas = "bananas";
     ///
@@ -1051,7 +1379,7 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn contains<'a, P: Pattern<'a>>(&'a self, pat: P) -> bool {
+    pub fn contains<P: Pattern>(&self, pat: P) -> bool {
         pat.is_contained_in(self)
     }
 
@@ -1060,15 +1388,18 @@ impl str {
     ///
     /// Returns `false` if it does not.
     ///
-    /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
+    /// The [pattern] can be a `&str`, in which case this function will return true if
+    /// the `&str` is a prefix of this string slice.
+    ///
+    /// The [pattern] can also be a [`char`], a slice of [`char`]s, or a
     /// function or closure that determines if a character matches.
+    /// These will only be checked against the first character of this string slice.
+    /// Look at the second example below regarding behavior for slices of [`char`]s.
     ///
     /// [`char`]: prim@char
     /// [pattern]: self::pattern
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let bananas = "bananas";
@@ -1076,8 +1407,17 @@ impl str {
     /// assert!(bananas.starts_with("bana"));
     /// assert!(!bananas.starts_with("nana"));
     /// ```
+    ///
+    /// ```
+    /// let bananas = "bananas";
+    ///
+    /// // Note that both of these assert successfully.
+    /// assert!(bananas.starts_with(&['b', 'a', 'n', 'a']));
+    /// assert!(bananas.starts_with(&['a', 'b', 'c', 'd']));
+    /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn starts_with<'a, P: Pattern<'a>>(&'a self, pat: P) -> bool {
+    #[rustc_diagnostic_item = "str_starts_with"]
+    pub fn starts_with<P: Pattern>(&self, pat: P) -> bool {
         pat.is_prefix_of(self)
     }
 
@@ -1094,8 +1434,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let bananas = "bananas";
     ///
@@ -1103,9 +1441,10 @@ impl str {
     /// assert!(!bananas.ends_with("nana"));
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn ends_with<'a, P>(&'a self, pat: P) -> bool
+    #[rustc_diagnostic_item = "str_ends_with"]
+    pub fn ends_with<P: Pattern>(&self, pat: P) -> bool
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         pat.is_suffix_of(self)
     }
@@ -1154,11 +1493,11 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn find<'a, P: Pattern<'a>>(&'a self, pat: P) -> Option<usize> {
+    pub fn find<P: Pattern>(&self, pat: P) -> Option<usize> {
         pat.into_searcher(self).next_match().map(|(i, _)| i)
     }
 
-    /// Returns the byte index for the first character of the rightmost match of the pattern in
+    /// Returns the byte index for the first character of the last match of the pattern in
     /// this string slice.
     ///
     /// Returns [`None`] if the pattern doesn't match.
@@ -1200,18 +1539,21 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn rfind<'a, P>(&'a self, pat: P) -> Option<usize>
+    pub fn rfind<P: Pattern>(&self, pat: P) -> Option<usize>
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         pat.into_searcher(self).next_match_back().map(|(i, _)| i)
     }
 
-    /// An iterator over substrings of this string slice, separated by
+    /// Returns an iterator over substrings of this string slice, separated by
     /// characters matched by a pattern.
     ///
     /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
     /// function or closure that determines if a character matches.
+    ///
+    /// If there are no matches the full string slice is returned as the only
+    /// item in the iterator.
     ///
     /// [`char`]: prim@char
     /// [pattern]: self::pattern
@@ -1243,6 +1585,9 @@ impl str {
     ///
     /// let v: Vec<&str> = "lion::tiger::leopard".split("::").collect();
     /// assert_eq!(v, ["lion", "tiger", "leopard"]);
+    ///
+    /// let v: Vec<&str> = "AABBCC".split("DD").collect();
+    /// assert_eq!(v, ["AABBCC"]);
     ///
     /// let v: Vec<&str> = "abc1def2ghi".split(char::is_numeric).collect();
     /// assert_eq!(v, ["abc", "def", "ghi"]);
@@ -1322,7 +1667,7 @@ impl str {
     /// [`split_whitespace`]: str::split_whitespace
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn split<'a, P: Pattern<'a>>(&'a self, pat: P) -> Split<'a, P> {
+    pub fn split<P: Pattern>(&self, pat: P) -> Split<'_, P> {
         Split(SplitInternal {
             start: 0,
             end: self.len(),
@@ -1332,10 +1677,11 @@ impl str {
         })
     }
 
-    /// An iterator over substrings of this string slice, separated by
-    /// characters matched by a pattern. Differs from the iterator produced by
-    /// `split` in that `split_inclusive` leaves the matched part as the
-    /// terminator of the substring.
+    /// Returns an iterator over substrings of this string slice, separated by
+    /// characters matched by a pattern.
+    ///
+    /// Differs from the iterator produced by `split` in that `split_inclusive`
+    /// leaves the matched part as the terminator of the substring.
     ///
     /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
     /// function or closure that determines if a character matches.
@@ -1362,7 +1708,7 @@ impl str {
     /// ```
     #[stable(feature = "split_inclusive", since = "1.51.0")]
     #[inline]
-    pub fn split_inclusive<'a, P: Pattern<'a>>(&'a self, pat: P) -> SplitInclusive<'a, P> {
+    pub fn split_inclusive<P: Pattern>(&self, pat: P) -> SplitInclusive<'_, P> {
         SplitInclusive(SplitInternal {
             start: 0,
             end: self.len(),
@@ -1372,8 +1718,8 @@ impl str {
         })
     }
 
-    /// An iterator over substrings of the given string slice, separated by
-    /// characters matched by a pattern and yielded in reverse order.
+    /// Returns an iterator over substrings of the given string slice, separated
+    /// by characters matched by a pattern and yielded in reverse order.
     ///
     /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
     /// function or closure that determines if a character matches.
@@ -1417,15 +1763,15 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn rsplit<'a, P>(&'a self, pat: P) -> RSplit<'a, P>
+    pub fn rsplit<P: Pattern>(&self, pat: P) -> RSplit<'_, P>
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         RSplit(self.split(pat).0)
     }
 
-    /// An iterator over substrings of the given string slice, separated by
-    /// characters matched by a pattern.
+    /// Returns an iterator over substrings of the given string slice, separated
+    /// by characters matched by a pattern.
     ///
     /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
     /// function or closure that determines if a character matches.
@@ -1454,8 +1800,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let v: Vec<&str> = "A.B.".split_terminator('.').collect();
     /// assert_eq!(v, ["A", "B"]);
@@ -1468,11 +1812,11 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn split_terminator<'a, P: Pattern<'a>>(&'a self, pat: P) -> SplitTerminator<'a, P> {
+    pub fn split_terminator<P: Pattern>(&self, pat: P) -> SplitTerminator<'_, P> {
         SplitTerminator(SplitInternal { allow_trailing_empty: false, ..self.split(pat).0 })
     }
 
-    /// An iterator over substrings of `self`, separated by characters
+    /// Returns an iterator over substrings of `self`, separated by characters
     /// matched by a pattern and yielded in reverse order.
     ///
     /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
@@ -1514,15 +1858,15 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn rsplit_terminator<'a, P>(&'a self, pat: P) -> RSplitTerminator<'a, P>
+    pub fn rsplit_terminator<P: Pattern>(&self, pat: P) -> RSplitTerminator<'_, P>
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         RSplitTerminator(self.split_terminator(pat).0)
     }
 
-    /// An iterator over substrings of the given string slice, separated by a
-    /// pattern, restricted to returning at most `n` items.
+    /// Returns an iterator over substrings of the given string slice, separated
+    /// by a pattern, restricted to returning at most `n` items.
     ///
     /// If `n` substrings are returned, the last substring (the `n`th substring)
     /// will contain the remainder of the string.
@@ -1569,13 +1913,13 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn splitn<'a, P: Pattern<'a>>(&'a self, n: usize, pat: P) -> SplitN<'a, P> {
+    pub fn splitn<P: Pattern>(&self, n: usize, pat: P) -> SplitN<'_, P> {
         SplitN(SplitNInternal { iter: self.split(pat).0, count: n })
     }
 
-    /// An iterator over substrings of this string slice, separated by a
-    /// pattern, starting from the end of the string, restricted to returning
-    /// at most `n` items.
+    /// Returns an iterator over substrings of this string slice, separated by a
+    /// pattern, starting from the end of the string, restricted to returning at
+    /// most `n` items.
     ///
     /// If `n` substrings are returned, the last substring (the `n`th substring)
     /// will contain the remainder of the string.
@@ -1618,9 +1962,9 @@ impl str {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
-    pub fn rsplitn<'a, P>(&'a self, n: usize, pat: P) -> RSplitN<'a, P>
+    pub fn rsplitn<P: Pattern>(&self, n: usize, pat: P) -> RSplitN<'_, P>
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         RSplitN(self.splitn(n, pat).0)
     }
@@ -1632,12 +1976,13 @@ impl str {
     ///
     /// ```
     /// assert_eq!("cfg".split_once('='), None);
+    /// assert_eq!("cfg=".split_once('='), Some(("cfg", "")));
     /// assert_eq!("cfg=foo".split_once('='), Some(("cfg", "foo")));
     /// assert_eq!("cfg=foo=bar".split_once('='), Some(("cfg", "foo=bar")));
     /// ```
     #[stable(feature = "str_split_once", since = "1.52.0")]
     #[inline]
-    pub fn split_once<'a, P: Pattern<'a>>(&'a self, delimiter: P) -> Option<(&'a str, &'a str)> {
+    pub fn split_once<P: Pattern>(&self, delimiter: P) -> Option<(&'_ str, &'_ str)> {
         let (start, end) = delimiter.into_searcher(self).next_match()?;
         // SAFETY: `Searcher` is known to return valid indices.
         unsafe { Some((self.get_unchecked(..start), self.get_unchecked(end..))) }
@@ -1650,22 +1995,23 @@ impl str {
     ///
     /// ```
     /// assert_eq!("cfg".rsplit_once('='), None);
+    /// assert_eq!("cfg=".rsplit_once('='), Some(("cfg", "")));
     /// assert_eq!("cfg=foo".rsplit_once('='), Some(("cfg", "foo")));
     /// assert_eq!("cfg=foo=bar".rsplit_once('='), Some(("cfg=foo", "bar")));
     /// ```
     #[stable(feature = "str_split_once", since = "1.52.0")]
     #[inline]
-    pub fn rsplit_once<'a, P>(&'a self, delimiter: P) -> Option<(&'a str, &'a str)>
+    pub fn rsplit_once<P: Pattern>(&self, delimiter: P) -> Option<(&'_ str, &'_ str)>
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         let (start, end) = delimiter.into_searcher(self).next_match_back()?;
         // SAFETY: `Searcher` is known to return valid indices.
         unsafe { Some((self.get_unchecked(..start), self.get_unchecked(end..))) }
     }
 
-    /// An iterator over the disjoint matches of a pattern within the given string
-    /// slice.
+    /// Returns an iterator over the disjoint matches of a pattern within the
+    /// given string slice.
     ///
     /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
     /// function or closure that determines if a character matches.
@@ -1682,11 +2028,9 @@ impl str {
     /// If the pattern allows a reverse search but its results might differ
     /// from a forward search, the [`rmatches`] method can be used.
     ///
-    /// [`rmatches`]: str::matches
+    /// [`rmatches`]: str::rmatches
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```
     /// let v: Vec<&str> = "abcXXXabcYYYabc".matches("abc").collect();
@@ -1697,12 +2041,12 @@ impl str {
     /// ```
     #[stable(feature = "str_matches", since = "1.2.0")]
     #[inline]
-    pub fn matches<'a, P: Pattern<'a>>(&'a self, pat: P) -> Matches<'a, P> {
+    pub fn matches<P: Pattern>(&self, pat: P) -> Matches<'_, P> {
         Matches(MatchesInternal(pat.into_searcher(self)))
     }
 
-    /// An iterator over the disjoint matches of a pattern within this string slice,
-    /// yielded in reverse order.
+    /// Returns an iterator over the disjoint matches of a pattern within this
+    /// string slice, yielded in reverse order.
     ///
     /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
     /// function or closure that determines if a character matches.
@@ -1722,8 +2066,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let v: Vec<&str> = "abcXXXabcYYYabc".rmatches("abc").collect();
     /// assert_eq!(v, ["abc", "abc", "abc"]);
@@ -1733,14 +2075,14 @@ impl str {
     /// ```
     #[stable(feature = "str_matches", since = "1.2.0")]
     #[inline]
-    pub fn rmatches<'a, P>(&'a self, pat: P) -> RMatches<'a, P>
+    pub fn rmatches<P: Pattern>(&self, pat: P) -> RMatches<'_, P>
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         RMatches(self.matches(pat).0)
     }
 
-    /// An iterator over the disjoint matches of a pattern within this string
+    /// Returns an iterator over the disjoint matches of a pattern within this string
     /// slice as well as the index that the match starts at.
     ///
     /// For matches of `pat` within `self` that overlap, only the indices
@@ -1765,8 +2107,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let v: Vec<_> = "abcXXXabcYYYabc".match_indices("abc").collect();
     /// assert_eq!(v, [(0, "abc"), (6, "abc"), (12, "abc")]);
@@ -1779,11 +2119,11 @@ impl str {
     /// ```
     #[stable(feature = "str_match_indices", since = "1.5.0")]
     #[inline]
-    pub fn match_indices<'a, P: Pattern<'a>>(&'a self, pat: P) -> MatchIndices<'a, P> {
+    pub fn match_indices<P: Pattern>(&self, pat: P) -> MatchIndices<'_, P> {
         MatchIndices(MatchIndicesInternal(pat.into_searcher(self)))
     }
 
-    /// An iterator over the disjoint matches of a pattern within `self`,
+    /// Returns an iterator over the disjoint matches of a pattern within `self`,
     /// yielded in reverse order along with the index of the match.
     ///
     /// For matches of `pat` within `self` that overlap, only the indices
@@ -1807,8 +2147,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let v: Vec<_> = "abcXXXabcYYYabc".rmatch_indices("abc").collect();
     /// assert_eq!(v, [(12, "abc"), (6, "abc"), (0, "abc")]);
@@ -1821,9 +2159,9 @@ impl str {
     /// ```
     #[stable(feature = "str_match_indices", since = "1.5.0")]
     #[inline]
-    pub fn rmatch_indices<'a, P>(&'a self, pat: P) -> RMatchIndices<'a, P>
+    pub fn rmatch_indices<P: Pattern>(&self, pat: P) -> RMatchIndices<'_, P>
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         RMatchIndices(self.match_indices(pat).0)
     }
@@ -1835,8 +2173,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// let s = "\n Hello\tworld\t\n";
     ///
@@ -1846,9 +2182,9 @@ impl str {
     #[must_use = "this returns the trimmed string as a slice, \
                   without modifying the original"]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(not(test), rustc_diagnostic_item = "str_trim")]
+    #[rustc_diagnostic_item = "str_trim"]
     pub fn trim(&self) -> &str {
-        self.trim_matches(|c: char| c.is_whitespace())
+        self.trim_matches(char::is_whitespace)
     }
 
     /// Returns a string slice with leading whitespace removed.
@@ -1885,9 +2221,9 @@ impl str {
     #[must_use = "this returns the trimmed string as a new slice, \
                   without modifying the original"]
     #[stable(feature = "trim_direction", since = "1.30.0")]
-    #[cfg_attr(not(test), rustc_diagnostic_item = "str_trim_start")]
+    #[rustc_diagnostic_item = "str_trim_start"]
     pub fn trim_start(&self) -> &str {
-        self.trim_start_matches(|c: char| c.is_whitespace())
+        self.trim_start_matches(char::is_whitespace)
     }
 
     /// Returns a string slice with trailing whitespace removed.
@@ -1924,9 +2260,9 @@ impl str {
     #[must_use = "this returns the trimmed string as a new slice, \
                   without modifying the original"]
     #[stable(feature = "trim_direction", since = "1.30.0")]
-    #[cfg_attr(not(test), rustc_diagnostic_item = "str_trim_end")]
+    #[rustc_diagnostic_item = "str_trim_end"]
     pub fn trim_end(&self) -> &str {
-        self.trim_end_matches(|c: char| c.is_whitespace())
+        self.trim_end_matches(char::is_whitespace)
     }
 
     /// Returns a string slice with leading whitespace removed.
@@ -1964,11 +2300,7 @@ impl str {
                   without modifying the original"]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(
-        since = "1.33.0",
-        reason = "superseded by `trim_start`",
-        suggestion = "trim_start"
-    )]
+    #[deprecated(since = "1.33.0", note = "superseded by `trim_start`", suggestion = "trim_start")]
     pub fn trim_left(&self) -> &str {
         self.trim_start()
     }
@@ -2008,11 +2340,7 @@ impl str {
                   without modifying the original"]
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(
-        since = "1.33.0",
-        reason = "superseded by `trim_end`",
-        suggestion = "trim_end"
-    )]
+    #[deprecated(since = "1.33.0", note = "superseded by `trim_end`", suggestion = "trim_end")]
     pub fn trim_right(&self) -> &str {
         self.trim_end()
     }
@@ -2046,9 +2374,9 @@ impl str {
     #[must_use = "this returns the trimmed string as a new slice, \
                   without modifying the original"]
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn trim_matches<'a, P>(&'a self, pat: P) -> &'a str
+    pub fn trim_matches<P: Pattern>(&self, pat: P) -> &str
     where
-        P: Pattern<'a, Searcher: DoubleEndedSearcher<'a>>,
+        for<'a> P::Searcher<'a>: DoubleEndedSearcher<'a>,
     {
         let mut i = 0;
         let mut j = 0;
@@ -2083,8 +2411,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// assert_eq!("11foo1bar11".trim_start_matches('1'), "foo1bar11");
     /// assert_eq!("123foo1bar123".trim_start_matches(char::is_numeric), "foo1bar123");
@@ -2095,7 +2421,7 @@ impl str {
     #[must_use = "this returns the trimmed string as a new slice, \
                   without modifying the original"]
     #[stable(feature = "trim_direction", since = "1.30.0")]
-    pub fn trim_start_matches<'a, P: Pattern<'a>>(&'a self, pat: P) -> &'a str {
+    pub fn trim_start_matches<P: Pattern>(&self, pat: P) -> &str {
         let mut i = self.len();
         let mut matcher = pat.into_searcher(self);
         if let Some((a, _)) = matcher.next_reject() {
@@ -2107,8 +2433,8 @@ impl str {
 
     /// Returns a string slice with the prefix removed.
     ///
-    /// If the string starts with the pattern `prefix`, returns substring after the prefix, wrapped
-    /// in `Some`.  Unlike `trim_start_matches`, this method removes the prefix exactly once.
+    /// If the string starts with the pattern `prefix`, returns the substring after the prefix,
+    /// wrapped in `Some`. Unlike [`trim_start_matches`], this method removes the prefix exactly once.
     ///
     /// If the string does not start with `prefix`, returns `None`.
     ///
@@ -2117,6 +2443,7 @@ impl str {
     ///
     /// [`char`]: prim@char
     /// [pattern]: self::pattern
+    /// [`trim_start_matches`]: Self::trim_start_matches
     ///
     /// # Examples
     ///
@@ -2128,14 +2455,14 @@ impl str {
     #[must_use = "this returns the remaining substring as a new slice, \
                   without modifying the original"]
     #[stable(feature = "str_strip", since = "1.45.0")]
-    pub fn strip_prefix<'a, P: Pattern<'a>>(&'a self, prefix: P) -> Option<&'a str> {
+    pub fn strip_prefix<P: Pattern>(&self, prefix: P) -> Option<&str> {
         prefix.strip_prefix_of(self)
     }
 
     /// Returns a string slice with the suffix removed.
     ///
     /// If the string ends with the pattern `suffix`, returns the substring before the suffix,
-    /// wrapped in `Some`.  Unlike `trim_end_matches`, this method removes the suffix exactly once.
+    /// wrapped in `Some`.  Unlike [`trim_end_matches`], this method removes the suffix exactly once.
     ///
     /// If the string does not end with `suffix`, returns `None`.
     ///
@@ -2144,6 +2471,7 @@ impl str {
     ///
     /// [`char`]: prim@char
     /// [pattern]: self::pattern
+    /// [`trim_end_matches`]: Self::trim_end_matches
     ///
     /// # Examples
     ///
@@ -2155,12 +2483,122 @@ impl str {
     #[must_use = "this returns the remaining substring as a new slice, \
                   without modifying the original"]
     #[stable(feature = "str_strip", since = "1.45.0")]
-    pub fn strip_suffix<'a, P>(&'a self, suffix: P) -> Option<&'a str>
+    pub fn strip_suffix<P: Pattern>(&self, suffix: P) -> Option<&str>
     where
-        P: Pattern<'a>,
-        <P as Pattern<'a>>::Searcher: ReverseSearcher<'a>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         suffix.strip_suffix_of(self)
+    }
+
+    /// Returns a string slice with the prefix and suffix removed.
+    ///
+    /// If the string starts with the pattern `prefix` and ends with the pattern `suffix`, returns
+    /// the substring after the prefix and before the suffix, wrapped in `Some`.
+    /// Unlike [`trim_start_matches`] and [`trim_end_matches`], this method removes both the prefix
+    /// and suffix exactly once.
+    ///
+    /// If the string does not start with `prefix` or does not end with `suffix`, returns `None`.
+    ///
+    /// Each [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
+    /// function or closure that determines if a character matches.
+    ///
+    /// [`char`]: prim@char
+    /// [pattern]: self::pattern
+    /// [`trim_start_matches`]: Self::trim_start_matches
+    /// [`trim_end_matches`]: Self::trim_end_matches
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!("bar:hello:foo".strip_circumfix("bar:", ":foo"), Some("hello"));
+    /// assert_eq!("bar:foo".strip_circumfix("foo", "foo"), None);
+    /// assert_eq!("foo:bar;".strip_circumfix("foo:", ';'), Some("bar"));
+    /// ```
+    #[must_use = "this returns the remaining substring as a new slice, \
+                  without modifying the original"]
+    #[stable(feature = "strip_circumfix", since = "CURRENT_RUSTC_VERSION")]
+    pub fn strip_circumfix<P: Pattern, S: Pattern>(&self, prefix: P, suffix: S) -> Option<&str>
+    where
+        for<'a> S::Searcher<'a>: ReverseSearcher<'a>,
+    {
+        self.strip_prefix(prefix)?.strip_suffix(suffix)
+    }
+
+    /// Returns a string slice with the optional prefix removed.
+    ///
+    /// If the string starts with the pattern `prefix`, returns the substring after the prefix.
+    /// Unlike [`strip_prefix`], this method always returns `&str` for easy method chaining,
+    /// instead of returning [`Option<&str>`].
+    ///
+    /// If the string does not start with `prefix`, returns the original string unchanged.
+    ///
+    /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
+    /// function or closure that determines if a character matches.
+    ///
+    /// [`char`]: prim@char
+    /// [pattern]: self::pattern
+    /// [`strip_prefix`]: Self::strip_prefix
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(trim_prefix_suffix)]
+    ///
+    /// // Prefix present - removes it
+    /// assert_eq!("foo:bar".trim_prefix("foo:"), "bar");
+    /// assert_eq!("foofoo".trim_prefix("foo"), "foo");
+    ///
+    /// // Prefix absent - returns original string
+    /// assert_eq!("foo:bar".trim_prefix("bar"), "foo:bar");
+    ///
+    /// // Method chaining example
+    /// assert_eq!("<https://example.com/>".trim_prefix('<').trim_suffix('>'), "https://example.com/");
+    /// ```
+    #[must_use = "this returns the remaining substring as a new slice, \
+                  without modifying the original"]
+    #[unstable(feature = "trim_prefix_suffix", issue = "142312")]
+    pub fn trim_prefix<P: Pattern>(&self, prefix: P) -> &str {
+        prefix.strip_prefix_of(self).unwrap_or(self)
+    }
+
+    /// Returns a string slice with the optional suffix removed.
+    ///
+    /// If the string ends with the pattern `suffix`, returns the substring before the suffix.
+    /// Unlike [`strip_suffix`], this method always returns `&str` for easy method chaining,
+    /// instead of returning [`Option<&str>`].
+    ///
+    /// If the string does not end with `suffix`, returns the original string unchanged.
+    ///
+    /// The [pattern] can be a `&str`, [`char`], a slice of [`char`]s, or a
+    /// function or closure that determines if a character matches.
+    ///
+    /// [`char`]: prim@char
+    /// [pattern]: self::pattern
+    /// [`strip_suffix`]: Self::strip_suffix
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(trim_prefix_suffix)]
+    ///
+    /// // Suffix present - removes it
+    /// assert_eq!("bar:foo".trim_suffix(":foo"), "bar");
+    /// assert_eq!("foofoo".trim_suffix("foo"), "foo");
+    ///
+    /// // Suffix absent - returns original string
+    /// assert_eq!("bar:foo".trim_suffix("bar"), "bar:foo");
+    ///
+    /// // Method chaining example
+    /// assert_eq!("<https://example.com/>".trim_prefix('<').trim_suffix('>'), "https://example.com/");
+    /// ```
+    #[must_use = "this returns the remaining substring as a new slice, \
+                  without modifying the original"]
+    #[unstable(feature = "trim_prefix_suffix", issue = "142312")]
+    pub fn trim_suffix<P: Pattern>(&self, suffix: P) -> &str
+    where
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
+    {
+        suffix.strip_suffix_of(self).unwrap_or(self)
     }
 
     /// Returns a string slice with all suffixes that match a pattern
@@ -2199,9 +2637,9 @@ impl str {
     #[must_use = "this returns the trimmed string as a new slice, \
                   without modifying the original"]
     #[stable(feature = "trim_direction", since = "1.30.0")]
-    pub fn trim_end_matches<'a, P>(&'a self, pat: P) -> &'a str
+    pub fn trim_end_matches<P: Pattern>(&self, pat: P) -> &str
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         let mut j = 0;
         let mut matcher = pat.into_searcher(self);
@@ -2230,8 +2668,6 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// assert_eq!("11foo1bar11".trim_left_matches('1'), "foo1bar11");
     /// assert_eq!("123foo1bar123".trim_left_matches(char::is_numeric), "foo1bar123");
@@ -2240,12 +2676,12 @@ impl str {
     /// assert_eq!("12foo1bar12".trim_left_matches(x), "foo1bar12");
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(
+    #[deprecated(
         since = "1.33.0",
-        reason = "superseded by `trim_start_matches`",
+        note = "superseded by `trim_start_matches`",
         suggestion = "trim_start_matches"
     )]
-    pub fn trim_left_matches<'a, P: Pattern<'a>>(&'a self, pat: P) -> &'a str {
+    pub fn trim_left_matches<P: Pattern>(&self, pat: P) -> &str {
         self.trim_start_matches(pat)
     }
 
@@ -2283,14 +2719,14 @@ impl str {
     /// assert_eq!("1fooX".trim_right_matches(|c| c == '1' || c == 'X'), "1foo");
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(
+    #[deprecated(
         since = "1.33.0",
-        reason = "superseded by `trim_end_matches`",
+        note = "superseded by `trim_end_matches`",
         suggestion = "trim_end_matches"
     )]
-    pub fn trim_right_matches<'a, P>(&'a self, pat: P) -> &'a str
+    pub fn trim_right_matches<P: Pattern>(&self, pat: P) -> &str
     where
-        P: Pattern<'a, Searcher: ReverseSearcher<'a>>,
+        for<'a> P::Searcher<'a>: ReverseSearcher<'a>,
     {
         self.trim_end_matches(pat)
     }
@@ -2304,7 +2740,6 @@ impl str {
     /// you're trying to parse into.
     ///
     /// `parse` can parse into any type that implements the [`FromStr`] trait.
-
     ///
     /// # Errors
     ///
@@ -2315,7 +2750,7 @@ impl str {
     ///
     /// # Examples
     ///
-    /// Basic usage
+    /// Basic usage:
     ///
     /// ```
     /// let four: u32 = "4".parse().unwrap();
@@ -2346,6 +2781,8 @@ impl str {
 
     /// Checks if all characters in this string are within the ASCII range.
     ///
+    /// An empty string returns `true`.
+    ///
     /// # Examples
     ///
     /// ```
@@ -2356,19 +2793,54 @@ impl str {
     /// assert!(!non_ascii.is_ascii());
     /// ```
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
+    #[rustc_const_stable(feature = "const_slice_is_ascii", since = "1.74.0")]
     #[must_use]
     #[inline]
-    pub fn is_ascii(&self) -> bool {
+    pub const fn is_ascii(&self) -> bool {
         // We can treat each byte as character here: all multibyte characters
-        // start with a byte that is not in the ascii range, so we will stop
+        // start with a byte that is not in the ASCII range, so we will stop
         // there already.
         self.as_bytes().is_ascii()
+    }
+
+    /// If this string slice [`is_ascii`](Self::is_ascii), returns it as a slice
+    /// of [ASCII characters](`ascii::Char`), otherwise returns `None`.
+    #[unstable(feature = "ascii_char", issue = "110998")]
+    #[must_use]
+    #[inline]
+    pub const fn as_ascii(&self) -> Option<&[ascii::Char]> {
+        // Like in `is_ascii`, we can work on the bytes directly.
+        self.as_bytes().as_ascii()
+    }
+
+    /// Converts this string slice into a slice of [ASCII characters](ascii::Char),
+    /// without checking whether they are valid.
+    ///
+    /// # Safety
+    ///
+    /// Every character in this string must be ASCII, or else this is UB.
+    #[unstable(feature = "ascii_char", issue = "110998")]
+    #[must_use]
+    #[inline]
+    pub const unsafe fn as_ascii_unchecked(&self) -> &[ascii::Char] {
+        assert_unsafe_precondition!(
+            check_library_ub,
+            "as_ascii_unchecked requires that the string is valid ASCII",
+            (it: &str = self) => it.is_ascii()
+        );
+
+        // SAFETY: the caller promised that every byte of this string slice
+        // is ASCII.
+        unsafe { self.as_bytes().as_ascii_unchecked() }
     }
 
     /// Checks that two strings are an ASCII case-insensitive match.
     ///
     /// Same as `to_ascii_lowercase(a) == to_ascii_lowercase(b)`,
     /// but without allocating and copying temporaries.
+    ///
+    /// For Unicode-aware case-insensitive matching, consider
+    /// [`str::eq_ignore_case_unnormalized`].
     ///
     /// # Examples
     ///
@@ -2378,10 +2850,64 @@ impl str {
     /// assert!(!"Ferrös".eq_ignore_ascii_case("FERRÖS"));
     /// ```
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
+    #[rustc_const_stable(feature = "const_eq_ignore_ascii_case", since = "1.89.0")]
     #[must_use]
     #[inline]
-    pub fn eq_ignore_ascii_case(&self, other: &str) -> bool {
+    pub const fn eq_ignore_ascii_case(&self, other: &str) -> bool {
         self.as_bytes().eq_ignore_ascii_case(other.as_bytes())
+    }
+
+    /// Checks that two strings are a caseless match, according to
+    /// [Definition 144] in Chapter 3 of the Unicode Standard.
+    ///
+    /// [Definition 144]: https://www.unicode.org/versions/latest/core-spec/chapter-3/#G53513
+    ///
+    /// Same as `a.to_casefold_unnormalized() == b.to_casefold_unnormalized()`,
+    /// but without allocating. See that method's documentation,
+    /// as well as [`char::to_casefold_unnormalized()`],
+    /// for more information about case folding.
+    ///
+    /// No [normalization] (e.g. NFC) is performed, so visually and semantically identical strings
+    /// might still compare unequal. For example, `"Å"` (U+00C5 LATIN CAPITAL LETTER A WITH RING ABOVE)
+    /// is considered distinct from `"Å"` (A followed by U+030A COMBINING RING ABOVE),
+    /// even though Unicode considers them canonically equivalent.
+    ///
+    /// In addition, this method is independent of language/locale,
+    /// so the special behavior of I/ı/İ/i in Turkish and Azeri is not handled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(casefold)]
+    /// assert!("Ferris".eq_ignore_case_unnormalized("FERRIS"));
+    /// assert!("Ferrös".eq_ignore_case_unnormalized("FERRÖS"));
+    /// assert!("ẞ".eq_ignore_case_unnormalized("ss"));
+    /// ```
+    ///
+    /// No NFC [normalization] is performed:
+    ///
+    /// ```rust
+    /// #![feature(casefold)]
+    /// // These two strings are visually and semantically identical...
+    /// let comp = "Å";
+    /// let decomp = "Å";
+    ///
+    /// // ... but not codepoint-for-codepoint equal.
+    /// assert_eq!(comp, "\u{C5}");
+    /// assert_eq!(decomp, "A\u{030A}");
+    ///
+    /// // Their case-foldings are likewise unequal:
+    /// assert!(!comp.eq_ignore_case_unnormalized(decomp));
+    /// ```
+    ///
+    /// [normalization]: https://www.unicode.org/faq/normalization.html
+    #[unstable(feature = "casefold", issue = "154742")]
+    #[must_use]
+    #[inline]
+    pub fn eq_ignore_case_unnormalized(&self, other: &str) -> bool {
+        self.chars()
+            .flat_map(char::to_casefold_unnormalized)
+            .eq(other.chars().flat_map(char::to_casefold_unnormalized))
     }
 
     /// Converts this string to its ASCII upper case equivalent in-place.
@@ -2404,8 +2930,9 @@ impl str {
     /// assert_eq!("GRüßE, JüRGEN ❤", s);
     /// ```
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
+    #[rustc_const_stable(feature = "const_make_ascii", since = "1.84.0")]
     #[inline]
-    pub fn make_ascii_uppercase(&mut self) {
+    pub const fn make_ascii_uppercase(&mut self) {
         // SAFETY: changing ASCII letters only does not invalidate UTF-8.
         let me = unsafe { self.as_bytes_mut() };
         me.make_ascii_uppercase()
@@ -2431,14 +2958,100 @@ impl str {
     /// assert_eq!("grÜße, jÜrgen ❤", s);
     /// ```
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
+    #[rustc_const_stable(feature = "const_make_ascii", since = "1.84.0")]
     #[inline]
-    pub fn make_ascii_lowercase(&mut self) {
+    pub const fn make_ascii_lowercase(&mut self) {
         // SAFETY: changing ASCII letters only does not invalidate UTF-8.
         let me = unsafe { self.as_bytes_mut() };
         me.make_ascii_lowercase()
     }
 
-    /// Return an iterator that escapes each char in `self` with [`char::escape_debug`].
+    /// Returns a string slice with leading ASCII whitespace removed.
+    ///
+    /// 'Whitespace' refers to the definition used by
+    /// [`u8::is_ascii_whitespace`]. Importantly, this definition excludes
+    /// the U+000B code point even though it has the Unicode [`White_Space`] property
+    /// and is removed by [`str::trim_start`].
+    ///
+    /// [`u8::is_ascii_whitespace`]: u8::is_ascii_whitespace
+    /// [`White_Space`]: https://www.unicode.org/reports/tr44/#White_Space
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(" \t \u{3000}hello world\n".trim_ascii_start(), "\u{3000}hello world\n");
+    /// assert_eq!("  ".trim_ascii_start(), "");
+    /// assert_eq!("".trim_ascii_start(), "");
+    /// ```
+    #[must_use = "this returns the trimmed string as a new slice, \
+                  without modifying the original"]
+    #[stable(feature = "byte_slice_trim_ascii", since = "1.80.0")]
+    #[rustc_const_stable(feature = "byte_slice_trim_ascii", since = "1.80.0")]
+    #[inline]
+    pub const fn trim_ascii_start(&self) -> &str {
+        // SAFETY: Removing ASCII characters from a `&str` does not invalidate
+        // UTF-8.
+        unsafe { core::str::from_utf8_unchecked(self.as_bytes().trim_ascii_start()) }
+    }
+
+    /// Returns a string slice with trailing ASCII whitespace removed.
+    ///
+    /// 'Whitespace' refers to the definition used by
+    /// [`u8::is_ascii_whitespace`]. Importantly, this definition excludes
+    /// the U+000B code point even though it has the Unicode [`White_Space`] property
+    /// and is removed by [`str::trim_end`].
+    ///
+    /// [`u8::is_ascii_whitespace`]: u8::is_ascii_whitespace
+    /// [`White_Space`]: https://www.unicode.org/reports/tr44/#White_Space
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!("\r hello world\u{3000}\n ".trim_ascii_end(), "\r hello world\u{3000}");
+    /// assert_eq!("  ".trim_ascii_end(), "");
+    /// assert_eq!("".trim_ascii_end(), "");
+    /// ```
+    #[must_use = "this returns the trimmed string as a new slice, \
+                  without modifying the original"]
+    #[stable(feature = "byte_slice_trim_ascii", since = "1.80.0")]
+    #[rustc_const_stable(feature = "byte_slice_trim_ascii", since = "1.80.0")]
+    #[inline]
+    pub const fn trim_ascii_end(&self) -> &str {
+        // SAFETY: Removing ASCII characters from a `&str` does not invalidate
+        // UTF-8.
+        unsafe { core::str::from_utf8_unchecked(self.as_bytes().trim_ascii_end()) }
+    }
+
+    /// Returns a string slice with leading and trailing ASCII whitespace
+    /// removed.
+    ///
+    /// 'Whitespace' refers to the definition used by
+    /// [`u8::is_ascii_whitespace`]. Importantly, this definition excludes
+    /// the U+000B code point even though it has the Unicode [`White_Space`] property
+    /// and is removed by [`str::trim`].
+    ///
+    /// [`u8::is_ascii_whitespace`]: u8::is_ascii_whitespace
+    /// [`White_Space`]: https://www.unicode.org/reports/tr44/#White_Space
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!("\r hello world\n ".trim_ascii(), "hello world");
+    /// assert_eq!("  ".trim_ascii(), "");
+    /// assert_eq!("".trim_ascii(), "");
+    /// ```
+    #[must_use = "this returns the trimmed string as a new slice, \
+                  without modifying the original"]
+    #[stable(feature = "byte_slice_trim_ascii", since = "1.80.0")]
+    #[rustc_const_stable(feature = "byte_slice_trim_ascii", since = "1.80.0")]
+    #[inline]
+    pub const fn trim_ascii(&self) -> &str {
+        // SAFETY: Removing ASCII characters from a `&str` does not invalidate
+        // UTF-8.
+        unsafe { core::str::from_utf8_unchecked(self.as_bytes().trim_ascii()) }
+    }
+
+    /// Returns an iterator that escapes each char in `self` with [`char::escape_debug`].
     ///
     /// Note: only extended grapheme codepoints that begin the string will be
     /// escaped.
@@ -2487,7 +3100,7 @@ impl str {
         }
     }
 
-    /// Return an iterator that escapes each char in `self` with [`char::escape_default`].
+    /// Returns an iterator that escapes each char in `self` with [`char::escape_default`].
     ///
     /// # Examples
     ///
@@ -2525,7 +3138,7 @@ impl str {
         EscapeDefault { inner: self.chars().flat_map(CharEscapeDefault) }
     }
 
-    /// Return an iterator that escapes each char in `self` with [`char::escape_unicode`].
+    /// Returns an iterator that escapes each char in `self` with [`char::escape_unicode`].
     ///
     /// # Examples
     ///
@@ -2562,10 +3175,55 @@ impl str {
     pub fn escape_unicode(&self) -> EscapeUnicode<'_> {
         EscapeUnicode { inner: self.chars().flat_map(CharEscapeUnicode) }
     }
+
+    /// Returns the range that a substring points to.
+    ///
+    /// Returns `None` if `substr` does not point within `self`.
+    ///
+    /// Unlike [`str::find`], **this does not search through the string**.
+    /// Instead, it uses pointer arithmetic to find where in the string
+    /// `substr` is derived from.
+    ///
+    /// This is useful for extending [`str::split`] and similar methods.
+    ///
+    /// Note that this method may return false positives (typically either
+    /// `Some(0..0)` or `Some(self.len()..self.len())`) if `substr` is a
+    /// zero-length `str` that points at the beginning or end of another,
+    /// independent, `str`.
+    ///
+    /// # Examples
+    /// ```
+    /// use core::range::Range;
+    ///
+    /// let data = "a, b, b, a";
+    /// let mut iter = data.split(", ").map(|s| data.substr_range(s).unwrap());
+    ///
+    /// assert_eq!(iter.next(), Some(Range { start: 0, end: 1 }));
+    /// assert_eq!(iter.next(), Some(Range { start: 3, end: 4 }));
+    /// assert_eq!(iter.next(), Some(Range { start: 6, end: 7 }));
+    /// assert_eq!(iter.next(), Some(Range { start: 9, end: 10 }));
+    /// ```
+    #[must_use]
+    #[stable(feature = "substr_range", since = "CURRENT_RUSTC_VERSION")]
+    pub fn substr_range(&self, substr: &str) -> Option<Range<usize>> {
+        self.as_bytes().subslice_range(substr.as_bytes())
+    }
+
+    /// Returns the same string as a string slice `&str`.
+    ///
+    /// This method is redundant when used directly on `&str`, but
+    /// it helps dereferencing other string-like types to string slices,
+    /// for example references to `Box<str>` or `Arc<str>`.
+    #[inline]
+    #[unstable(feature = "str_as_str", issue = "130366")]
+    pub const fn as_str(&self) -> &str {
+        self
+    }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl AsRef<[u8]> for str {
+#[rustc_const_unstable(feature = "const_convert", issue = "143773")]
+const impl AsRef<[u8]> for str {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
@@ -2573,8 +3231,8 @@ impl AsRef<[u8]> for str {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_default_impls", issue = "87864")]
-impl const Default for &str {
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+const impl Default for &str {
     /// Creates an empty str
     #[inline]
     fn default() -> Self {
@@ -2583,7 +3241,8 @@ impl const Default for &str {
 }
 
 #[stable(feature = "default_mut_str", since = "1.28.0")]
-impl Default for &mut str {
+#[rustc_const_unstable(feature = "const_default", issue = "143894")]
+const impl Default for &mut str {
     /// Creates an empty mutable str
     #[inline]
     fn default() -> Self {
@@ -2595,16 +3254,16 @@ impl Default for &mut str {
 impl_fn_for_zst! {
     /// A nameable, cloneable fn type
     #[derive(Clone)]
-    struct LinesAnyMap impl<'a> Fn = |line: &'a str| -> &'a str {
-        let l = line.len();
-        if l > 0 && line.as_bytes()[l - 1] == b'\r' { &line[0 .. l - 1] }
-        else { line }
+    struct LinesMap impl<'a> Fn = |line: &'a str| -> &'a str {
+        let Some(line) = line.strip_suffix('\n') else { return line };
+        let Some(line) = line.strip_suffix('\r') else { return line };
+        line
     };
 
     #[derive(Clone)]
     struct CharEscapeDebugContinue impl Fn = |c: char| -> char::EscapeDebug {
         c.escape_debug_ext(EscapeDebugExtArgs {
-            escape_grapheme_extended: false,
+            escape_grapheme_extender: false,
             escape_single_quote: true,
             escape_double_quote: true
         })
@@ -2645,3 +3304,7 @@ impl_fn_for_zst! {
         unsafe { from_utf8_unchecked(bytes) }
     };
 }
+
+// This is required to make `impl From<&str> for Box<dyn Error>` and `impl<E> From<E> for Box<dyn Error>` not overlap.
+#[stable(feature = "error_in_core_neg_impl", since = "1.65.0")]
+impl !crate::error::Error for &str {}

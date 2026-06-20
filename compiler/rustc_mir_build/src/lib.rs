@@ -1,35 +1,28 @@
 //! Construction of MIR from HIR.
-//!
-//! This crate also contains the match exhaustiveness and usefulness checking.
-#![allow(rustc::potential_query_instability)]
-#![feature(bool_to_option)]
-#![feature(box_patterns)]
-#![feature(control_flow_enum)]
-#![feature(crate_visibility_modifier)]
-#![feature(let_chains)]
-#![feature(let_else)]
-#![feature(min_specialization)]
-#![feature(once_cell)]
-#![recursion_limit = "256"]
 
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate rustc_middle;
+// tidy-alphabetical-start
+#![feature(deref_patterns)]
+#![feature(try_blocks)]
+// tidy-alphabetical-end
 
-mod build;
+// The `builder` module used to be named `build`, but that was causing GitHub's
+// "Go to file" feature to silently ignore all files in the module, probably
+// because it assumes that "build" is a build-output directory. See #134365.
+mod builder;
+mod check_tail_calls;
 mod check_unsafety;
-mod lints;
+mod diagnostics;
 pub mod thir;
 
-use rustc_middle::ty::query::Providers;
+use rustc_middle::util::Providers;
 
 pub fn provide(providers: &mut Providers) {
-    providers.check_match = thir::pattern::check_match;
-    providers.lit_to_const = thir::constant::lit_to_const;
-    providers.mir_built = build::mir_built;
-    providers.thir_check_unsafety = check_unsafety::thir_check_unsafety;
-    providers.thir_check_unsafety_for_const_arg = check_unsafety::thir_check_unsafety_for_const_arg;
-    providers.thir_body = thir::cx::thir_body;
-    providers.thir_tree = thir::cx::thir_tree;
+    providers.queries.check_match = thir::pattern::check_match;
+    providers.queries.lit_to_const = thir::constant::lit_to_const;
+    providers.queries.closure_saved_names_of_captured_variables =
+        builder::closure_saved_names_of_captured_variables;
+    providers.queries.check_unsafety = check_unsafety::check_unsafety;
+    providers.queries.check_tail_calls = check_tail_calls::check_tail_calls;
+    providers.queries.thir_body = thir::cx::thir_body;
+    providers.hooks.build_mir_inner_impl = builder::build_mir_inner_impl;
 }

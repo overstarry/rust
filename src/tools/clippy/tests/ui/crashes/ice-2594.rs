@@ -1,9 +1,8 @@
-#![allow(dead_code, unused_variables)]
+//@ check-pass
 
 /// Should not trigger an ICE in `SpanlessHash` / `consts::constant`
 ///
 /// Issue: https://github.com/rust-lang/rust-clippy/issues/2594
-
 fn spanless_hash_ice() {
     let txt = "something";
     let empty_header: [u8; 1] = [1; 1];

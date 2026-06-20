@@ -7,87 +7,180 @@
 //! `RETURN_PLACE` the MIR arguments) are always fully normalized (and
 //! contain revealed `impl Trait` values).
 
-use crate::type_check::constraint_conversion::ConstraintConversion;
-use rustc_index::vec::Idx;
-use rustc_infer::infer::LateBoundRegionConversionTime;
-use rustc_middle::mir::*;
-use rustc_middle::ty::Ty;
-use rustc_span::Span;
-use rustc_span::DUMMY_SP;
-use rustc_trait_selection::traits::query::type_op::{self, TypeOp};
-use rustc_trait_selection::traits::query::Fallible;
-use type_op::TypeOpOutput;
+use std::assert_matches;
 
-use crate::universal_regions::UniversalRegions;
+use itertools::Itertools;
+use rustc_hir as hir;
+use rustc_infer::infer::{BoundRegionConversionTime, RegionVariableOrigin};
+use rustc_middle::mir::*;
+use rustc_middle::ty::{self, Ty};
+use rustc_span::Span;
+use tracing::{debug, instrument};
 
 use super::{Locations, TypeChecker};
+use crate::renumber::RegionCtxt;
+use crate::universal_regions::DefiningTy;
 
 impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
-    #[instrument(skip(self, body, universal_regions), level = "debug")]
-    pub(super) fn equate_inputs_and_outputs(
-        &mut self,
-        body: &Body<'tcx>,
-        universal_regions: &UniversalRegions<'tcx>,
-        normalized_inputs_and_output: &[Ty<'tcx>],
-    ) {
+    /// Check explicit closure signature annotation,
+    /// e.g., `|x: FxIndexMap<_, &'static u32>| ...`.
+    #[instrument(skip(self), level = "debug")]
+    pub(super) fn check_signature_annotation(&mut self) {
+        let mir_def_id = self.body.source.def_id().expect_local();
+
+        if !self.tcx().is_closure_like(mir_def_id.to_def_id()) {
+            return;
+        }
+
+        // If the MIR body was constructed via `construct_error` (because an
+        // earlier pass like match checking failed), its args may not match
+        // the user-provided signature (e.g. a coroutine with too many
+        // parameters). Bail out as this can cause panic,
+        // see <https://github.com/rust-lang/rust/issues/139570>.
+        if self.body.tainted_by_errors.is_some() {
+            return;
+        }
+
+        let user_provided_poly_sig = self.tcx().closure_user_provided_sig(mir_def_id);
+
+        // Instantiate the canonicalized variables from user-provided signature
+        // (e.g., the `_` in the code above) with fresh variables.
+        // Then replace the bound items in the fn sig with fresh variables,
+        // so that they represent the view from "inside" the closure.
+        let user_provided_sig = self.instantiate_canonical(self.body.span, &user_provided_poly_sig);
+        let mut user_provided_sig = self.infcx.instantiate_binder_with_fresh_vars(
+            self.body.span,
+            BoundRegionConversionTime::FnCall,
+            user_provided_sig,
+        );
+
+        // FIXME(async_closures): It's kind of wacky that we must apply this
+        // transformation here, since we do the same thing in HIR typeck.
+        // Maybe we could just fix up the canonicalized signature during HIR typeck?
+        if let DefiningTy::CoroutineClosure(_, args) = self.universal_regions.defining_ty {
+            assert_matches!(
+                self.tcx().coroutine_kind(self.tcx().coroutine_for_closure(mir_def_id)),
+                Some(hir::CoroutineKind::Desugared(
+                    hir::CoroutineDesugaring::Async | hir::CoroutineDesugaring::Gen,
+                    hir::CoroutineSource::Closure
+                )),
+                "this needs to be modified if we're lowering non-async closures"
+            );
+            // Make sure to use the args from `DefiningTy` so the right NLL region vids are
+            // prepopulated into the type.
+            let args = args.as_coroutine_closure();
+            let tupled_upvars_ty = ty::CoroutineClosureSignature::tupled_upvars_by_closure_kind(
+                self.tcx(),
+                args.kind(),
+                Ty::new_tup(self.tcx(), user_provided_sig.inputs()),
+                args.tupled_upvars_ty(),
+                args.coroutine_captures_by_ref_ty(),
+                self.infcx.next_region_var(RegionVariableOrigin::Misc(self.body.span), || {
+                    RegionCtxt::Unknown
+                }),
+            );
+
+            let next_ty_var = || self.infcx.next_ty_var(self.body.span);
+            let output_ty = Ty::new_coroutine(
+                self.tcx(),
+                self.tcx().coroutine_for_closure(mir_def_id),
+                ty::CoroutineArgs::new(
+                    self.tcx(),
+                    ty::CoroutineArgsParts {
+                        parent_args: args.parent_args(),
+                        kind_ty: Ty::from_coroutine_closure_kind(self.tcx(), args.kind()),
+                        return_ty: user_provided_sig.output(),
+                        tupled_upvars_ty,
+                        // For async closures, none of these can be annotated, so just fill
+                        // them with fresh ty vars.
+                        resume_ty: next_ty_var(),
+                        yield_ty: next_ty_var(),
+                    },
+                )
+                .args,
+            );
+
+            user_provided_sig = self.tcx().mk_fn_sig(
+                user_provided_sig.inputs().iter().copied(),
+                output_ty,
+                user_provided_sig.fn_sig_kind,
+            );
+        }
+
+        let is_coroutine_with_implicit_resume_ty = self.tcx().is_coroutine(mir_def_id.to_def_id())
+            && user_provided_sig.inputs().is_empty();
+
+        for (&user_ty, arg_decl) in user_provided_sig.inputs().iter().zip_eq(
+            // In MIR, closure args begin with an implicit `self`.
+            // Also, coroutines have a resume type which may be implicitly `()`.
+            self.body
+                .args_iter()
+                .skip(1 + if is_coroutine_with_implicit_resume_ty { 1 } else { 0 })
+                .map(|local| &self.body.local_decls[local]),
+        ) {
+            self.ascribe_user_type_skip_wf(
+                arg_decl.ty,
+                ty::UserType::new(ty::UserTypeKind::Ty(user_ty)),
+                arg_decl.source_info.span,
+            );
+        }
+
+        // If the user explicitly annotated the output type, enforce it.
+        let output_decl = &self.body.local_decls[RETURN_PLACE];
+        self.ascribe_user_type_skip_wf(
+            output_decl.ty,
+            ty::UserType::new(ty::UserTypeKind::Ty(user_provided_sig.output())),
+            output_decl.source_info.span,
+        );
+    }
+
+    //  FIXME(BoxyUwU): This should probably be part of a larger borrowck dev-guide chapter
+    //
+    /// Enforce that the types of the locals corresponding to the inputs and output of
+    /// the body are equal to those of the (normalized) signature.
+    ///
+    /// This is necessary for two reasons:
+    /// - Locals in the MIR all start out with `'erased` regions and then are replaced
+    ///    with unconstrained nll vars. If we have a function returning `&'a u32` then
+    ///    the local `_0: &'?10 u32` needs to have its region var equated with the nll
+    ///    var representing `'a`. i.e. borrow check must uphold that `'?10 = 'a`.
+    /// - When computing the normalized signature we may introduce new unconstrained nll
+    ///    vars due to higher ranked where clauses ([#136547]). We then wind up with implied
+    ///    bounds involving these vars.
+    ///
+    ///    For this reason it is important that we equate with the *normalized* signature
+    ///    which was produced when computing implied bounds. If we do not do so then we will
+    ///    wind up with implied bounds on nll vars which cannot actually be used as the nll
+    ///    var never gets related to anything.
+    ///
+    /// For 'closure-like' bodies this function effectively relates the *inferred* signature
+    /// of the closure against the locals corresponding to the closure's inputs/output. It *does
+    /// not* relate the user provided types for the signature to the locals, this is handled
+    /// separately by: [`TypeChecker::check_signature_annotation`].
+    ///
+    /// [#136547]: <https://www.github.com/rust-lang/rust/issues/136547>
+    #[instrument(skip(self), level = "debug")]
+    pub(super) fn equate_inputs_and_outputs(&mut self, normalized_inputs_and_output: &[Ty<'tcx>]) {
         let (&normalized_output_ty, normalized_input_tys) =
             normalized_inputs_and_output.split_last().unwrap();
 
         debug!(?normalized_output_ty);
         debug!(?normalized_input_tys);
 
-        let mir_def_id = body.source.def_id().expect_local();
-
-        // If the user explicitly annotated the input types, extract
-        // those.
-        //
-        // e.g., `|x: FxHashMap<_, &'static u32>| ...`
-        let user_provided_sig;
-        if !self.tcx().is_closure(mir_def_id.to_def_id()) {
-            user_provided_sig = None;
-        } else {
-            let typeck_results = self.tcx().typeck(mir_def_id);
-            user_provided_sig = typeck_results.user_provided_sigs.get(&mir_def_id.to_def_id()).map(
-                |user_provided_poly_sig| {
-                    // Instantiate the canonicalized variables from
-                    // user-provided signature (e.g., the `_` in the code
-                    // above) with fresh variables.
-                    let poly_sig = self.instantiate_canonical_with_fresh_inference_vars(
-                        body.span,
-                        &user_provided_poly_sig,
-                    );
-
-                    // Replace the bound items in the fn sig with fresh
-                    // variables, so that they represent the view from
-                    // "inside" the closure.
-                    self.infcx
-                        .replace_bound_vars_with_fresh_vars(
-                            body.span,
-                            LateBoundRegionConversionTime::FnCall,
-                            poly_sig,
-                        )
-                        .0
-                },
-            );
-        }
-
-        debug!(?normalized_input_tys, ?body.local_decls);
-
         // Equate expected input tys with those in the MIR.
         for (argument_index, &normalized_input_ty) in normalized_input_tys.iter().enumerate() {
-            if argument_index + 1 >= body.local_decls.len() {
+            if argument_index + 1 >= self.body.local_decls.len() {
                 self.tcx()
-                    .sess
-                    .delay_span_bug(body.span, "found more normalized_input_ty than local_decls");
-                break;
+                    .dcx()
+                    .span_bug(self.body.span, "found more normalized_input_ty than local_decls");
             }
 
             // In MIR, argument N is stored in local N+1.
-            let local = Local::new(argument_index + 1);
+            let local = Local::arg(argument_index);
 
-            let mir_input_ty = body.local_decls[local].ty;
+            let mir_input_ty = self.body.local_decls[local].ty;
 
-            let mir_input_span = body.local_decls[local].source_info.span;
+            let mir_input_span = self.body.local_decls[local].source_info.span;
             self.equate_normalized_input_or_output(
                 normalized_input_ty,
                 mir_input_ty,
@@ -95,153 +188,62 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             );
         }
 
-        if let Some(user_provided_sig) = user_provided_sig {
-            for (argument_index, &user_provided_input_ty) in
-                user_provided_sig.inputs().iter().enumerate()
-            {
-                // In MIR, closures begin an implicit `self`, so
-                // argument N is stored in local N+2.
-                let local = Local::new(argument_index + 2);
-                let mir_input_ty = body.local_decls[local].ty;
-                let mir_input_span = body.local_decls[local].source_info.span;
-
-                // If the user explicitly annotated the input types, enforce those.
-                let user_provided_input_ty =
-                    self.normalize(user_provided_input_ty, Locations::All(mir_input_span));
-
-                self.equate_normalized_input_or_output(
-                    user_provided_input_ty,
-                    mir_input_ty,
-                    mir_input_span,
-                );
-            }
-        }
-
-        debug!(
-            "equate_inputs_and_outputs: body.yield_ty {:?}, universal_regions.yield_ty {:?}",
-            body.yield_ty(),
-            universal_regions.yield_ty
-        );
-
-        // We will not have a universal_regions.yield_ty if we yield (by accident)
-        // outside of a generator and return an `impl Trait`, so emit a delay_span_bug
-        // because we don't want to panic in an assert here if we've already got errors.
-        if body.yield_ty().is_some() != universal_regions.yield_ty.is_some() {
-            self.tcx().sess.delay_span_bug(
-                body.span,
-                &format!(
-                    "Expected body to have yield_ty ({:?}) iff we have a UR yield_ty ({:?})",
-                    body.yield_ty(),
-                    universal_regions.yield_ty,
-                ),
+        if let Some(mir_yield_ty) = self.body.yield_ty() {
+            let yield_span = self.body.local_decls[RETURN_PLACE].source_info.span;
+            self.equate_normalized_input_or_output(
+                self.universal_regions.yield_ty.unwrap(),
+                mir_yield_ty,
+                yield_span,
             );
         }
 
-        if let (Some(mir_yield_ty), Some(ur_yield_ty)) =
-            (body.yield_ty(), universal_regions.yield_ty)
-        {
-            let yield_span = body.local_decls[RETURN_PLACE].source_info.span;
-            self.equate_normalized_input_or_output(ur_yield_ty, mir_yield_ty, yield_span);
-        }
-
-        // Return types are a bit more complex. They may contain opaque `impl Trait` types.
-        let mir_output_ty = body.local_decls[RETURN_PLACE].ty;
-        let output_span = body.local_decls[RETURN_PLACE].source_info.span;
-        if let Err(terr) = self.eq_types(
-            normalized_output_ty,
-            mir_output_ty,
-            Locations::All(output_span),
-            ConstraintCategory::BoringNoLocation,
-        ) {
-            span_mirbug!(
-                self,
-                Location::START,
-                "equate_inputs_and_outputs: `{:?}=={:?}` failed with `{:?}`",
-                normalized_output_ty,
-                mir_output_ty,
-                terr
+        if let Some(mir_resume_ty) = self.body.resume_ty() {
+            let yield_span = self.body.local_decls[RETURN_PLACE].source_info.span;
+            self.equate_normalized_input_or_output(
+                self.universal_regions.resume_ty.unwrap(),
+                mir_resume_ty,
+                yield_span,
             );
-        };
-
-        // If the user explicitly annotated the output types, enforce those.
-        // Note that this only happens for closures.
-        if let Some(user_provided_sig) = user_provided_sig {
-            let user_provided_output_ty = user_provided_sig.output();
-            let user_provided_output_ty =
-                self.normalize(user_provided_output_ty, Locations::All(output_span));
-            if let Err(err) = self.eq_types(
-                user_provided_output_ty,
-                mir_output_ty,
-                Locations::All(output_span),
-                ConstraintCategory::BoringNoLocation,
-            ) {
-                span_mirbug!(
-                    self,
-                    Location::START,
-                    "equate_inputs_and_outputs: `{:?}=={:?}` failed with `{:?}`",
-                    mir_output_ty,
-                    user_provided_output_ty,
-                    err
-                );
-            }
         }
+
+        // Equate expected output ty with the type of the RETURN_PLACE in MIR
+        let mir_output_ty = self.body.return_ty();
+        let output_span = self.body.local_decls[RETURN_PLACE].source_info.span;
+        self.equate_normalized_input_or_output(normalized_output_ty, mir_output_ty, output_span);
     }
 
-    #[instrument(skip(self, span), level = "debug")]
+    #[instrument(skip(self), level = "debug")]
     fn equate_normalized_input_or_output(&mut self, a: Ty<'tcx>, b: Ty<'tcx>, span: Span) {
+        if self.infcx.next_trait_solver() {
+            return self
+                .eq_types(a, b, Locations::All(span), ConstraintCategory::BoringNoLocation)
+                .unwrap_or_else(|terr| {
+                    span_mirbug!(
+                        self,
+                        Location::START,
+                        "equate_normalized_input_or_output: `{a:?}=={b:?}` failed with `{terr:?}`",
+                    );
+                });
+        }
+
+        // This is a hack. `body.local_decls` are not necessarily normalized in the old
+        // solver due to not deeply normalizing in writeback. So we must re-normalize here.
+        //
+        // However, in most cases normalizing is unnecessary so we only do so if it may be
+        // necessary for type equality to hold. This leads to some (very minor) performance
+        // wins.
         if let Err(_) =
             self.eq_types(a, b, Locations::All(span), ConstraintCategory::BoringNoLocation)
         {
-            // FIXME(jackh726): This is a hack. It's somewhat like
-            // `rustc_traits::normalize_after_erasing_regions`. Ideally, we'd
-            // like to normalize *before* inserting into `local_decls`, but
-            // doing so ends up causing some other trouble.
-            let b = match self.normalize_and_add_constraints(b) {
-                Ok(n) => n,
-                Err(_) => {
-                    debug!("equate_inputs_and_outputs: NoSolution");
-                    b
-                }
-            };
-
-            // Note: if we have to introduce new placeholders during normalization above, then we won't have
-            // added those universes to the universe info, which we would want in `relate_tys`.
-            if let Err(terr) =
-                self.eq_types(a, b, Locations::All(span), ConstraintCategory::BoringNoLocation)
-            {
-                span_mirbug!(
-                    self,
-                    Location::START,
-                    "equate_normalized_input_or_output: `{:?}=={:?}` failed with `{:?}`",
-                    a,
-                    b,
-                    terr
-                );
-            }
-        }
-    }
-
-    pub(crate) fn normalize_and_add_constraints(&mut self, t: Ty<'tcx>) -> Fallible<Ty<'tcx>> {
-        let TypeOpOutput { output: norm_ty, constraints, .. } =
-            self.param_env.and(type_op::normalize::Normalize::new(t)).fully_perform(self.infcx)?;
-
-        debug!("{:?} normalized to {:?}", t, norm_ty);
-
-        for data in constraints.into_iter().collect::<Vec<_>>() {
-            ConstraintConversion::new(
-                self.infcx,
-                &self.borrowck_context.universal_regions,
-                &self.region_bound_pairs,
-                Some(self.implicit_region_bound),
-                self.param_env,
-                Locations::All(DUMMY_SP),
-                DUMMY_SP,
-                ConstraintCategory::Internal,
-                &mut self.borrowck_context.constraints,
-            )
-            .convert_all(&*data);
-        }
-
-        Ok(norm_ty)
+            let b = self.normalize(ty::Unnormalized::new(b), Locations::All(span));
+            self.eq_types(a, b, Locations::All(span), ConstraintCategory::BoringNoLocation)
+                .unwrap_or_else(|terr| {
+                    span_mirbug!(
+                        self,
+                        Location::START,
+                        "equate_normalized_input_or_output: `{a:?}=={b:?}` failed with `{terr:?}`",
+                    );
+                });
+        };
     }
 }

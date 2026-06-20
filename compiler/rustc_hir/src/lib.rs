@@ -2,43 +2,48 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/hir.html
 
+// tidy-alphabetical-start
 #![feature(associated_type_defaults)]
-#![feature(const_btree_new)]
-#![feature(crate_visibility_modifier)]
-#![feature(let_else)]
-#![feature(once_cell)]
-#![feature(min_specialization)]
+#![feature(closure_track_caller)]
+#![feature(const_default)]
+#![feature(const_trait_impl)]
+#![feature(default_field_values)]
+#![feature(derive_const)]
+#![feature(exhaustive_patterns)]
 #![feature(never_type)]
-#![feature(rustc_attrs)]
+#![feature(variant_count)]
 #![recursion_limit = "256"]
+// tidy-alphabetical-end
 
-#[macro_use]
-extern crate rustc_macros;
-
-#[macro_use]
-extern crate rustc_data_structures;
+extern crate self as rustc_hir;
 
 mod arena;
+pub mod attrs;
 pub mod def;
 pub mod def_path_hash_map;
 pub mod definitions;
 pub mod diagnostic_items;
 pub use rustc_span::def_id;
 mod hir;
-pub mod hir_id;
+pub use rustc_hir_id::{self as hir_id, *};
 pub mod intravisit;
-pub mod itemlikevisit;
 pub mod lang_items;
+pub mod limit;
+pub mod lints;
 pub mod pat_util;
+mod stability;
 mod stable_hash_impls;
-mod target;
+pub mod target;
 pub mod weak_lang_items;
 
 #[cfg(test)]
 mod tests;
 
+#[doc(no_inline)]
 pub use hir::*;
-pub use hir_id::*;
 pub use lang_items::{LangItem, LanguageItems};
-pub use stable_hash_impls::HashStableContext;
+pub use rustc_ast::attr::version::*;
+pub use stability::*;
 pub use target::{MethodKind, Target};
+
+arena_types!(rustc_arena::declare_arena);

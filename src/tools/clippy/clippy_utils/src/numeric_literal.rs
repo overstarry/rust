@@ -1,11 +1,16 @@
-use rustc_ast::ast::{Lit, LitFloatType, LitIntType, LitKind};
+use rustc_ast::ast::{LitFloatType, LitIntType, LitKind};
 use std::iter;
 
-#[derive(Debug, PartialEq, Copy, Clone)]
+/// Represents the base of a numeric literal, used for parsing and formatting.
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum Radix {
+    /// A binary literal (e.g., `0b1010`)
     Binary,
+    /// An octal literal (e.g., `0o670`)
     Octal,
+    /// A decimal literal (e.g., `123`)
     Decimal,
+    /// A hexadecimal literal (e.g., `0xFF`)
     Hexadecimal,
 }
 
@@ -46,10 +51,7 @@ pub struct NumericLiteral<'a> {
 }
 
 impl<'a> NumericLiteral<'a> {
-    pub fn from_lit(src: &'a str, lit: &Lit) -> Option<NumericLiteral<'a>> {
-        NumericLiteral::from_lit_kind(src, &lit.kind)
-    }
-
+    /// Attempts to parse a `NumericLiteral` from the source string of an `ast::LitKind`.
     pub fn from_lit_kind(src: &'a str, lit_kind: &LitKind) -> Option<NumericLiteral<'a>> {
         let unsigned_src = src.strip_prefix('-').map_or(src, |s| s);
         if lit_kind.is_numeric()
@@ -57,7 +59,7 @@ impl<'a> NumericLiteral<'a> {
                 .trim_start()
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_digit(10))
+                .is_some_and(|c| c.is_ascii_digit())
         {
             let (unsuffixed, suffix) = split_suffix(src, lit_kind);
             let float = matches!(lit_kind, LitKind::Float(..));
@@ -67,14 +69,16 @@ impl<'a> NumericLiteral<'a> {
         }
     }
 
+    /// Parses a raw numeric literal string into its structured `NumericLiteral` parts.
     #[must_use]
     pub fn new(lit: &'a str, suffix: Option<&'a str>, float: bool) -> Self {
+        let unsigned_lit = lit.trim_start_matches('-');
         // Determine delimiter for radix prefix, if present, and radix.
-        let radix = if lit.starts_with("0x") {
+        let radix = if unsigned_lit.starts_with("0x") {
             Radix::Hexadecimal
-        } else if lit.starts_with("0b") {
+        } else if unsigned_lit.starts_with("0b") {
             Radix::Binary
-        } else if lit.starts_with("0o") {
+        } else if unsigned_lit.starts_with("0o") {
             Radix::Octal
         } else {
             Radix::Decimal
@@ -105,11 +109,12 @@ impl<'a> NumericLiteral<'a> {
         }
     }
 
+    /// Checks if the literal's radix is `Radix::Decimal`
     pub fn is_decimal(&self) -> bool {
         self.radix == Radix::Decimal
     }
 
-    pub fn split_digit_parts(digits: &str, float: bool) -> (&str, Option<&str>, Option<(&str, &str)>) {
+    fn split_digit_parts(digits: &str, float: bool) -> (&str, Option<&str>, Option<(&str, &str)>) {
         let mut integer = digits;
         let mut fraction = None;
         let mut exponent = None;
@@ -128,7 +133,7 @@ impl<'a> NumericLiteral<'a> {
                             integer = &digits[..exp_start];
                         } else {
                             fraction = Some(&digits[integer.len() + 1..exp_start]);
-                        };
+                        }
                         exponent = Some((&digits[exp_start..=i], &digits[i + 1..]));
                         break;
                     },
@@ -164,9 +169,11 @@ impl<'a> NumericLiteral<'a> {
         }
 
         if let Some((separator, exponent)) = self.exponent {
-            if exponent != "0" {
+            if !exponent.is_empty() && exponent != "0" {
                 output.push_str(separator);
                 Self::group_digits(&mut output, exponent, group_size, true, false);
+            } else if exponent == "0" && self.fraction.is_none() && self.suffix.is_none() {
+                output.push_str(".0");
             }
         }
 
@@ -181,7 +188,7 @@ impl<'a> NumericLiteral<'a> {
         output
     }
 
-    pub fn group_digits(output: &mut String, input: &str, group_size: usize, partial_group_first: bool, pad: bool) {
+    fn group_digits(output: &mut String, input: &str, group_size: usize, partial_group_first: bool, zero_pad: bool) {
         debug_assert!(group_size > 0);
 
         let mut digits = input.chars().filter(|&c| c != '_');
@@ -189,7 +196,7 @@ impl<'a> NumericLiteral<'a> {
         // The exponent may have a sign, output it early, otherwise it will be
         // treated as a digit
         if digits.clone().next() == Some('-') {
-            let _ = digits.next();
+            let _: Option<char> = digits.next();
             output.push('-');
         }
 
@@ -197,7 +204,7 @@ impl<'a> NumericLiteral<'a> {
 
         if partial_group_first {
             first_group_size = (digits.clone().count() - 1) % group_size + 1;
-            if pad {
+            if zero_pad {
                 for _ in 0..group_size - first_group_size {
                     output.push('0');
                 }
@@ -223,10 +230,12 @@ impl<'a> NumericLiteral<'a> {
 
 fn split_suffix<'a>(src: &'a str, lit_kind: &LitKind) -> (&'a str, Option<&'a str>) {
     debug_assert!(lit_kind.is_numeric());
-    lit_suffix_length(lit_kind).map_or((src, None), |suffix_length| {
-        let (unsuffixed, suffix) = src.split_at(src.len() - suffix_length);
-        (unsuffixed, Some(suffix))
-    })
+    lit_suffix_length(lit_kind)
+        .and_then(|suffix_length| src.len().checked_sub(suffix_length))
+        .map_or((src, None), |split_pos| {
+            let (unsuffixed, suffix) = src.split_at(split_pos);
+            (unsuffixed, Some(suffix))
+        })
 }
 
 fn lit_suffix_length(lit_kind: &LitKind) -> Option<usize> {

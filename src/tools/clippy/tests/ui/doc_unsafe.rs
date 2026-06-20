@@ -1,10 +1,15 @@
-// aux-build:doc_unsafe_macros.rs
+//@aux-build:proc_macros.rs
 
-#[macro_use]
-extern crate doc_unsafe_macros;
+#![deny(clippy::unnecessary_safety_doc)]
+#![expect(incomplete_features)]
+#![feature(unsafe_fields)]
+
+extern crate proc_macros;
+use proc_macros::external;
 
 /// This is not sufficiently documented
 pub unsafe fn destroy_the_planet() {
+    //~^ missing_safety_doc
     unimplemented!();
 }
 
@@ -28,20 +33,62 @@ mod private_mod {
     }
 
     pub unsafe fn republished() {
+        //~^ missing_safety_doc
         unimplemented!();
     }
 }
 
 pub use private_mod::republished;
 
+struct UnsafeStruct {
+    // Unsafe fields are almost always private, so excluding according to
+    // `check-private-items` does not make sense (they are also not items).
+    unsafe field: u8,
+    //~^ missing_safety_doc
+}
+
+enum UnsafeEnum {
+    Variant {
+        unsafe field: u8,
+        //~^ missing_safety_doc
+    },
+}
+
+union UnsafeUnion {
+    unsafe field: u8,
+    //~^ missing_safety_doc
+}
+
+struct SafeStruct {
+    /// # Safety
+    field: u8,
+    //~^ unnecessary_safety_doc
+}
+
+enum SafeEnum {
+    Variant {
+        /// # Safety
+        field: u8,
+        //~^ unnecessary_safety_doc
+    },
+}
+
+union SafeUnion {
+    /// # Safety
+    field: u8,
+    //~^ unnecessary_safety_doc
+}
+
 pub trait SafeTraitUnsafeMethods {
     unsafe fn woefully_underdocumented(self);
+    //~^ missing_safety_doc
 
     /// # Safety
     unsafe fn at_least_somewhat_documented(self);
 }
 
 pub unsafe trait UnsafeTrait {
+    //~^ missing_safety_doc
     fn method();
 }
 
@@ -72,6 +119,7 @@ unsafe impl DocumentedUnsafeTrait for Struct {
 
 impl Struct {
     pub unsafe fn more_undocumented_unsafe() -> Self {
+        //~^ missing_safety_doc
         unimplemented!();
     }
 
@@ -88,6 +136,7 @@ impl Struct {
 macro_rules! very_unsafe {
     () => {
         pub unsafe fn whee() {
+            //~^ missing_safety_doc
             unimplemented!()
         }
 
@@ -95,7 +144,7 @@ macro_rules! very_unsafe {
         ///
         /// Please keep the seat belt fastened
         pub unsafe fn drive() {
-            whee()
+            unsafe { whee() }
         }
     };
 }
@@ -103,7 +152,11 @@ macro_rules! very_unsafe {
 very_unsafe!();
 
 // we don't lint code from external macros
-undocd_unsafe!();
+external! {
+    pub unsafe fn oy_vey() {
+        unimplemented!();
+    }
+}
 
 fn main() {
     unsafe {

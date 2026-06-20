@@ -1,62 +1,68 @@
 //! Support for serializing the dep-graph and reloading it.
 
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(crate_visibility_modifier)]
-#![feature(nll)]
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![feature(core_intrinsics)]
 #![feature(min_specialization)]
-#![feature(once_cell)]
 #![feature(rustc_attrs)]
-#![recursion_limit = "256"]
-#![allow(rustc::potential_query_instability)]
+#![feature(try_blocks)]
+// tidy-alphabetical-end
 
-#[macro_use]
-extern crate rustc_macros;
-#[macro_use]
-extern crate rustc_middle;
+use rustc_data_structures::sync::{AtomicU64, Lock};
+use rustc_middle::dep_graph;
+use rustc_middle::queries::{ExternProviders, Providers};
+use rustc_middle::query::on_disk_cache::OnDiskCache;
+use rustc_middle::query::{QueryCache, QuerySystem, QueryVTable};
+use rustc_middle::ty::TyCtxt;
 
-use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
-use rustc_data_structures::sync::AtomicU64;
-use rustc_middle::arena::Arena;
-use rustc_middle::dep_graph::{self, DepKindStruct, SerializedDepNodeIndex};
-use rustc_middle::ty::query::{query_keys, query_storage, query_stored, query_values};
-use rustc_middle::ty::query::{ExternProviders, Providers, QueryEngine};
-use rustc_middle::ty::{self, TyCtxt};
-use rustc_span::def_id::LocalDefId;
-use rustc_span::Span;
+pub use crate::dep_kind_vtables::make_dep_kind_vtables;
+pub use crate::execution::{CollectActiveJobsKind, collect_active_query_jobs};
+pub use crate::job::{QueryJobMap, break_query_cycle, print_query_stack};
 
-#[macro_use]
+mod dep_kind_vtables;
+mod error;
+mod execution;
+mod handle_cycle_error;
+mod job;
 mod plumbing;
-pub use plumbing::QueryCtxt;
-use rustc_query_system::query::*;
-
-mod keys;
-use keys::Key;
-
-mod values;
-use self::values::Value;
-
-pub use rustc_query_system::query::QueryConfig;
-pub(crate) use rustc_query_system::query::{QueryDescription, QueryVtable};
-
-mod on_disk_cache;
-pub use on_disk_cache::OnDiskCache;
-
 mod profiling_support;
-pub use self::profiling_support::alloc_self_profile_query_strings;
+mod query_impl;
 
-fn describe_as_module(def_id: LocalDefId, tcx: TyCtxt<'_>) -> String {
-    if def_id.is_top_level_module() {
-        "top-level module".to_string()
-    } else {
-        format!("module `{}`", tcx.def_path_str(def_id.to_def_id()))
+/// Trait that knows how to look up the [`QueryVTable`] for a particular query.
+///
+/// This trait allows some per-query code to be defined in generic functions
+/// with a trait bound, instead of having to be defined inline within a macro
+/// expansion.
+///
+/// There is one macro-generated implementation of this trait for each query,
+/// on the type `rustc_query_impl::query_impl::$name::VTableGetter`.
+trait GetQueryVTable<'tcx> {
+    type Cache: QueryCache + 'tcx;
+
+    fn query_vtable(tcx: TyCtxt<'tcx>) -> &'tcx QueryVTable<'tcx, Self::Cache>;
+}
+
+pub fn query_system<'tcx>(
+    local_providers: Providers,
+    extern_providers: ExternProviders,
+    on_disk_cache: Option<OnDiskCache>,
+    incremental: bool,
+) -> QuerySystem<'tcx> {
+    QuerySystem {
+        arenas: Default::default(),
+        query_vtables: query_impl::make_query_vtables(incremental),
+        side_effects: Default::default(),
+        on_disk_cache,
+        local_providers,
+        extern_providers,
+        jobs: AtomicU64::new(1),
+        cycle_handler_nesting: Lock::new(0),
     }
 }
 
-rustc_query_append! { [define_queries!][<'tcx>] }
-
-impl<'tcx> Queries<'tcx> {
-    // Force codegen in the dyn-trait transformation in this crate.
-    pub fn as_dyn(&'tcx self) -> &'tcx dyn QueryEngine<'tcx> {
-        self
-    }
+pub fn provide(providers: &mut rustc_middle::util::Providers) {
+    providers.hooks.alloc_self_profile_query_strings =
+        profiling_support::alloc_self_profile_query_strings;
+    providers.hooks.verify_query_key_hashes = plumbing::verify_query_key_hashes;
+    providers.hooks.encode_query_values = plumbing::encode_query_values;
 }

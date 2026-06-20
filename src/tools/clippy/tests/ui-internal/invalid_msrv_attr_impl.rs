@@ -1,6 +1,4 @@
-// run-rustfix
-
-#![deny(clippy::internal)]
+#![deny(clippy::missing_msrv_attr_impl)]
 #![allow(clippy::missing_clippy_version_attribute)]
 #![feature(rustc_private)]
 
@@ -11,9 +9,9 @@ extern crate rustc_middle;
 #[macro_use]
 extern crate rustc_session;
 use clippy_utils::extract_msrv_attr;
+use clippy_utils::msrvs::MsrvStack;
 use rustc_hir::Expr;
 use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass};
-use rustc_semver::RustcVersion;
 
 declare_lint! {
     pub TEST_LINT,
@@ -22,16 +20,13 @@ declare_lint! {
 }
 
 struct Pass {
-    msrv: Option<RustcVersion>,
+    msrv: MsrvStack,
 }
 
 impl_lint_pass!(Pass => [TEST_LINT]);
 
-impl LateLintPass<'_> for Pass {
-    fn check_expr(&mut self, _: &LateContext<'_>, _: &Expr<'_>) {}
-}
-
 impl EarlyLintPass for Pass {
+    //~^ missing_msrv_attr_impl
     fn check_expr(&mut self, _: &EarlyContext<'_>, _: &rustc_ast::Expr) {}
 }
 

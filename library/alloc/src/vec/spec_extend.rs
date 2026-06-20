@@ -1,9 +1,9 @@
-use crate::alloc::Allocator;
+use core::clone::TrivialClone;
 use core::iter::TrustedLen;
-use core::ptr::{self};
-use core::slice::{self};
+use core::slice;
 
-use super::{IntoIter, SetLenOnDrop, Vec};
+use super::{IntoIter, Vec};
+use crate::alloc::Allocator;
 
 // Specialization trait used for Vec::extend
 pub(super) trait SpecExtend<T, I> {
@@ -24,49 +24,20 @@ where
     I: TrustedLen<Item = T>,
 {
     default fn spec_extend(&mut self, iterator: I) {
-        // This is the case for a TrustedLen iterator.
-        let (low, high) = iterator.size_hint();
-        if let Some(additional) = high {
-            debug_assert_eq!(
-                low,
-                additional,
-                "TrustedLen iterator's size hint is not exact: {:?}",
-                (low, high)
-            );
-            self.reserve(additional);
-            unsafe {
-                let mut ptr = self.as_mut_ptr().add(self.len());
-                let mut local_len = SetLenOnDrop::new(&mut self.len);
-                iterator.for_each(move |element| {
-                    ptr::write(ptr, element);
-                    ptr = ptr.offset(1);
-                    // Since the loop executes user code which can panic we have to bump the pointer
-                    // after each step.
-                    // NB can't overflow since we would have had to alloc the address space
-                    local_len.increment_len(1);
-                });
-            }
-        } else {
-            // Per TrustedLen contract a `None` upper bound means that the iterator length
-            // truly exceeds usize::MAX, which would eventually lead to a capacity overflow anyway.
-            // Since the other branch already panics eagerly (via `reserve()`) we do the same here.
-            // This avoids additional codegen for a fallback code path which would eventually
-            // panic anyway.
-            panic!("capacity overflow");
-        }
+        self.extend_trusted(iterator)
     }
 }
 
-impl<T, A: Allocator> SpecExtend<T, IntoIter<T>> for Vec<T, A> {
-    fn spec_extend(&mut self, mut iterator: IntoIter<T>) {
+impl<T, A1: Allocator, A2: Allocator> SpecExtend<T, IntoIter<T, A2>> for Vec<T, A1> {
+    fn spec_extend(&mut self, iterator: IntoIter<T, A2>) {
         unsafe {
             self.append_elements(iterator.as_slice() as _);
         }
-        iterator.ptr = iterator.end;
+        iterator.forget_remaining_elements_and_dealloc();
     }
 }
 
-impl<'a, T: 'a, I, A: Allocator + 'a> SpecExtend<&'a T, I> for Vec<T, A>
+impl<'a, T: 'a, I, A: Allocator> SpecExtend<&'a T, I> for Vec<T, A>
 where
     I: Iterator<Item = &'a T>,
     T: Clone,
@@ -76,9 +47,9 @@ where
     }
 }
 
-impl<'a, T: 'a, A: Allocator + 'a> SpecExtend<&'a T, slice::Iter<'a, T>> for Vec<T, A>
+impl<'a, T: 'a, A: Allocator> SpecExtend<&'a T, slice::Iter<'a, T>> for Vec<T, A>
 where
-    T: Copy,
+    T: TrivialClone,
 {
     fn spec_extend(&mut self, iterator: slice::Iter<'a, T>) {
         let slice = iterator.as_slice();

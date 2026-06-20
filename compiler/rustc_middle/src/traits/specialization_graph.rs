@@ -1,10 +1,12 @@
-use crate::ty::fast_reject::SimplifiedType;
-use crate::ty::fold::TypeFoldable;
-use crate::ty::{self, TyCtxt};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::{DefId, DefIdMap};
-use rustc_span::symbol::sym;
+use rustc_hir::find_attr;
+use rustc_macros::{StableHash, TyDecodable, TyEncodable};
+
+use crate::error::StrictCoherenceNeedsNegativeCoherence;
+use crate::ty::fast_reject::SimplifiedType;
+use crate::ty::{self, TyCtxt, TypeVisitableExt};
 
 /// A per-trait graph of impls in specialization order. At the moment, this
 /// graph forms a tree rooted with the trait itself, with all other nodes
@@ -21,7 +23,7 @@ use rustc_span::symbol::sym;
 ///   parents of a given specializing impl, which is needed for extracting
 ///   default items amongst other things. In the simple "chain" rule, every impl
 ///   has at most one parent.
-#[derive(TyEncodable, TyDecodable, HashStable, Debug)]
+#[derive(TyEncodable, TyDecodable, StableHash, Debug)]
 pub struct Graph {
     /// All impls have a parent; the "root" impls have as their parent the `def_id`
     /// of the trait.
@@ -29,26 +31,24 @@ pub struct Graph {
 
     /// The "root" impls are found by looking up the trait's def_id.
     pub children: DefIdMap<Children>,
-
-    /// Whether an error was emitted while constructing the graph.
-    pub has_errored: Option<ErrorGuaranteed>,
 }
 
 impl Graph {
     pub fn new() -> Graph {
-        Graph { parent: Default::default(), children: Default::default(), has_errored: None }
+        Graph { parent: Default::default(), children: Default::default() }
     }
 
     /// The parent of a given impl, which is the `DefId` of the trait when the
     /// impl is a "specialization root".
+    #[track_caller]
     pub fn parent(&self, child: DefId) -> DefId {
-        *self.parent.get(&child).unwrap_or_else(|| panic!("Failed to get parent for {:?}", child))
+        *self.parent.get(&child).unwrap_or_else(|| panic!("Failed to get parent for {child:?}"))
     }
 }
 
 /// What kind of overlap check are we doing -- this exists just for testing and feature-gating
 /// purposes.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable, Debug, TyEncodable, TyDecodable)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, StableHash, Debug, TyEncodable, TyDecodable)]
 pub enum OverlapMode {
     /// The 1.0 rules (either types fail to unify, or where clauses are not implemented for crate-local types)
     Stable,
@@ -59,15 +59,19 @@ pub enum OverlapMode {
 }
 
 impl OverlapMode {
-    pub fn get<'tcx>(tcx: TyCtxt<'tcx>, trait_id: DefId) -> OverlapMode {
-        let with_negative_coherence = tcx.features().with_negative_coherence;
-        let strict_coherence = tcx.has_attr(trait_id, sym::rustc_strict_coherence);
+    pub fn get(tcx: TyCtxt<'_>, trait_id: DefId) -> OverlapMode {
+        let with_negative_coherence = tcx.features().with_negative_coherence();
+        let strict_coherence = find_attr!(tcx, trait_id, RustcStrictCoherence(span) => *span);
 
         if with_negative_coherence {
-            if strict_coherence { OverlapMode::Strict } else { OverlapMode::WithNegative }
-        } else if strict_coherence {
-            bug!("To use strict_coherence you need to set with_negative_coherence feature flag");
+            if strict_coherence.is_some() { OverlapMode::Strict } else { OverlapMode::WithNegative }
         } else {
+            if let Some(span) = strict_coherence {
+                tcx.dcx().emit_err(StrictCoherenceNeedsNegativeCoherence {
+                    span: tcx.def_span(trait_id),
+                    attr_span: span,
+                });
+            }
             OverlapMode::Stable
         }
     }
@@ -83,7 +87,7 @@ impl OverlapMode {
 
 /// Children of a given impl, grouped into blanket/non-blanket varieties as is
 /// done in `TraitDef`.
-#[derive(Default, TyEncodable, TyDecodable, Debug, HashStable)]
+#[derive(Default, TyEncodable, TyDecodable, Debug, StableHash)]
 pub struct Children {
     // Impls of a trait (or specializations of a given impl). To allow for
     // quicker lookup, the impls are indexed by a simplified version of their
@@ -115,16 +119,12 @@ impl Node {
         matches!(self, Node::Trait(..))
     }
 
-    /// Trys to find the associated item that implements `trait_item_def_id`
+    /// Tries to find the associated item that implements `trait_item_def_id`
     /// defined in this node.
     ///
     /// If this returns `None`, the item can potentially still be found in
     /// parents of this node.
-    pub fn item<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        trait_item_def_id: DefId,
-    ) -> Option<&'tcx ty::AssocItem> {
+    pub fn item<'tcx>(&self, tcx: TyCtxt<'tcx>, trait_item_def_id: DefId) -> Option<ty::AssocItem> {
         match *self {
             Node::Trait(_) => Some(tcx.associated_item(trait_item_def_id)),
             Node::Impl(impl_def_id) => {
@@ -167,6 +167,7 @@ impl Iterator for Ancestors<'_> {
 }
 
 /// Information about the most specialized definition of an associated item.
+#[derive(Debug)]
 pub struct LeafDef {
     /// The associated item described by this `LeafDef`.
     pub item: ty::AssocItem,
@@ -174,12 +175,13 @@ pub struct LeafDef {
     /// The node in the specialization graph containing the definition of `item`.
     pub defining_node: Node,
 
-    /// The "top-most" (ie. least specialized) specialization graph node that finalized the
+    /// The "top-most" (i.e. least specialized) specialization graph node that finalized the
     /// definition of `item`.
     ///
     /// Example:
     ///
     /// ```
+    /// #![feature(specialization)]
     /// trait Tr {
     ///     fn assoc(&self);
     /// }
@@ -208,7 +210,7 @@ impl LeafDef {
 }
 
 impl<'tcx> Ancestors<'tcx> {
-    /// Finds the bottom-most (ie. most specialized) definition of an associated
+    /// Finds the bottom-most (i.e. most specialized) definition of an associated
     /// item.
     pub fn leaf_def(mut self, tcx: TyCtxt<'tcx>, trait_item_def_id: DefId) -> Option<LeafDef> {
         let mut finalizing_node = None;
@@ -216,15 +218,15 @@ impl<'tcx> Ancestors<'tcx> {
         self.find_map(|node| {
             if let Some(item) = node.item(tcx, trait_item_def_id) {
                 if finalizing_node.is_none() {
-                    let is_specializable = item.defaultness.is_default()
-                        || tcx.impl_defaultness(node.def_id()).is_default();
+                    let is_specializable = item.defaultness(tcx).is_default()
+                        || tcx.defaultness(node.def_id()).is_default();
 
                     if !is_specializable {
                         finalizing_node = Some(node);
                     }
                 }
 
-                Some(LeafDef { item: *item, defining_node: node, finalizing_node })
+                Some(LeafDef { item, defining_node: node, finalizing_node })
             } else {
                 // Item not mentioned. This "finalizes" any defaulted item provided by an ancestor.
                 finalizing_node = Some(node);
@@ -239,16 +241,16 @@ impl<'tcx> Ancestors<'tcx> {
 ///
 /// Returns `Err` if an error was reported while building the specialization
 /// graph.
-pub fn ancestors<'tcx>(
-    tcx: TyCtxt<'tcx>,
+pub fn ancestors(
+    tcx: TyCtxt<'_>,
     trait_def_id: DefId,
     start_from_impl: DefId,
-) -> Result<Ancestors<'tcx>, ErrorGuaranteed> {
-    let specialization_graph = tcx.specialization_graph_of(trait_def_id);
+) -> Result<Ancestors<'_>, ErrorGuaranteed> {
+    let specialization_graph = tcx.specialization_graph_of(trait_def_id)?;
 
-    if let Some(reported) = specialization_graph.has_errored {
-        Err(reported)
-    } else if let Some(reported) = tcx.type_of(start_from_impl).error_reported() {
+    if let Err(reported) =
+        tcx.type_of(start_from_impl).instantiate_identity().skip_normalization().error_reported()
+    {
         Err(reported)
     } else {
         Ok(Ancestors {

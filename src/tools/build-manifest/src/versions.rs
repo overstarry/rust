@@ -1,59 +1,103 @@
-use anyhow::Error;
-use flate2::read::GzDecoder;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+use anyhow::Error;
+use flate2::read::GzDecoder;
 use tar::Archive;
+use xz2::read::XzDecoder;
 
 const DEFAULT_TARGET: &str = "x86_64-unknown-linux-gnu";
 
-#[derive(Debug, Hash, Eq, PartialEq, Clone)]
-pub(crate) enum PkgType {
-    Rust,
-    RustSrc,
-    Rustc,
-    Cargo,
-    Rls,
-    RustAnalyzer,
-    Clippy,
-    Rustfmt,
-    LlvmTools,
-    Miri,
-    Other(String),
+macro_rules! pkg_type {
+    ( $($variant:ident = $component:literal $(; preview = true $(@$is_preview:tt)? )? $(; suffixes = [$($suffixes:literal),+] $(@$is_suffixed:tt)? )? ),+ $(,)? ) => {
+        #[derive(Debug, Hash, Eq, PartialEq, Clone)]
+        pub(crate) enum PkgType {
+            $($variant $( $($is_suffixed)? { suffix: &'static str })?,)+
+        }
+
+        impl PkgType {
+            pub(crate) fn is_preview(&self) -> bool {
+                match self {
+                    $( PkgType::$variant $($($is_suffixed)? { .. })? => false $( $($is_preview)? || true)?, )+
+                }
+            }
+
+            /// First part of the tarball name. May include a suffix, if the package has one.
+            pub(crate) fn tarball_component_name(&self) -> String {
+                match self {
+                    $( PkgType::$variant $($($is_suffixed)? { suffix })? => {
+                        #[allow(unused_mut)]
+                        let mut name = $component.to_owned();
+                        $($($is_suffixed)?
+                        name.push('-');
+                        name.push_str(suffix);
+                        )?
+                        name
+                    },)+
+                }
+            }
+
+            pub(crate) fn all() -> Vec<PkgType> {
+                let mut packages = vec![];
+                $(
+                    // Push the single variant
+                    packages.push(PkgType::$variant $($($is_suffixed)? { suffix: "" })?);
+                    // Macro hell, we have to remove the fake empty suffix if we actually have
+                    // suffixes
+                    $(
+                        $($is_suffixed)?
+                        packages.pop();
+                    )?
+                    // And now add the suffixes, if any
+                    $(
+                        $($is_suffixed)?
+                        $(
+                            packages.push(PkgType::$variant { suffix: $suffixes });
+                        )+
+                    )?
+                )+
+                packages
+            }
+        }
+    }
+}
+
+pkg_type! {
+    Rust = "rust",
+    RustSrc = "rust-src",
+    Rustc = "rustc",
+    RustcDev = "rustc-dev",
+    RustcDocs = "rustc-docs",
+    ReproducibleArtifacts = "reproducible-artifacts",
+    RustMingw = "rust-mingw",
+    RustStd = "rust-std",
+    Cargo = "cargo",
+    HtmlDocs = "rust-docs",
+    RustAnalysis = "rust-analysis",
+    RustAnalyzer = "rust-analyzer"; preview = true,
+    Clippy = "clippy"; preview = true,
+    Rustfmt = "rustfmt"; preview = true,
+    LlvmTools = "llvm-tools"; preview = true,
+    Miri = "miri"; preview = true,
+    JsonDocs = "rust-docs-json"; preview = true,
+    RustcCodegenCranelift = "rustc-codegen-cranelift"; preview = true,
+    LlvmBitcodeLinker = "llvm-bitcode-linker"; preview = true,
+    RustcCodegenGcc = "rustc-codegen-gcc"; preview = true,
+    Gcc = "gcc"; preview = true; suffixes = [
+        "x86_64-unknown-linux-gnu"
+    ],
+    Enzyme = "enzyme"; preview = true,
 }
 
 impl PkgType {
-    pub(crate) fn from_component(component: &str) -> Self {
-        match component {
-            "rust" => PkgType::Rust,
-            "rust-src" => PkgType::RustSrc,
-            "rustc" => PkgType::Rustc,
-            "cargo" => PkgType::Cargo,
-            "rls" | "rls-preview" => PkgType::Rls,
-            "rust-analyzer" | "rust-analyzer-preview" => PkgType::RustAnalyzer,
-            "clippy" | "clippy-preview" => PkgType::Clippy,
-            "rustfmt" | "rustfmt-preview" => PkgType::Rustfmt,
-            "llvm-tools" | "llvm-tools-preview" => PkgType::LlvmTools,
-            "miri" | "miri-preview" => PkgType::Miri,
-            other => PkgType::Other(other.into()),
-        }
-    }
-
-    /// First part of the tarball name.
-    fn tarball_component_name(&self) -> &str {
-        match self {
-            PkgType::Rust => "rust",
-            PkgType::RustSrc => "rust-src",
-            PkgType::Rustc => "rustc",
-            PkgType::Cargo => "cargo",
-            PkgType::Rls => "rls",
-            PkgType::RustAnalyzer => "rust-analyzer",
-            PkgType::Clippy => "clippy",
-            PkgType::Rustfmt => "rustfmt",
-            PkgType::LlvmTools => "llvm-tools",
-            PkgType::Miri => "miri",
-            PkgType::Other(component) => component,
+    /// Component name in the manifest. In particular, this includes the `-preview` suffix where appropriate.
+    pub(crate) fn manifest_component_name(&self) -> String {
+        if self.is_preview() {
+            format!("{}-preview", self.tarball_component_name())
+        } else {
+            self.tarball_component_name()
         }
     }
 
@@ -62,23 +106,76 @@ impl PkgType {
     fn should_use_rust_version(&self) -> bool {
         match self {
             PkgType::Cargo => false,
-            PkgType::Rls => false,
             PkgType::RustAnalyzer => false,
             PkgType::Clippy => false,
             PkgType::Rustfmt => false,
             PkgType::LlvmTools => false,
             PkgType::Miri => false,
+            PkgType::RustcCodegenCranelift => false,
+            PkgType::RustcCodegenGcc => false,
+            PkgType::Gcc { suffix: _ } => false,
 
             PkgType::Rust => true,
+            PkgType::RustStd => true,
             PkgType::RustSrc => true,
             PkgType::Rustc => true,
-            PkgType::Other(_) => true,
+            PkgType::JsonDocs => true,
+            PkgType::HtmlDocs => true,
+            PkgType::RustcDev => true,
+            PkgType::RustcDocs => true,
+            PkgType::ReproducibleArtifacts => true,
+            PkgType::RustMingw => true,
+            PkgType::RustAnalysis => true,
+            PkgType::LlvmBitcodeLinker => true,
+            PkgType::Enzyme => true,
+        }
+    }
+
+    pub(crate) fn targets(&self) -> &[&str] {
+        use PkgType::*;
+
+        use crate::{HOSTS, MINGW, TARGETS};
+
+        match self {
+            Rust => HOSTS, // doesn't matter in practice, but return something to avoid panicking
+            Rustc => HOSTS,
+            RustcDev => HOSTS,
+            ReproducibleArtifacts => HOSTS,
+            RustcDocs => HOSTS,
+            Cargo => HOSTS,
+            RustcCodegenCranelift => HOSTS,
+            RustcCodegenGcc => HOSTS,
+            // Gcc is "special", because we need a separate libgccjit.so for each
+            // (host, target) compilation pair. So it's even more special than stdlib, which has a
+            // separate component per target. This component thus hardcodes its compilation
+            // target in its name, and we thus ship it for HOSTS only. So we essentially have
+            // gcc-T1, gcc-T2, a separate *component/package* per each compilation target.
+            // So on host T1, if you want to compile for T2, you would install gcc-T2.
+            Gcc { suffix: _ } => HOSTS,
+            RustMingw => MINGW,
+            RustStd => TARGETS,
+            HtmlDocs => HOSTS,
+            JsonDocs => HOSTS,
+            RustSrc => &["*"],
+            RustAnalyzer => HOSTS,
+            Clippy => HOSTS,
+            Miri => HOSTS,
+            Rustfmt => HOSTS,
+            RustAnalysis => TARGETS,
+            LlvmTools => TARGETS,
+            LlvmBitcodeLinker => HOSTS,
+            Enzyme => HOSTS,
         }
     }
 
     /// Whether this package is target-independent or not.
     fn target_independent(&self) -> bool {
         *self == PkgType::RustSrc
+    }
+
+    /// Whether to package these target-specific docs for another similar target.
+    pub(crate) fn use_docs_fallback(&self) -> bool {
+        matches!(self, PkgType::JsonDocs | PkgType::HtmlDocs | PkgType::RustcDocs)
     }
 }
 
@@ -113,6 +210,9 @@ impl Versions {
             Some(version) => Ok(version.clone()),
             None => {
                 let version_info = self.load_version_from_tarball(package)?;
+                if *package == PkgType::Rust && version_info.version.is_none() {
+                    panic!("missing version info for toolchain");
+                }
                 self.versions.insert(package.clone(), version_info.clone());
                 Ok(version_info)
             }
@@ -120,18 +220,40 @@ impl Versions {
     }
 
     fn load_version_from_tarball(&mut self, package: &PkgType) -> Result<VersionInfo, Error> {
-        let tarball_name = self.tarball_name(package, DEFAULT_TARGET)?;
-        let tarball = self.dist_path.join(tarball_name);
+        for ext in ["xz", "gz"] {
+            let info =
+                self.load_version_from_tarball_inner(&self.dist_path.join(self.archive_name(
+                    package,
+                    DEFAULT_TARGET,
+                    &format!("tar.{}", ext),
+                )?))?;
+            if info.present {
+                return Ok(info);
+            }
+        }
 
+        // If neither tarball is present, we fallback to returning the non-present info.
+        Ok(VersionInfo::default())
+    }
+
+    fn load_version_from_tarball_inner(&mut self, tarball: &Path) -> Result<VersionInfo, Error> {
         let file = match File::open(&tarball) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 // Missing tarballs do not return an error, but return empty data.
+                println!("warning: missing tarball {}", tarball.display());
                 return Ok(VersionInfo::default());
             }
             Err(err) => return Err(err.into()),
         };
-        let mut tar = Archive::new(GzDecoder::new(file));
+        let mut tar: Archive<Box<dyn std::io::Read>> =
+            Archive::new(if tarball.extension().map_or(false, |e| e == "gz") {
+                Box::new(GzDecoder::new(file))
+            } else if tarball.extension().map_or(false, |e| e == "xz") {
+                Box::new(XzDecoder::new(file))
+            } else {
+                unimplemented!("tarball extension not recognized: {}", tarball.display())
+            });
 
         let mut version = None;
         let mut git_commit = None;
@@ -155,17 +277,6 @@ impl Versions {
         }
 
         Ok(VersionInfo { version, git_commit, present: true })
-    }
-
-    pub(crate) fn disable_version(&mut self, package: &PkgType) {
-        match self.versions.get_mut(package) {
-            Some(version) => {
-                *version = VersionInfo::default();
-            }
-            None => {
-                self.versions.insert(package.clone(), VersionInfo::default());
-            }
-        }
     }
 
     pub(crate) fn archive_name(

@@ -1,3 +1,5 @@
+use crate::marker::Destruct;
+use crate::num::NonZero;
 use crate::ops::{ControlFlow, Try};
 
 /// An iterator able to yield elements from both ends.
@@ -36,8 +38,9 @@ use crate::ops::{ControlFlow, Try};
 /// assert_eq!(None, iter.next_back());
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
-#[cfg_attr(not(test), rustc_diagnostic_item = "DoubleEndedIterator")]
-pub trait DoubleEndedIterator: Iterator {
+#[rustc_diagnostic_item = "DoubleEndedIterator"]
+#[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+pub const trait DoubleEndedIterator: [const] Iterator {
     /// Removes and returns an element from the end of the iterator.
     ///
     /// Returns `None` when there are no more elements.
@@ -98,10 +101,11 @@ pub trait DoubleEndedIterator: Iterator {
     /// eagerly skip `n` elements starting from the back by calling [`next_back`] up
     /// to `n` times until [`None`] is encountered.
     ///
-    /// `advance_back_by(n)` will return [`Ok(())`] if the iterator successfully advances by
-    /// `n` elements, or [`Err(k)`] if [`None`] is encountered, where `k` is the number of
-    /// elements the iterator is advanced by before running out of elements (i.e. the length
-    /// of the iterator). Note that `k` is always less than `n`.
+    /// `advance_back_by(n)` will return `Ok(())` if the iterator successfully advances by
+    /// `n` elements, or a `Err(NonZero<usize>)` with value `k` if [`None`] is encountered, where `k`
+    /// is remaining number of steps that could not be advanced because the iterator ran out.
+    /// If `self` is empty and `n` is non-zero, then this returns `Err(n)`.
+    /// Otherwise, `k` is always less than `n`.
     ///
     /// Calling `advance_back_by(0)` can do meaningful work, for example [`Flatten`] can advance its
     /// outer iterator until it finds an inner iterator that is not empty, which then often
@@ -118,22 +122,28 @@ pub trait DoubleEndedIterator: Iterator {
     /// ```
     /// #![feature(iter_advance_by)]
     ///
+    /// use std::num::NonZero;
+    ///
     /// let a = [3, 4, 5, 6];
     /// let mut iter = a.iter();
     ///
     /// assert_eq!(iter.advance_back_by(2), Ok(()));
     /// assert_eq!(iter.next_back(), Some(&4));
     /// assert_eq!(iter.advance_back_by(0), Ok(()));
-    /// assert_eq!(iter.advance_back_by(100), Err(1)); // only `&3` was skipped
+    /// assert_eq!(iter.advance_back_by(100), Err(NonZero::new(99).unwrap())); // only `&3` was skipped
     /// ```
     ///
     /// [`Ok(())`]: Ok
     /// [`Err(k)`]: Err
     #[inline]
-    #[unstable(feature = "iter_advance_by", reason = "recently added", issue = "77404")]
-    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+    #[unstable(feature = "iter_advance_by", issue = "77404")]
+    #[rustc_non_const_trait_method]
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         for i in 0..n {
-            self.next_back().ok_or(i)?;
+            if self.next_back().is_none() {
+                // SAFETY: `i` is always less than `n`.
+                return Err(unsafe { NonZero::new_unchecked(n - i) });
+            }
         }
         Ok(())
     }
@@ -181,8 +191,11 @@ pub trait DoubleEndedIterator: Iterator {
     /// ```
     #[inline]
     #[stable(feature = "iter_nth_back", since = "1.37.0")]
+    #[rustc_non_const_trait_method]
     fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        self.advance_back_by(n).ok()?;
+        if self.advance_back_by(n).is_err() {
+            return None;
+        }
         self.next_back()
     }
 
@@ -221,8 +234,8 @@ pub trait DoubleEndedIterator: Iterator {
     fn try_rfold<B, F, R>(&mut self, init: B, mut f: F) -> R
     where
         Self: Sized,
-        F: FnMut(B, Self::Item) -> R,
-        R: Try<Output = B>,
+        F: [const] FnMut(B, Self::Item) -> R + [const] Destruct,
+        R: [const] Try<Output = B>,
     {
         let mut accum = init;
         while let Some(x) = self.next_back() {
@@ -291,8 +304,8 @@ pub trait DoubleEndedIterator: Iterator {
     #[stable(feature = "iter_rfold", since = "1.27.0")]
     fn rfold<B, F>(mut self, init: B, mut f: F) -> B
     where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
+        Self: Sized + [const] Destruct,
+        F: [const] FnMut(B, Self::Item) -> B + [const] Destruct,
     {
         let mut accum = init;
         while let Some(x) = self.next_back() {
@@ -325,8 +338,18 @@ pub trait DoubleEndedIterator: Iterator {
     /// ```
     /// let a = [1, 2, 3];
     ///
-    /// assert_eq!(a.iter().rfind(|&&x| x == 2), Some(&2));
+    /// assert_eq!(a.into_iter().rfind(|&x| x == 2), Some(2));
+    /// assert_eq!(a.into_iter().rfind(|&x| x == 5), None);
+    /// ```
     ///
+    /// Iterating over references:
+    ///
+    /// ```
+    /// let a = [1, 2, 3];
+    ///
+    /// // `iter()` yields references i.e. `&i32` and `rfind()` takes a
+    /// // reference to each element.
+    /// assert_eq!(a.iter().rfind(|&&x| x == 2), Some(&2));
     /// assert_eq!(a.iter().rfind(|&&x| x == 5), None);
     /// ```
     ///
@@ -344,6 +367,7 @@ pub trait DoubleEndedIterator: Iterator {
     /// ```
     #[inline]
     #[stable(feature = "iter_rfind", since = "1.27.0")]
+    #[rustc_non_const_trait_method]
     fn rfind<P>(&mut self, predicate: P) -> Option<Self::Item>
     where
         Self: Sized,
@@ -352,7 +376,7 @@ pub trait DoubleEndedIterator: Iterator {
         #[inline]
         fn check<T>(mut predicate: impl FnMut(&T) -> bool) -> impl FnMut((), T) -> ControlFlow<T> {
             move |(), x| {
-                if predicate(&x) { ControlFlow::Break(x) } else { ControlFlow::CONTINUE }
+                if predicate(&x) { ControlFlow::Break(x) } else { ControlFlow::Continue(()) }
             }
         }
 
@@ -365,10 +389,72 @@ impl<'a, I: DoubleEndedIterator + ?Sized> DoubleEndedIterator for &'a mut I {
     fn next_back(&mut self) -> Option<I::Item> {
         (**self).next_back()
     }
-    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+    fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
         (**self).advance_back_by(n)
     }
     fn nth_back(&mut self, n: usize) -> Option<I::Item> {
         (**self).nth_back(n)
+    }
+    fn rfold<B, F>(self, init: B, f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        self.spec_rfold(init, f)
+    }
+    fn try_rfold<B, F, R>(&mut self, init: B, f: F) -> R
+    where
+        F: FnMut(B, Self::Item) -> R,
+        R: Try<Output = B>,
+    {
+        self.spec_try_rfold(init, f)
+    }
+}
+
+/// Helper trait to specialize `rfold` and `rtry_fold` for `&mut I where I: Sized`
+trait DoubleEndedIteratorRefSpec: DoubleEndedIterator {
+    fn spec_rfold<B, F>(self, init: B, f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B;
+
+    fn spec_try_rfold<B, F, R>(&mut self, init: B, f: F) -> R
+    where
+        F: FnMut(B, Self::Item) -> R,
+        R: Try<Output = B>;
+}
+
+impl<I: DoubleEndedIterator + ?Sized> DoubleEndedIteratorRefSpec for &mut I {
+    default fn spec_rfold<B, F>(self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut accum = init;
+        while let Some(x) = self.next_back() {
+            accum = f(accum, x);
+        }
+        accum
+    }
+
+    default fn spec_try_rfold<B, F, R>(&mut self, init: B, mut f: F) -> R
+    where
+        F: FnMut(B, Self::Item) -> R,
+        R: Try<Output = B>,
+    {
+        let mut accum = init;
+        while let Some(x) = self.next_back() {
+            accum = f(accum, x)?;
+        }
+        try { accum }
+    }
+}
+
+impl<I: DoubleEndedIterator> DoubleEndedIteratorRefSpec for &mut I {
+    impl_fold_via_try_fold! { spec_rfold -> spec_try_rfold }
+
+    fn spec_try_rfold<B, F, R>(&mut self, init: B, f: F) -> R
+    where
+        F: FnMut(B, Self::Item) -> R,
+        R: Try<Output = B>,
+    {
+        (**self).try_rfold(init, f)
     }
 }

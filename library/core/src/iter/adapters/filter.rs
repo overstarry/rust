@@ -1,5 +1,11 @@
+use core::array;
+use core::mem::MaybeUninit;
+use core::ops::ControlFlow;
+
 use crate::fmt;
-use crate::iter::{adapters::SourceIter, FusedIterator, InPlaceIterable};
+use crate::iter::adapters::SourceIter;
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedFused, TrustedLen};
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that filters the elements of `iter` with `predicate`.
@@ -18,8 +24,44 @@ pub struct Filter<I, P> {
     predicate: P,
 }
 impl<I, P> Filter<I, P> {
-    pub(in crate::iter) fn new(iter: I, predicate: P) -> Filter<I, P> {
+    pub(in crate::iter) const fn new(iter: I, predicate: P) -> Filter<I, P> {
         Filter { iter, predicate }
+    }
+}
+
+impl<I, P> Filter<I, P>
+where
+    I: Iterator,
+    P: FnMut(&I::Item) -> bool,
+{
+    #[inline]
+    fn next_chunk_dropless<const N: usize>(
+        &mut self,
+    ) -> Result<[I::Item; N], array::IntoIter<I::Item, N>> {
+        let mut array: [MaybeUninit<I::Item>; N] = [const { MaybeUninit::uninit() }; N];
+        let mut initialized = 0;
+
+        let result = self.iter.try_for_each(|element| {
+            let idx = initialized;
+            // branchless index update combined with unconditionally copying the value even when
+            // it is filtered reduces branching and dependencies in the loop.
+            initialized = idx + (self.predicate)(&element) as usize;
+            // SAFETY: Loop conditions ensure the index is in bounds.
+            unsafe { array.get_unchecked_mut(idx) }.write(element);
+
+            if initialized < N { ControlFlow::Continue(()) } else { ControlFlow::Break(()) }
+        });
+
+        match result {
+            ControlFlow::Break(()) => {
+                // SAFETY: The loop above is only explicitly broken when the array has been fully initialized
+                Ok(unsafe { MaybeUninit::array_assume_init(array) })
+            }
+            ControlFlow::Continue(()) => {
+                // SAFETY: The range is in bounds since the loop breaks when reaching N elements.
+                Err(unsafe { array::IntoIter::new_unchecked(array, 0..initialized) })
+            }
+        }
     }
 }
 
@@ -57,6 +99,22 @@ where
     }
 
     #[inline]
+    fn next_chunk<const N: usize>(
+        &mut self,
+    ) -> Result<[Self::Item; N], array::IntoIter<Self::Item, N>> {
+        // avoid codegen for the dead branch
+        let fun = const {
+            if crate::mem::needs_drop::<I::Item>() {
+                array::iter_next_chunk::<I::Item, N>
+            } else {
+                Self::next_chunk_dropless::<N>
+            }
+        };
+
+        fun(self)
+    }
+
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (_, upper) = self.iter.size_hint();
         (0, upper) // can't know a lower bound, due to the predicate
@@ -80,7 +138,13 @@ where
             move |x| predicate(&x) as usize
         }
 
-        self.iter.map(to_usize(self.predicate)).sum()
+        let before = self.iter.size_hint().1.unwrap_or(usize::MAX);
+        let total = self.iter.map(to_usize(self.predicate)).sum();
+        // SAFETY: `total` and `before` came from the same iterator of type `I`
+        unsafe {
+            <I as SpecAssumeCount>::assume_count_le_upper_bound(total, before);
+        }
+        total
     }
 
     #[inline]
@@ -134,6 +198,9 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<I: FusedIterator, P> FusedIterator for Filter<I, P> where P: FnMut(&I::Item) -> bool {}
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused, F> TrustedFused for Filter<I, F> {}
+
 #[unstable(issue = "none", feature = "inplace_iteration")]
 unsafe impl<P, I> SourceIter for Filter<I, P>
 where
@@ -149,4 +216,38 @@ where
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<I: InPlaceIterable, P> InPlaceIterable for Filter<I, P> where P: FnMut(&I::Item) -> bool {}
+unsafe impl<I: InPlaceIterable, P> InPlaceIterable for Filter<I, P> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
+}
+
+trait SpecAssumeCount {
+    /// # Safety
+    ///
+    /// `count` must be an number of items actually read from the iterator.
+    ///
+    /// `upper` must either:
+    /// - have come from `size_hint().1` on the iterator, or
+    /// - be `usize::MAX` which will vacuously do nothing.
+    unsafe fn assume_count_le_upper_bound(count: usize, upper: usize);
+}
+
+impl<I: Iterator> SpecAssumeCount for I {
+    #[inline]
+    #[rustc_inherit_overflow_checks]
+    default unsafe fn assume_count_le_upper_bound(count: usize, upper: usize) {
+        // In the default we can't trust the `upper` for soundness
+        // because it came from an untrusted `size_hint`.
+
+        // In debug mode we might as well check that the size_hint wasn't too small
+        let _ = upper - count;
+    }
+}
+
+impl<I: TrustedLen> SpecAssumeCount for I {
+    #[inline]
+    unsafe fn assume_count_le_upper_bound(count: usize, upper: usize) {
+        // SAFETY: The `upper` is trusted because it came from a `TrustedLen` iterator.
+        unsafe { crate::hint::assert_unchecked(count <= upper) }
+    }
+}

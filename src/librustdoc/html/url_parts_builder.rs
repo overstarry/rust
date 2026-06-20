@@ -8,14 +8,13 @@ use rustc_span::Symbol;
 /// This type is a wrapper around the final `String` buffer,
 /// but its API is like that of a `Vec` of URL components.
 #[derive(Debug)]
-crate struct UrlPartsBuilder {
+pub(crate) struct UrlPartsBuilder {
     buf: String,
 }
 
 impl UrlPartsBuilder {
     /// Create an empty buffer.
-    #[allow(dead_code)]
-    crate fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { buf: String::new() }
     }
 
@@ -43,7 +42,7 @@ impl UrlPartsBuilder {
     /// builder.push_front("nightly");
     /// assert_eq!(builder.finish(), "nightly/core/str");
     /// ```
-    crate fn singleton(part: &str) -> Self {
+    pub(crate) fn singleton(part: &str) -> Self {
         Self { buf: part.to_owned() }
     }
 
@@ -60,7 +59,7 @@ impl UrlPartsBuilder {
     /// builder.push("struct.Bytes.html");
     /// assert_eq!(builder.finish(), "core/str/struct.Bytes.html");
     /// ```
-    crate fn push(&mut self, part: &str) {
+    pub(crate) fn push(&mut self, part: &str) {
         if !self.buf.is_empty() {
             self.buf.push('/');
         }
@@ -80,7 +79,7 @@ impl UrlPartsBuilder {
     /// builder.push_fmt(format_args!("{}.{}.html", "struct", "Bytes"));
     /// assert_eq!(builder.finish(), "core/str/struct.Bytes.html");
     /// ```
-    crate fn push_fmt(&mut self, args: fmt::Arguments<'_>) {
+    pub(crate) fn push_fmt(&mut self, args: fmt::Arguments<'_>) {
         if !self.buf.is_empty() {
             self.buf.push('/');
         }
@@ -101,7 +100,7 @@ impl UrlPartsBuilder {
     /// builder.push("struct.Bytes.html");
     /// assert_eq!(builder.finish(), "nightly/core/str/struct.Bytes.html");
     /// ```
-    crate fn push_front(&mut self, part: &str) {
+    pub(crate) fn push_front(&mut self, part: &str) {
         let is_empty = self.buf.is_empty();
         self.buf.reserve(part.len() + if !is_empty { 1 } else { 0 });
         self.buf.insert_str(0, part);
@@ -111,14 +110,14 @@ impl UrlPartsBuilder {
     }
 
     /// Get the final `String` buffer.
-    crate fn finish(self) -> String {
+    pub(crate) fn finish(self) -> String {
         self.buf
     }
 }
 
 /// This is just a guess at the average length of a URL part,
 /// used for [`String::with_capacity`] calls in the [`FromIterator`]
-/// and [`Extend`] impls, and for [estimating item path lengths].
+/// and [`Extend`] impls.
 ///
 /// The value `8` was chosen for two main reasons:
 ///
@@ -126,17 +125,7 @@ impl UrlPartsBuilder {
 /// * jemalloc's size classes are all multiples of eight,
 ///   which means that the amount of memory it allocates will often match
 ///   the amount requested, avoiding wasted bytes.
-///
-/// [estimating item path lengths]: estimate_item_path_byte_length
 const AVG_PART_LENGTH: usize = 8;
-
-/// Estimate the number of bytes in an item's path, based on how many segments it has.
-///
-/// **Note:** This is only to be used with, e.g., [`String::with_capacity()`];
-/// the return value is just a rough estimate.
-crate const fn estimate_item_path_byte_length(segment_count: usize) -> usize {
-    AVG_PART_LENGTH * segment_count
-}
 
 impl<'a> FromIterator<&'a str> for UrlPartsBuilder {
     fn from_iter<T: IntoIterator<Item = &'a str>>(iter: T) -> Self {

@@ -68,20 +68,20 @@
 //! will be made to flow subsequent breaks together onto lines. Inconsistent
 //! is the opposite. Inconsistent breaking example would be, say:
 //!
-//! ```
+//! ```ignore (illustrative)
 //! foo(hello, there, good, friends)
 //! ```
 //!
 //! breaking inconsistently to become
 //!
-//! ```
+//! ```ignore (illustrative)
 //! foo(hello, there,
 //!     good, friends);
 //! ```
 //!
 //! whereas a consistent breaking would yield:
 //!
-//! ```
+//! ```ignore (illustrative)
 //! foo(hello,
 //!     there,
 //!     good,
@@ -132,14 +132,13 @@
 //! methods called `Printer::scan_*`, and the 'PRINT' process is the
 //! method called `Printer::print`.
 
-mod convenience;
 mod ring;
 
-use ring::RingBuffer;
 use std::borrow::Cow;
-use std::cmp;
 use std::collections::VecDeque;
-use std::iter;
+use std::{cmp, iter};
+
+use ring::RingBuffer;
 
 /// How to break. Described in more detail in the module docs.
 #[derive(Clone, Copy, PartialEq)]
@@ -153,32 +152,32 @@ enum IndentStyle {
     /// Vertically aligned under whatever column this block begins at.
     ///
     ///     fn demo(arg1: usize,
-    ///             arg2: usize);
+    ///             arg2: usize) {}
     Visual,
     /// Indented relative to the indentation level of the previous line.
     ///
     ///     fn demo(
     ///         arg1: usize,
     ///         arg2: usize,
-    ///     );
+    ///     ) {}
     Block { offset: isize },
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
-pub struct BreakToken {
+pub(crate) struct BreakToken {
     offset: isize,
     blank_space: isize,
     pre_break: Option<char>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub struct BeginToken {
+pub(crate) struct BeginToken {
     indent: IndentStyle,
     breaks: Breaks,
 }
 
-#[derive(Clone, PartialEq)]
-pub enum Token {
+#[derive(PartialEq)]
+pub(crate) enum Token {
     // In practice a string token contains either a `&'static str` or a
     // `String`. `Cow` is overkill for this because we never modify the data,
     // but it's more convenient than rolling our own more specialized type.
@@ -186,6 +185,12 @@ pub enum Token {
     Break(BreakToken),
     Begin(BeginToken),
     End,
+}
+
+impl Token {
+    pub(crate) fn is_hardbreak_tok(&self) -> bool {
+        *self == Printer::hardbreak_tok_offset(0)
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -229,10 +234,37 @@ pub struct Printer {
     last_printed: Option<Token>,
 }
 
-#[derive(Clone)]
 struct BufEntry {
     token: Token,
     size: isize,
+}
+
+// Boxes opened with methods like `Printer::{cbox,ibox}` must be closed with
+// `Printer::end`. Failure to do so can result in bad indenting, or in extreme
+// cases, cause no output to be produced at all.
+//
+// Box opening and closing used to be entirely implicit, which was hard to
+// understand and easy to get wrong. This marker type is now returned from the
+// box opening methods and forgotten by `Printer::end`. Any marker that isn't
+// forgotten will trigger a panic in `drop`. (Closing a box more than once
+// isn't possible because `BoxMarker` doesn't implement `Copy` or `Clone`.)
+//
+// Note: it would be better to make open/close mismatching impossible and avoid
+// the need for this marker type altogether by having functions like
+// `with_ibox` that open a box, call a closure, and then close the box. That
+// would work for simple cases, but box lifetimes sometimes interact with
+// complex control flow and across function boundaries in ways that are
+// difficult to handle with such a technique.
+#[must_use]
+pub struct BoxMarker;
+
+impl !Clone for BoxMarker {}
+impl !Copy for BoxMarker {}
+
+impl Drop for BoxMarker {
+    fn drop(&mut self) {
+        panic!("BoxMarker not ended with `Printer::end()`");
+    }
 }
 
 impl Printer {
@@ -251,16 +283,16 @@ impl Printer {
         }
     }
 
-    pub fn last_token(&self) -> Option<&Token> {
+    pub(crate) fn last_token(&self) -> Option<&Token> {
         self.last_token_still_buffered().or_else(|| self.last_printed.as_ref())
     }
 
-    pub fn last_token_still_buffered(&self) -> Option<&Token> {
+    pub(crate) fn last_token_still_buffered(&self) -> Option<&Token> {
         self.buf.last().map(|last| &last.token)
     }
 
     /// Be very careful with this!
-    pub fn replace_last_token_still_buffered(&mut self, token: Token) {
+    pub(crate) fn replace_last_token_still_buffered(&mut self, token: Token) {
         self.buf.last_mut().unwrap().token = token;
     }
 
@@ -271,7 +303,8 @@ impl Printer {
         }
     }
 
-    fn scan_begin(&mut self, token: BeginToken) {
+    // This is where `BoxMarker`s are produced.
+    fn scan_begin(&mut self, token: BeginToken) -> BoxMarker {
         if self.scan_stack.is_empty() {
             self.left_total = 1;
             self.right_total = 1;
@@ -279,15 +312,18 @@ impl Printer {
         }
         let right = self.buf.push(BufEntry { token: Token::Begin(token), size: -self.right_total });
         self.scan_stack.push_back(right);
+        BoxMarker
     }
 
-    fn scan_end(&mut self) {
+    // This is where `BoxMarker`s are consumed.
+    fn scan_end(&mut self, b: BoxMarker) {
         if self.scan_stack.is_empty() {
             self.print_end();
         } else {
             let right = self.buf.push(BufEntry { token: Token::End, size: -1 });
             self.scan_stack.push_back(right);
         }
+        std::mem::forget(b)
     }
 
     fn scan_break(&mut self, token: BreakToken) {
@@ -314,7 +350,7 @@ impl Printer {
         }
     }
 
-    pub fn offset(&mut self, offset: isize) {
+    pub(crate) fn offset(&mut self, offset: isize) {
         if let Some(BufEntry { token: Token::Break(token), .. }) = &mut self.buf.last_mut() {
             token.offset += offset;
         }
@@ -360,7 +396,7 @@ impl Printer {
 
     fn check_stack(&mut self, mut depth: usize) {
         while let Some(&index) = self.scan_stack.back() {
-            let mut entry = &mut self.buf[index];
+            let entry = &mut self.buf[index];
             match entry.token {
                 Token::Begin(_) => {
                     if depth == 0 {
@@ -447,5 +483,133 @@ impl Printer {
 
         self.out.push_str(string);
         self.space -= string.len() as isize;
+    }
+
+    /// Synthesizes a comment that was not textually present in the original
+    /// source file.
+    pub fn synth_comment(&mut self, text: impl Into<Cow<'static, str>>) {
+        self.word("/*");
+        self.space();
+        self.word(text);
+        self.space();
+        self.word("*/")
+    }
+
+    /// "raw box"
+    pub fn rbox(&mut self, indent: isize, breaks: Breaks) -> BoxMarker {
+        self.scan_begin(BeginToken { indent: IndentStyle::Block { offset: indent }, breaks })
+    }
+
+    /// Inconsistent breaking box
+    pub fn ibox(&mut self, indent: isize) -> BoxMarker {
+        self.rbox(indent, Breaks::Inconsistent)
+    }
+
+    /// Consistent breaking box
+    pub fn cbox(&mut self, indent: isize) -> BoxMarker {
+        self.rbox(indent, Breaks::Consistent)
+    }
+
+    pub fn visual_align(&mut self) -> BoxMarker {
+        self.scan_begin(BeginToken { indent: IndentStyle::Visual, breaks: Breaks::Consistent })
+    }
+
+    pub fn break_offset(&mut self, n: usize, off: isize) {
+        self.scan_break(BreakToken {
+            offset: off,
+            blank_space: n as isize,
+            ..BreakToken::default()
+        });
+    }
+
+    pub fn end(&mut self, b: BoxMarker) {
+        self.scan_end(b)
+    }
+
+    pub fn eof(mut self) -> String {
+        self.scan_eof();
+        self.out
+    }
+
+    pub fn word<S: Into<Cow<'static, str>>>(&mut self, wrd: S) {
+        let string = wrd.into();
+        self.scan_string(string)
+    }
+
+    pub fn word_space<W: Into<Cow<'static, str>>>(&mut self, w: W) {
+        self.word(w);
+        self.space();
+    }
+
+    pub fn nbsp(&mut self) {
+        self.word(" ")
+    }
+
+    pub fn word_nbsp<S: Into<Cow<'static, str>>>(&mut self, w: S) {
+        self.word(w);
+        self.nbsp()
+    }
+
+    fn spaces(&mut self, n: usize) {
+        self.break_offset(n, 0)
+    }
+
+    pub fn zerobreak(&mut self) {
+        self.spaces(0)
+    }
+
+    pub fn space(&mut self) {
+        self.spaces(1)
+    }
+
+    pub fn popen(&mut self) {
+        self.word("(");
+    }
+
+    pub fn pclose(&mut self) {
+        self.word(")");
+    }
+
+    pub fn hardbreak(&mut self) {
+        self.spaces(SIZE_INFINITY as usize)
+    }
+
+    pub fn is_beginning_of_line(&self) -> bool {
+        match self.last_token() {
+            Some(last_token) => last_token.is_hardbreak_tok(),
+            None => true,
+        }
+    }
+
+    pub fn hardbreak_if_not_bol(&mut self) {
+        if !self.is_beginning_of_line() {
+            self.hardbreak()
+        }
+    }
+
+    pub fn space_if_not_bol(&mut self) {
+        if !self.is_beginning_of_line() {
+            self.space();
+        }
+    }
+
+    pub(crate) fn hardbreak_tok_offset(off: isize) -> Token {
+        Token::Break(BreakToken {
+            offset: off,
+            blank_space: SIZE_INFINITY,
+            ..BreakToken::default()
+        })
+    }
+
+    pub fn trailing_comma(&mut self) {
+        self.scan_break(BreakToken { pre_break: Some(','), ..BreakToken::default() });
+    }
+
+    pub fn trailing_comma_or_space(&mut self) {
+        self.scan_break(BreakToken {
+            blank_space: 1,
+            pre_break: Some(','),
+            ..BreakToken::default()
+        });
     }
 }

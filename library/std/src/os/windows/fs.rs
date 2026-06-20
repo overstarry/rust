@@ -4,11 +4,12 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use crate::fs::{self, Metadata, OpenOptions};
-use crate::io;
+use crate::fs::{self, Metadata, OpenOptions, Permissions};
+use crate::io::BorrowedCursor;
 use crate::path::Path;
-use crate::sys;
-use crate::sys_common::{AsInner, AsInnerMut};
+use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner};
+use crate::time::SystemTime;
+use crate::{io, sys};
 
 /// Windows-specific extensions to [`fs::File`].
 #[stable(feature = "file_offset", since = "1.15.0")]
@@ -48,6 +49,44 @@ pub trait FileExt {
     #[stable(feature = "file_offset", since = "1.15.0")]
     fn seek_read(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
 
+    /// Seeks to a given position and reads some bytes into the buffer.
+    ///
+    /// This is equivalent to the [`seek_read`](FileExt::seek_read) method, except that it is passed
+    /// a [`BorrowedCursor`] rather than `&mut [u8]` to allow use with uninitialized buffers. The
+    /// new data will be appended to any existing contents of `buf`.
+    ///
+    /// Reading beyond the end of the file will always succeed without reading any bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(core_io_borrowed_buf)]
+    /// #![feature(read_buf_at)]
+    ///
+    /// use std::io;
+    /// use std::io::BorrowedBuf;
+    /// use std::fs::File;
+    /// use std::mem::MaybeUninit;
+    /// use std::os::windows::prelude::*;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let mut file = File::open("pi.txt")?;
+    ///
+    ///     // Read some bytes starting from offset 2
+    ///     let mut buf: [MaybeUninit<u8>; 10] = [MaybeUninit::uninit(); 10];
+    ///     let mut buf = BorrowedBuf::from(buf.as_mut_slice());
+    ///     file.seek_read_buf(buf.unfilled(), 2)?;
+    ///
+    ///     assert!(buf.filled().starts_with(b"1"));
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "read_buf_at", issue = "140771")]
+    fn seek_read_buf(&self, buf: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
+        io::default_read_buf(|b| self.seek_read(b, offset), buf)
+    }
+
     /// Seeks to a given position and writes a number of bytes.
     ///
     /// Returns the number of bytes written.
@@ -57,7 +96,7 @@ pub trait FileExt {
     /// function, it is set to the end of the write.
     ///
     /// When writing beyond the end of the file, the file is appropriately
-    /// extended and the intermediate bytes are left uninitialized.
+    /// extended and the intermediate bytes are set to zero.
     ///
     /// Note that similar to `File::write`, it is not an error to return a
     /// short write. When returning from such a short write, the file pointer
@@ -88,12 +127,18 @@ impl FileExt for fs::File {
         self.as_inner().read_at(buf, offset)
     }
 
+    fn seek_read_buf(&self, buf: BorrowedCursor<'_, u8>, offset: u64) -> io::Result<()> {
+        self.as_inner().read_buf_at(buf, offset)
+    }
+
     fn seek_write(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
         self.as_inner().write_at(buf, offset)
     }
 }
 
 /// Windows-specific extensions to [`fs::OpenOptions`].
+// WARNING: This trait is not sealed. DON'T add any new methods!
+// Add them to OpenOptionsExt2 instead.
 #[stable(feature = "open_options_ext", since = "1.10.0")]
 pub trait OpenOptionsExt {
     /// Overrides the `dwDesiredAccess` argument to the call to [`CreateFile`]
@@ -291,13 +336,100 @@ impl OpenOptionsExt for OpenOptions {
     }
 }
 
+#[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+pub impl(self) trait OpenOptionsExt2 {
+    /// If set to `true`, prevent the "last access time" of the file from being changed.
+    ///
+    /// Default to `false`.
+    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+    fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self;
+
+    /// If set to `true`, prevent the "last write time" of the file from being changed.
+    ///
+    /// Default to `false`.
+    #[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+    fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self;
+}
+
+#[unstable(feature = "windows_freeze_file_times", issue = "149715")]
+impl OpenOptionsExt2 for OpenOptions {
+    fn freeze_last_access_time(&mut self, freeze: bool) -> &mut Self {
+        self.as_inner_mut().freeze_last_access_time(freeze);
+        self
+    }
+
+    fn freeze_last_write_time(&mut self, freeze: bool) -> &mut Self {
+        self.as_inner_mut().freeze_last_write_time(freeze);
+        self
+    }
+}
+
+/// Windows-specific extensions to [`fs::Permissions`]. This extension trait
+/// provides extra utilities to shows what Windows file attributes are enabled
+/// in [`Permissions`] and to manually set file attributes on [`Permissions`].
+///
+/// See Microsoft's [`File Attribute Constants`] page to know what file
+/// attribute metadata are defined and stored on Windows files.
+///
+/// [`Permissions`]: fs::Permissions
+/// [`File Attribute Constants`]:
+///     https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants
+///
+/// # Example
+///
+/// ```no_run
+/// #![feature(windows_permissions_ext)]
+/// use std::fs::Permissions;
+/// use std::os::windows::fs::PermissionsExt;
+///
+/// const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+/// const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
+/// let my_file_attr = FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE;
+/// let mut permissions = Permissions::from_file_attributes(my_file_attr);
+/// assert_eq!(permissions.file_attributes(), my_file_attr);
+///
+/// const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+/// let new_file_attr = permissions.file_attributes() | FILE_ATTRIBUTE_HIDDEN;
+/// permissions.set_file_attributes(new_file_attr);
+/// assert_eq!(permissions.file_attributes(), new_file_attr);
+/// ```
+#[unstable(feature = "windows_permissions_ext", issue = "152956")]
+pub impl(self) trait PermissionsExt {
+    /// Returns the file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn file_attributes(&self) -> u32;
+
+    /// Sets the file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn set_file_attributes(&mut self, mask: u32);
+
+    /// Creates a new instance from the given file attribute bits.
+    #[unstable(feature = "windows_permissions_ext", issue = "152956")]
+    fn from_file_attributes(mask: u32) -> Self;
+}
+
+#[unstable(feature = "windows_permissions_ext", issue = "152956")]
+impl PermissionsExt for fs::Permissions {
+    fn file_attributes(&self) -> u32 {
+        self.as_inner().file_attributes()
+    }
+
+    fn set_file_attributes(&mut self, mask: u32) {
+        *self = Permissions::from_inner(FromInner::from_inner(mask));
+    }
+
+    fn from_file_attributes(mask: u32) -> Self {
+        Permissions::from_inner(FromInner::from_inner(mask))
+    }
+}
+
 /// Windows-specific extensions to [`fs::Metadata`].
 ///
 /// The data members that this trait exposes correspond to the members
 /// of the [`BY_HANDLE_FILE_INFORMATION`] structure.
 ///
 /// [`BY_HANDLE_FILE_INFORMATION`]:
-///     https://docs.microsoft.com/en-us/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information
+///     https://docs.microsoft.com/windows/win32/api/fileapi/ns-fileapi-by_handle_file_information
 #[stable(feature = "metadata_ext", since = "1.1.0")]
 pub trait MetadataExt {
     /// Returns the value of the `dwFileAttributes` field of this metadata.
@@ -321,7 +453,7 @@ pub trait MetadataExt {
     /// ```
     ///
     /// [File Attribute Constants]:
-    ///     https://docs.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants
+    ///     https://docs.microsoft.com/windows/win32/fileio/file-attribute-constants
     #[stable(feature = "metadata_ext", since = "1.1.0")]
     fn file_attributes(&self) -> u32;
 
@@ -350,7 +482,7 @@ pub trait MetadataExt {
     /// }
     /// ```
     ///
-    /// [`FILETIME`]: https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime
+    /// [`FILETIME`]: https://docs.microsoft.com/windows/win32/api/minwinbase/ns-minwinbase-filetime
     #[stable(feature = "metadata_ext", since = "1.1.0")]
     fn creation_time(&self) -> u64;
 
@@ -385,7 +517,7 @@ pub trait MetadataExt {
     /// }
     /// ```
     ///
-    /// [`FILETIME`]: https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime
+    /// [`FILETIME`]: https://docs.microsoft.com/windows/win32/api/minwinbase/ns-minwinbase-filetime
     #[stable(feature = "metadata_ext", since = "1.1.0")]
     fn last_access_time(&self) -> u64;
 
@@ -418,11 +550,11 @@ pub trait MetadataExt {
     /// }
     /// ```
     ///
-    /// [`FILETIME`]: https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime
+    /// [`FILETIME`]: https://docs.microsoft.com/windows/win32/api/minwinbase/ns-minwinbase-filetime
     #[stable(feature = "metadata_ext", since = "1.1.0")]
     fn last_write_time(&self) -> u64;
 
-    /// Returns the value of the `nFileSize{High,Low}` fields of this
+    /// Returns the value of the `nFileSize` fields of this
     /// metadata.
     ///
     /// The returned value does not have meaning for directories.
@@ -461,7 +593,7 @@ pub trait MetadataExt {
     #[unstable(feature = "windows_by_handle", issue = "63010")]
     fn number_of_links(&self) -> Option<u32>;
 
-    /// Returns the value of the `nFileIndex{Low,High}` fields of this
+    /// Returns the value of the `nFileIndex` fields of this
     /// metadata.
     ///
     /// This will return `None` if the `Metadata` instance was created from a
@@ -469,6 +601,17 @@ pub trait MetadataExt {
     /// `fs::metadata` or `File::metadata`, then this will return `Some`.
     #[unstable(feature = "windows_by_handle", issue = "63010")]
     fn file_index(&self) -> Option<u64>;
+
+    /// Returns the value of the `ChangeTime` fields of this metadata.
+    ///
+    /// `ChangeTime` is the last time file metadata was changed, such as
+    /// renames, attributes, etc.
+    ///
+    /// This will return `None` if `Metadata` instance was created from a call to
+    /// `DirEntry::metadata` or if the `target_vendor` is outside the current platform
+    /// support for this api.
+    #[unstable(feature = "windows_change_time", issue = "121478")]
+    fn change_time(&self) -> Option<u64>;
 }
 
 #[stable(feature = "metadata_ext", since = "1.1.0")]
@@ -497,28 +640,47 @@ impl MetadataExt for Metadata {
     fn file_index(&self) -> Option<u64> {
         self.as_inner().file_index()
     }
+    fn change_time(&self) -> Option<u64> {
+        self.as_inner().changed_u64()
+    }
 }
 
 /// Windows-specific extensions to [`fs::FileType`].
 ///
 /// On Windows, a symbolic link knows whether it is a file or directory.
-#[unstable(feature = "windows_file_type_ext", issue = "none")]
-pub trait FileTypeExt {
+#[stable(feature = "windows_file_type_ext", since = "1.64.0")]
+pub impl(self) trait FileTypeExt {
     /// Returns `true` if this file type is a symbolic link that is also a directory.
-    #[unstable(feature = "windows_file_type_ext", issue = "none")]
+    #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
     fn is_symlink_dir(&self) -> bool;
     /// Returns `true` if this file type is a symbolic link that is also a file.
-    #[unstable(feature = "windows_file_type_ext", issue = "none")]
+    #[stable(feature = "windows_file_type_ext", since = "1.64.0")]
     fn is_symlink_file(&self) -> bool;
 }
 
-#[unstable(feature = "windows_file_type_ext", issue = "none")]
+#[stable(feature = "windows_file_type_ext", since = "1.64.0")]
 impl FileTypeExt for fs::FileType {
     fn is_symlink_dir(&self) -> bool {
         self.as_inner().is_symlink_dir()
     }
     fn is_symlink_file(&self) -> bool {
         self.as_inner().is_symlink_file()
+    }
+}
+
+/// Windows-specific extensions to [`fs::FileTimes`].
+#[stable(feature = "file_set_times", since = "1.75.0")]
+pub impl(self) trait FileTimesExt {
+    /// Set the creation time of a file.
+    #[stable(feature = "file_set_times", since = "1.75.0")]
+    fn set_created(self, t: SystemTime) -> Self;
+}
+
+#[stable(feature = "file_set_times", since = "1.75.0")]
+impl FileTimesExt for fs::FileTimes {
+    fn set_created(mut self, t: SystemTime) -> Self {
+        self.as_inner_mut().set_created(t.into_inner());
+        self
     }
 }
 
@@ -598,4 +760,16 @@ pub fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io:
 #[stable(feature = "symlink", since = "1.1.0")]
 pub fn symlink_dir<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     sys::fs::symlink_inner(original.as_ref(), link.as_ref(), true)
+}
+
+/// Creates a junction point.
+///
+/// The `link` path will be a directory junction pointing to the original path.
+/// If `link` is a relative path then it will be made absolute prior to creating the junction point.
+/// The `original` path must be a directory or a link to a directory, otherwise the junction point will be broken.
+///
+/// If either path is not a local file path then this will fail.
+#[unstable(feature = "junction_point", issue = "121709")]
+pub fn junction_point<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
+    sys::fs::junction_point(original.as_ref(), link.as_ref())
 }

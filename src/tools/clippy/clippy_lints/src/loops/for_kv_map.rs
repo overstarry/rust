@@ -1,66 +1,76 @@
 use super::FOR_KV_MAP;
-use clippy_utils::diagnostics::{multispan_sugg, span_lint_and_then};
-use clippy_utils::source::snippet;
-use clippy_utils::sugg;
-use clippy_utils::ty::is_type_diagnostic_item;
-use clippy_utils::visitors::is_local_used;
+use clippy_utils::diagnostics::span_lint_and_then;
+use clippy_utils::res::MaybeDef;
+use clippy_utils::source::{snippet_with_applicability, walk_span_to_context};
+use clippy_utils::{pat_is_wild, sugg};
+use rustc_errors::Applicability;
 use rustc_hir::{BorrowKind, Expr, ExprKind, Mutability, Pat, PatKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty;
-use rustc_span::sym;
+use rustc_span::{Span, sym};
 
 /// Checks for the `FOR_KV_MAP` lint.
-pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, pat: &'tcx Pat<'_>, arg: &'tcx Expr<'_>, body: &'tcx Expr<'_>) {
+pub(super) fn check<'tcx>(
+    cx: &LateContext<'tcx>,
+    pat: &'tcx Pat<'_>,
+    arg: &'tcx Expr<'_>,
+    body: &'tcx Expr<'_>,
+    span: Span,
+) {
     let pat_span = pat.span;
 
-    if let PatKind::Tuple(pat, _) = pat.kind {
-        if pat.len() == 2 {
-            let arg_span = arg.span;
-            let (new_pat_span, kind, ty, mutbl) = match *cx.typeck_results().expr_ty(arg).kind() {
-                ty::Ref(_, ty, mutbl) => match (&pat[0].kind, &pat[1].kind) {
-                    (key, _) if pat_is_wild(cx, key, body) => (pat[1].span, "value", ty, mutbl),
-                    (_, value) if pat_is_wild(cx, value, body) => (pat[0].span, "key", ty, Mutability::Not),
-                    _ => return,
-                },
+    if let PatKind::Tuple(pat, _) = pat.kind
+        && pat.len() == 2
+    {
+        let arg_span = arg.span;
+        let (arg, arg_ty) = match arg.kind {
+            // `for x in &expr` or `for x in &mut expr`
+            ExprKind::AddrOf(BorrowKind::Ref, _, expr) => (expr, cx.typeck_results().expr_ty(arg)),
+            // `for x in receiver.iter()` or `for x in receiver.iter_mut()`
+            ExprKind::MethodCall(path, receiver, [], ..)
+                if path.ident.name == sym::iter || path.ident.name == sym::iter_mut =>
+            {
+                // Use `expr_ty_adjusted` because `.iter()` / `.iter_mut()` may introduce auto deferences
+                (receiver, cx.typeck_results().expr_ty_adjusted(receiver))
+            },
+            _ => (arg, cx.typeck_results().expr_ty(arg)),
+        };
+
+        let (new_pat_span, kind, ty, mutbl) = match *arg_ty.kind() {
+            ty::Ref(_, ty, mutbl) => match (&pat[0].kind, &pat[1].kind) {
+                (key, _) if pat_is_wild(cx, key, body) => (pat[1].span, "value", ty, mutbl),
+                (_, value) if pat_is_wild(cx, value, body) => (pat[0].span, "key", ty, Mutability::Not),
                 _ => return,
-            };
-            let mutbl = match mutbl {
-                Mutability::Not => "",
-                Mutability::Mut => "_mut",
-            };
-            let arg = match arg.kind {
-                ExprKind::AddrOf(BorrowKind::Ref, _, expr) => expr,
-                _ => arg,
-            };
+            },
+            _ => return,
+        };
+        let mutbl = match mutbl {
+            Mutability::Not => "",
+            Mutability::Mut => "_mut",
+        };
 
-            if is_type_diagnostic_item(cx, ty, sym::HashMap) || is_type_diagnostic_item(cx, ty, sym::BTreeMap) {
-                span_lint_and_then(
-                    cx,
-                    FOR_KV_MAP,
-                    arg_span,
-                    &format!("you seem to want to iterate on a map's {}s", kind),
-                    |diag| {
-                        let map = sugg::Sugg::hir(cx, arg, "map");
-                        multispan_sugg(
-                            diag,
-                            "use the corresponding method",
-                            vec![
-                                (pat_span, snippet(cx, new_pat_span, kind).into_owned()),
-                                (arg_span, format!("{}.{}s{}()", map.maybe_par(), kind, mutbl)),
-                            ],
-                        );
-                    },
-                );
-            }
+        if matches!(ty.opt_diag_name(cx), Some(sym::HashMap | sym::BTreeMap))
+            && let Some(arg_span) = walk_span_to_context(arg_span, span.ctxt())
+        {
+            span_lint_and_then(
+                cx,
+                FOR_KV_MAP,
+                arg_span,
+                format!("you seem to want to iterate on a map's {kind}s"),
+                |diag| {
+                    let mut applicability = Applicability::MachineApplicable;
+                    let map = sugg::Sugg::hir_with_context(cx, arg, span.ctxt(), "map", &mut applicability);
+                    let pat = snippet_with_applicability(cx, new_pat_span, kind, &mut applicability);
+                    diag.multipart_suggestion(
+                        "use the corresponding method",
+                        vec![
+                            (pat_span, pat.to_string()),
+                            (arg_span, format!("{}.{kind}s{mutbl}()", map.maybe_paren())),
+                        ],
+                        applicability,
+                    );
+                },
+            );
         }
-    }
-}
-
-/// Returns `true` if the pattern is a `PatWild` or an ident prefixed with `_`.
-fn pat_is_wild<'tcx>(cx: &LateContext<'tcx>, pat: &'tcx PatKind<'_>, body: &'tcx Expr<'_>) -> bool {
-    match *pat {
-        PatKind::Wild => true,
-        PatKind::Binding(_, id, ident, None) if ident.as_str().starts_with('_') => !is_local_used(cx, body, id),
-        _ => false,
     }
 }

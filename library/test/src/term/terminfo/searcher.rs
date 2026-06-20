@@ -2,15 +2,13 @@
 //!
 //! Does not support hashed database, only filesystem!
 
-use std::env;
-use std::fs;
 use std::path::PathBuf;
+use std::{env, fs};
 
 #[cfg(test)]
 mod tests;
 
-/// Return path to database entry for `term`
-#[allow(deprecated)]
+/// Returns path to database entry for `term`
 pub(crate) fn get_dbpath_for_term(term: &str) -> Option<PathBuf> {
     let mut dirs_to_search = Vec::new();
     let first_char = term.chars().next()?;
@@ -22,7 +20,7 @@ pub(crate) fn get_dbpath_for_term(term: &str) -> Option<PathBuf> {
 
     if let Ok(dirs) = env::var("TERMINFO_DIRS") {
         for i in dirs.split(':') {
-            if i == "" {
+            if i.is_empty() {
                 dirs_to_search.push(PathBuf::from("/usr/share/terminfo"));
             } else {
                 dirs_to_search.push(PathBuf::from(i));
@@ -30,7 +28,7 @@ pub(crate) fn get_dbpath_for_term(term: &str) -> Option<PathBuf> {
         }
     } else {
         // Found nothing in TERMINFO_DIRS, use the default paths:
-        // According to  /etc/terminfo/README, after looking at
+        // According to /etc/terminfo/README, after looking at
         // ~/.terminfo, ncurses will search /etc/terminfo, then
         // /lib/terminfo, and eventually /usr/share/terminfo.
         // On Haiku the database can be found at /boot/system/data/terminfo
@@ -49,7 +47,7 @@ pub(crate) fn get_dbpath_for_term(term: &str) -> Option<PathBuf> {
     for mut p in dirs_to_search {
         if fs::metadata(&p).is_ok() {
             p.push(&first_char.to_string());
-            p.push(&term);
+            p.push(term);
             if fs::metadata(&p).is_ok() {
                 return Some(p);
             }

@@ -1,11 +1,18 @@
-use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::fn_def_id;
-
-use rustc_hir::{def::Res, def_id::DefIdMap, Expr};
+use clippy_config::Conf;
+use clippy_config::types::{DisallowedPath, create_disallowed_map};
+use clippy_utils::diagnostics::{span_lint, span_lint_and_then};
+use clippy_utils::disallowed_profiles::{ProfileEntry, ProfileResolver};
+use clippy_utils::paths::PathNS;
+use clippy_utils::sym;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::smallvec::SmallVec;
+use rustc_hir::def::{CtorKind, DefKind, Res};
+use rustc_hir::def_id::DefIdMap;
+use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_session::{declare_tool_lint, impl_lint_pass};
-
-use crate::utils::conf;
+use rustc_middle::ty::TyCtxt;
+use rustc_session::impl_lint_pass;
+use rustc_span::{Span, Symbol};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -30,11 +37,15 @@ declare_clippy_lint! {
     ///     # When using an inline table, can add a `reason` for why the method
     ///     # is disallowed.
     ///     { path = "std::vec::Vec::leak", reason = "no leaking memory" },
+    ///     # Can also add a `replacement` that will be offered as a suggestion.
+    ///     { path = "std::sync::Mutex::new", reason = "prefer faster & simpler non-poisonable mutex", replacement = "parking_lot::Mutex::new" },
+    ///     # This would normally error if the path is incorrect, but with `allow-invalid` = `true`,
+    ///     # it will be silently ignored
+    ///     { path = "std::fs::InvalidPath", reason = "use alternative instead", allow-invalid = true },
     /// ]
     /// ```
     ///
     /// ```rust,ignore
-    /// // Example code where clippy issues a warning
     /// let xs = vec![1, 2, 3, 4];
     /// xs.leak(); // Vec::leak is disallowed in the config.
     /// // The diagnostic contains the message "no leaking memory".
@@ -46,9 +57,21 @@ declare_clippy_lint! {
     ///
     /// Use instead:
     /// ```rust,ignore
-    /// // Example code which does not raise clippy warning
     /// let mut xs = Vec::new(); // Vec::new is _not_ disallowed in the config.
     /// xs.push(123); // Vec::push is _not_ disallowed in the config.
+    /// ```
+    ///
+    /// Disallowed profiles allow scoping different disallow lists:
+    /// ```toml
+    /// [profiles.forward_pass]
+    /// disallowed-methods = [{ path = "crate::devices::Buffer::copy_to_host", reason = "Forward code must not touch host buffers" }]
+    /// ```
+    ///
+    /// ```rust,ignore
+    /// #[clippy::disallowed_profile("forward_pass")]
+    /// fn evaluate() {
+    ///     // Method calls in this function use the `forward_pass` profile.
+    /// }
     /// ```
     #[clippy::version = "1.49.0"]
     pub DISALLOWED_METHODS,
@@ -56,50 +79,146 @@ declare_clippy_lint! {
     "use of a disallowed method call"
 }
 
-#[derive(Clone, Debug)]
+impl_lint_pass!(DisallowedMethods => [DISALLOWED_METHODS]);
+
 pub struct DisallowedMethods {
-    conf_disallowed: Vec<conf::DisallowedMethod>,
-    disallowed: DefIdMap<usize>,
+    default: DefIdMap<(&'static str, &'static DisallowedPath)>,
+    /// Lookup per profile that declares a non-empty `disallowed_methods` list. Profiles
+    /// declared in `[profiles.*]` but without `disallowed_methods` entries are absent here.
+    profiles: FxHashMap<Symbol, DefIdMap<(&'static str, &'static DisallowedPath)>>,
+    /// Every profile name declared in `[profiles.*]`, regardless of whether it contributes
+    /// to this lint. Used to suppress the "unknown profile" warning for profiles that exist
+    /// in config but only define entries for other lints (e.g. `disallowed_types`).
+    known_profiles: FxHashSet<Symbol>,
+    profile_cache: ProfileResolver,
+    warned_unknown_profiles: FxHashSet<Span>,
 }
 
 impl DisallowedMethods {
-    pub fn new(conf_disallowed: Vec<conf::DisallowedMethod>) -> Self {
+    #[allow(rustc::potential_query_instability)] // Profiles are sorted for deterministic iteration.
+    pub fn new(tcx: TyCtxt<'_>, conf: &'static Conf) -> Self {
+        let (default, _) = create_disallowed_map(
+            tcx,
+            &conf.disallowed_methods,
+            PathNS::Value,
+            |def_kind| {
+                matches!(
+                    def_kind,
+                    DefKind::Fn | DefKind::Ctor(_, CtorKind::Fn) | DefKind::AssocFn
+                )
+            },
+            "function",
+            false,
+        );
+
+        let mut profiles = FxHashMap::default();
+        let mut known_profiles = FxHashSet::default();
+        let mut profile_entries: Vec<_> = conf.profiles.iter().collect();
+        profile_entries.sort_by_key(|(a, _)| *a);
+        for (name, profile) in profile_entries {
+            let symbol = Symbol::intern(name.as_str());
+            known_profiles.insert(symbol);
+
+            let paths = profile.disallowed_methods.as_slice();
+            if paths.is_empty() {
+                continue;
+            }
+
+            let (map, _) = create_disallowed_map(
+                tcx,
+                paths,
+                PathNS::Value,
+                |def_kind| {
+                    matches!(
+                        def_kind,
+                        DefKind::Fn | DefKind::Ctor(_, CtorKind::Fn) | DefKind::AssocFn
+                    )
+                },
+                "function",
+                false,
+            );
+            profiles.insert(symbol, map);
+        }
+
         Self {
-            conf_disallowed,
-            disallowed: DefIdMap::default(),
+            default,
+            profiles,
+            known_profiles,
+            profile_cache: ProfileResolver::default(),
+            warned_unknown_profiles: FxHashSet::default(),
+        }
+    }
+
+    fn warn_unknown_profile(&mut self, cx: &LateContext<'_>, entry: &ProfileEntry) {
+        if self.warned_unknown_profiles.insert(entry.span) {
+            let attr_name = if entry.attr_name == sym::disallowed_profiles {
+                "clippy::disallowed_profiles"
+            } else {
+                "clippy::disallowed_profile"
+            };
+            span_lint(
+                cx,
+                DISALLOWED_METHODS,
+                entry.span,
+                format!(
+                    "`{attr_name}` references unknown profile `{}` for `clippy::disallowed_methods`",
+                    entry.name
+                ),
+            );
         }
     }
 }
 
-impl_lint_pass!(DisallowedMethods => [DISALLOWED_METHODS]);
-
 impl<'tcx> LateLintPass<'tcx> for DisallowedMethods {
-    fn check_crate(&mut self, cx: &LateContext<'_>) {
-        for (index, conf) in self.conf_disallowed.iter().enumerate() {
-            let segs: Vec<_> = conf.path().split("::").collect();
-            if let Res::Def(_, id) = clippy_utils::def_path_res(cx, &segs) {
-                self.disallowed.insert(id, index);
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
+        if expr.span.desugaring_kind().is_some() {
+            return;
+        }
+        let (id, span) = match &expr.kind {
+            ExprKind::Path(path) if let Res::Def(_, id) = cx.qpath_res(path, expr.hir_id) => (id, expr.span),
+            ExprKind::MethodCall(name, ..) if let Some(id) = cx.typeck_results().type_dependent_def_id(expr.hir_id) => {
+                (id, name.ident.span)
+            },
+            _ => return,
+        };
+        let mut active_profiles = SmallVec::<[Symbol; 2]>::new();
+        // Copy entries out of the cache before iterating: `warn_unknown_profile` takes
+        // `&mut self`, which conflicts with the borrow held by `active_profiles(...)`.
+        let entries: SmallVec<[ProfileEntry; 2]> = self
+            .profile_cache
+            .active_profiles(cx, expr.hir_id)
+            .map(|selection| selection.iter().copied().collect())
+            .unwrap_or_default();
+        for entry in &entries {
+            if self.profiles.contains_key(&entry.name) {
+                active_profiles.push(entry.name);
+            } else if !self.known_profiles.contains(&entry.name) {
+                self.warn_unknown_profile(cx, entry);
             }
         }
-    }
 
-    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        let def_id = match fn_def_id(cx, expr) {
-            Some(def_id) => def_id,
-            None => return,
-        };
-        let conf = match self.disallowed.get(&def_id) {
-            Some(&index) => &self.conf_disallowed[index],
-            None => return,
-        };
-        let msg = format!("use of a disallowed method `{}`", conf.path());
-        span_lint_and_then(cx, DISALLOWED_METHODS, expr.span, &msg, |diag| {
-            if let conf::DisallowedMethod::WithReason {
-                reason: Some(reason), ..
-            } = conf
-            {
-                diag.note(&format!("{} (from clippy.toml)", reason));
-            }
-        });
+        if let Some((profile, &(path, disallowed_path))) = active_profiles.iter().find_map(|symbol| {
+            self.profiles
+                .get(symbol)
+                .and_then(|map| map.get(&id).map(|info| (*symbol, info)))
+        }) {
+            let diag_amendment = disallowed_path.diag_amendment(span);
+            span_lint_and_then(
+                cx,
+                DISALLOWED_METHODS,
+                span,
+                format!("use of a disallowed method `{path}` (profile: {profile})"),
+                |diag| diag_amendment(diag),
+            );
+        } else if let Some(&(path, disallowed_path)) = self.default.get(&id) {
+            let diag_amendment = disallowed_path.diag_amendment(span);
+            span_lint_and_then(
+                cx,
+                DISALLOWED_METHODS,
+                span,
+                format!("use of a disallowed method `{path}`"),
+                |diag| diag_amendment(diag),
+            );
+        }
     }
 }

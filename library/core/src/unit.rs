@@ -1,4 +1,4 @@
-use crate::iter::FromIterator;
+use crate::intrinsics::type_id;
 
 /// Collapses all unit items from an iterator into one.
 ///
@@ -18,4 +18,13 @@ impl FromIterator<()> for () {
     fn from_iter<I: IntoIterator<Item = ()>>(iter: I) -> Self {
         iter.into_iter().for_each(|()| {})
     }
+}
+
+pub(crate) trait IsUnit {
+    const IS_UNIT: bool;
+}
+
+impl<T: ?Sized> IsUnit for T {
+    // `type_id` erases lifetimes, but that's OK here because "is it ()" never depends on lifetimes
+    const IS_UNIT: bool = type_id::<Self>() == type_id::<()>();
 }

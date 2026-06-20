@@ -1,8 +1,7 @@
-use crate::alloc::{Allocator, Global};
-use core::ptr::{self};
-use core::slice::{self};
+use core::ptr;
 
 use super::{Drain, Vec};
+use crate::alloc::{Allocator, Global};
 
 /// A splicing iterator for `Vec`.
 ///
@@ -14,7 +13,7 @@ use super::{Drain, Vec};
 /// ```
 /// let mut v = vec![0, 1, 2];
 /// let new = [7, 8];
-/// let iter: std::vec::Splice<_> = v.splice(1.., new);
+/// let iter: std::vec::Splice<'_, _> = v.splice(1.., new);
 /// ```
 #[derive(Debug)]
 #[stable(feature = "vec_splice", since = "1.21.0")]
@@ -50,10 +49,17 @@ impl<I: Iterator, A: Allocator> DoubleEndedIterator for Splice<'_, I, A> {
 #[stable(feature = "vec_splice", since = "1.21.0")]
 impl<I: Iterator, A: Allocator> ExactSizeIterator for Splice<'_, I, A> {}
 
+// See also: [`crate::collections::vec_deque::Splice`].
 #[stable(feature = "vec_splice", since = "1.21.0")]
 impl<I: Iterator, A: Allocator> Drop for Splice<'_, I, A> {
     fn drop(&mut self) {
         self.drain.by_ref().for_each(drop);
+        // At this point draining is done and the only remaining tasks are splicing
+        // and moving things into the final place.
+        // Which means we can replace the slice::Iter with pointers that won't point to deallocated
+        // memory, so that Drain::drop is still allowed to call iter.len(), otherwise it would break
+        // the ptr.offset_from_unsigned contract.
+        self.drain.iter = (&[]).iter();
 
         unsafe {
             if self.drain.tail_len == 0 {
@@ -101,17 +107,14 @@ impl<T, A: Allocator> Drain<'_, T, A> {
         let vec = unsafe { self.vec.as_mut() };
         let range_start = vec.len;
         let range_end = self.tail_start;
-        let range_slice = unsafe {
-            slice::from_raw_parts_mut(vec.as_mut_ptr().add(range_start), range_end - range_start)
-        };
+        // The elements in this range are not initialized so we avoid creating a slice.
 
-        for place in range_slice {
-            if let Some(new_item) = replace_with.next() {
-                unsafe { ptr::write(place, new_item) };
-                vec.len += 1;
-            } else {
+        for idx in range_start..range_end {
+            let Some(new_item) = replace_with.next() else {
                 return false;
-            }
+            };
+            unsafe { vec.as_mut_ptr().add(idx).write(new_item) };
+            vec.len += 1;
         }
         true
     }

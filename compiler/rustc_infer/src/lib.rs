@@ -2,7 +2,7 @@
 //!
 //! - **Type inference.** The type inference code can be found in the `infer` module;
 //!   this code handles low-level equality and subtyping operations. The
-//!   type check pass in the compiler is found in the `rustc_typeck` crate.
+//!   type check pass in the compiler is found in the `rustc_hir_analysis` crate.
 //!
 //! For more information about how rustc works, see the [rustc dev guide].
 //!
@@ -12,29 +12,12 @@
 //!
 //! This API is completely unstable and subject to change.
 
-#![allow(rustc::potential_query_instability)]
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bool_to_option)]
-#![feature(box_patterns)]
-#![feature(control_flow_enum)]
-#![cfg_attr(bootstrap, feature(derive_default_enum))]
+// tidy-alphabetical-start
+#![allow(rustc::direct_use_of_rustc_type_ir)]
 #![feature(extend_one)]
-#![feature(label_break_value)]
-#![feature(let_chains)]
-#![feature(let_else)]
-#![feature(min_specialization)]
-#![feature(never_type)]
 #![recursion_limit = "512"] // For rustdoc
+// tidy-alphabetical-end
 
-#[macro_use]
-extern crate rustc_macros;
-#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-#[macro_use]
-extern crate rustc_data_structures;
-#[macro_use]
-extern crate tracing;
-#[macro_use]
-extern crate rustc_middle;
-
+mod diagnostics;
 pub mod infer;
 pub mod traits;

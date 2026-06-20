@@ -1,12 +1,12 @@
 //! Linux-specific raw type definitions.
 
 #![stable(feature = "raw_ext", since = "1.1.0")]
-#![rustc_deprecated(
+#![deprecated(
     since = "1.8.0",
-    reason = "these type aliases are no longer supported by \
-              the standard library, the `libc` crate on \
-              crates.io should be used instead for the correct \
-              definitions"
+    note = "these type aliases are no longer supported by \
+            the standard library, the `libc` crate on \
+            crates.io should be used instead for the correct \
+            definitions"
 )]
 #![allow(deprecated)]
 
@@ -26,13 +26,11 @@ pub use self::arch::{blkcnt_t, blksize_t, ino_t, nlink_t, off_t, stat, time_t};
 
 #[cfg(any(
     target_arch = "x86",
-    target_arch = "le32",
     target_arch = "m68k",
+    target_arch = "csky",
     target_arch = "powerpc",
     target_arch = "sparc",
     target_arch = "arm",
-    target_arch = "asmjs",
-    target_arch = "wasm32"
 ))]
 mod arch {
     use crate::os::raw::{c_long, c_short, c_uint};
@@ -95,7 +93,7 @@ mod arch {
     }
 }
 
-#[cfg(target_arch = "mips")]
+#[cfg(any(target_arch = "mips", target_arch = "mips32r6"))]
 mod arch {
     use crate::os::raw::{c_long, c_ulong};
 
@@ -232,7 +230,10 @@ mod arch {
 }
 
 #[cfg(any(
+    target_arch = "loongarch32",
+    target_arch = "loongarch64",
     target_arch = "mips64",
+    target_arch = "mips64r6",
     target_arch = "s390x",
     target_arch = "sparc64",
     target_arch = "riscv64",
@@ -243,7 +244,11 @@ mod arch {
     pub use libc::{blkcnt_t, blksize_t, ino_t, nlink_t, off_t, stat, time_t};
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(
+    target_arch = "aarch64",
+    // Arm64EC is Windows-only, but docs are always build as Linux, so re-use AArch64 for Arm64EC.
+    all(doc, target_arch = "arm64ec")
+))]
 mod arch {
     use crate::os::raw::{c_int, c_long};
 
@@ -305,7 +310,9 @@ mod arch {
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "powerpc64"))]
+#[cfg(any(target_arch = "x86_64", target_arch = "powerpc64",
+    // `wasm32-wali-linux-musl` uses ABI similar to x86_64
+    target_arch = "wasm32"))]
 mod arch {
     use crate::os::raw::{c_int, c_long};
 

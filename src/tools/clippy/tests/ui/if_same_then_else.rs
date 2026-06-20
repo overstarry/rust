@@ -1,13 +1,13 @@
 #![warn(clippy::if_same_then_else)]
-#![allow(
-    clippy::blacklisted_name,
+#![expect(
     clippy::eq_op,
     clippy::never_loop,
     clippy::no_effect,
     clippy::unused_unit,
-    clippy::zero_divided_by_zero,
-    clippy::branches_sharing_code
+    clippy::zero_divided_by_zero
 )]
+
+use std::ops::*;
 
 struct Foo {
     bar: u8,
@@ -27,7 +27,6 @@ fn if_same_then_else() {
         0..=10;
         foo();
     } else {
-        //~ ERROR same body as `if` block
         Foo { bar: 42 };
         0..10;
         ..;
@@ -36,6 +35,7 @@ fn if_same_then_else() {
         0..=10;
         foo();
     }
+    //~^^^^^^^^^^^^^^^^^ if_same_then_else
 
     if true {
         Foo { bar: 42 };
@@ -62,19 +62,11 @@ fn if_same_then_else() {
         foo();
     }
 
-    let _ = if true {
-        0.0
-    } else {
-        //~ ERROR same body as `if` block
-        0.0
-    };
+    let _ = if true { 0.0 } else { 0.0 };
+    //~^ if_same_then_else
 
-    let _ = if true {
-        -0.0
-    } else {
-        //~ ERROR same body as `if` block
-        -0.0
-    };
+    let _ = if true { -0.0 } else { -0.0 };
+    //~^ if_same_then_else
 
     let _ = if true { 0.0 } else { -0.0 };
 
@@ -85,12 +77,8 @@ fn if_same_then_else() {
         foo();
     }
 
-    let _ = if true {
-        42
-    } else {
-        //~ ERROR same body as `if` block
-        42
-    };
+    let _ = if true { 42 } else { 42 };
+    //~^ if_same_then_else
 
     if true {
         let bar = if true { 42 } else { 43 };
@@ -100,7 +88,6 @@ fn if_same_then_else() {
         }
         bar + 1;
     } else {
-        //~ ERROR same body as `if` block
         let bar = if true { 42 } else { 43 };
 
         while foo() {
@@ -108,6 +95,7 @@ fn if_same_then_else() {
         }
         bar + 1;
     }
+    //~^^^^^^^^^^^^^^^ if_same_then_else
 
     if true {
         let _ = match 42 {
@@ -143,16 +131,190 @@ fn func() {
 
 fn f(val: &[u8]) {}
 
-mod issue_5698 {
-    fn mul_not_always_commutative(x: i32, y: i32) -> i32 {
-        if x == 42 {
-            x * y
-        } else if x == 21 {
-            y * x
+mod issue_8836 {
+    fn do_not_lint() {
+        if true {
+            todo!()
         } else {
-            0
+            todo!()
+        }
+        if true {
+            todo!();
+        } else {
+            todo!();
+        }
+        if true {
+            unimplemented!()
+        } else {
+            unimplemented!()
+        }
+        if true {
+            unimplemented!();
+        } else {
+            unimplemented!();
+        }
+
+        if true {
+            println!("FOO");
+            todo!();
+        } else {
+            println!("FOO");
+            todo!();
+        }
+
+        if true {
+            println!("FOO");
+            unimplemented!();
+        } else {
+            println!("FOO");
+            unimplemented!();
+        }
+
+        if true {
+            println!("FOO");
+            todo!()
+        } else {
+            println!("FOO");
+            todo!()
+        }
+
+        if true {
+            println!("FOO");
+            unimplemented!()
+        } else {
+            println!("FOO");
+            unimplemented!()
         }
     }
 }
 
+mod issue_11213 {
+    fn reproducer(x: bool) -> bool {
+        if x {
+            0_u8.is_power_of_two()
+        } else {
+            0_u16.is_power_of_two()
+        }
+    }
+
+    // a more obvious reproducer that shows
+    // why the code above is problematic:
+    fn v2(x: bool) -> bool {
+        trait Helper {
+            fn is_u8(&self) -> bool;
+        }
+        impl Helper for u8 {
+            fn is_u8(&self) -> bool {
+                true
+            }
+        }
+        impl Helper for u16 {
+            fn is_u8(&self) -> bool {
+                false
+            }
+        }
+
+        // this is certainly not the same code in both branches
+        // it returns a different bool depending on the branch.
+        if x { 0_u8.is_u8() } else { 0_u16.is_u8() }
+    }
+
+    fn do_lint(x: bool) -> bool {
+        // but do lint if the type of the literal is the same
+        if x {
+            0_u8.is_power_of_two()
+        } else {
+            0_u8.is_power_of_two()
+        }
+        //~^^^^^ if_same_then_else
+    }
+}
+
 fn main() {}
+
+fn issue16416<T>(x: bool, a: T, b: T)
+where
+    T: Add + Sub + Mul + Div + Rem + BitAnd + BitOr + BitXor + PartialEq + Eq + PartialOrd + Ord + Shr + Shl + Copy,
+{
+    // Non-guaranteed-commutative operators
+    _ = if x { a * b } else { b * a };
+    _ = if x { a + b } else { b + a };
+    _ = if x { a - b } else { b - a };
+    _ = if x { a / b } else { b / a };
+    _ = if x { a % b } else { b % a };
+    _ = if x { a << b } else { b << a };
+    _ = if x { a >> b } else { b >> a };
+    _ = if x { a & b } else { b & a };
+    _ = if x { a ^ b } else { b ^ a };
+    _ = if x { a | b } else { b | a };
+
+    // Guaranteed commutative operators
+    //~v if_same_then_else
+    _ = if x { a == b } else { b == a };
+    //~v if_same_then_else
+    _ = if x { a != b } else { b != a };
+
+    // Symetric operators
+    //~v if_same_then_else
+    _ = if x { a < b } else { b > a };
+    //~v if_same_then_else
+    _ = if x { a <= b } else { b >= a };
+    //~v if_same_then_else
+    _ = if x { a > b } else { b < a };
+    //~v if_same_then_else
+    _ = if x { a >= b } else { b <= a };
+}
+
+fn issue16416_prim(x: bool, a: u32, b: u32) {
+    // Non-commutative operators
+    _ = if x { a - b } else { b - a };
+    _ = if x { a / b } else { b / a };
+    _ = if x { a % b } else { b % a };
+    _ = if x { a << b } else { b << a };
+    _ = if x { a >> b } else { b >> a };
+
+    // Commutative operators on primitive types
+    //~v if_same_then_else
+    _ = if x { a * b } else { b * a };
+    //~v if_same_then_else
+    _ = if x { a + b } else { b + a };
+    //~v if_same_then_else
+    _ = if x { a & b } else { b & a };
+    //~v if_same_then_else
+    _ = if x { a ^ b } else { b ^ a };
+    //~v if_same_then_else
+    _ = if x { a | b } else { b | a };
+
+    // Always commutative operators
+    //~v if_same_then_else
+    _ = if x { a == b } else { b == a };
+    //~v if_same_then_else
+    _ = if x { a != b } else { b != a };
+
+    // Symetric operators
+    //~v if_same_then_else
+    _ = if x { a < b } else { b > a };
+    //~v if_same_then_else
+    _ = if x { a <= b } else { b >= a };
+    //~v if_same_then_else
+    _ = if x { a > b } else { b < a };
+    //~v if_same_then_else
+    _ = if x { a >= b } else { b <= a };
+}
+
+mod issue16505 {
+    macro_rules! foo {
+        (< $hi:literal : $lo:literal > | $N:tt bits) => {{
+            const NEW_N_: usize = $hi - $lo + 1;
+            NEW_N_
+        }};
+    }
+
+    fn bar(x: bool) {
+        _ = if x {
+            foo!(<2:0> | 3 bits) == foo!(<3:1> | 3 bits)
+        } else {
+            foo!(<3:1> | 3 bits) == foo!(<2:0> | 3 bits)
+        };
+    }
+}

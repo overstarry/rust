@@ -1,8 +1,7 @@
-// run-rustfix
 #![warn(clippy::needless_match)]
-#![allow(clippy::manual_map)]
+#![allow(clippy::manual_map, clippy::question_mark)]
 #![allow(dead_code)]
-
+#![allow(unused)]
 #[derive(Clone, Copy)]
 enum Simple {
     A,
@@ -62,6 +61,7 @@ fn result_match() {
 
 fn if_let_option() {
     let _ = Some(1);
+    //~^ needless_match
 
     fn do_something() {}
 
@@ -80,13 +80,28 @@ fn if_let_option() {
     } else {
         None
     };
+
+    // Don't trigger
+    let _ = if let Some(a) = Some(1) { Some(a) } else { Some(2) };
+}
+
+fn if_let_option_result() -> Result<(), ()> {
+    fn f(x: i32) -> Result<Option<i32>, ()> {
+        Ok(Some(x))
+    }
+    // Don't trigger
+    let _ = if let Some(v) = f(1)? { Some(v) } else { f(2)? };
+    Ok(())
 }
 
 fn if_let_result() {
     let x: Result<i32, i32> = Ok(1);
     let _: Result<i32, i32> = x;
+    //~^ needless_match
     let _: Result<i32, i32> = x;
+    //~^ needless_match
     // Input type mismatch, don't trigger
+    #[allow(clippy::question_mark)]
     let _: Result<i32, i32> = if let Err(e) = Ok(1) { Err(e) } else { x };
 }
 
@@ -192,6 +207,110 @@ impl Tr for Result<i32, i32> {
             Err(e) => Err(e),
         }
     }
+}
+
+mod issue9084 {
+    fn wildcard_if() {
+        let mut some_bool = true;
+        let e = Some(1);
+
+        // should lint
+        let _ = e;
+
+        // should lint
+        let _ = e;
+
+        // should not lint
+        let _ = match e {
+            _ if some_bool => e,
+            _ => Some(2),
+        };
+
+        // should not lint
+        let _ = match e {
+            Some(i) => Some(i + 1),
+            _ if some_bool => e,
+            _ => e,
+        };
+
+        // should not lint (guard has side effects)
+        let _ = match e {
+            Some(i) => Some(i),
+            _ if {
+                some_bool = false;
+                some_bool
+            } =>
+            {
+                e
+            },
+            _ => e,
+        };
+    }
+}
+
+fn a() -> Option<()> {
+    Some(())
+}
+fn b() -> Option<()> {
+    Some(())
+}
+fn c() -> Option<()> {
+    Some(())
+}
+
+#[allow(clippy::ifs_same_cond)]
+pub fn issue13574() -> Option<()> {
+    // Do not lint.
+    // The right hand of all these arms are different functions.
+    let _ = {
+        if let Some(a) = a() {
+            Some(a)
+        } else if let Some(b) = b() {
+            Some(b)
+        } else if let Some(c) = c() {
+            Some(c)
+        } else {
+            None
+        }
+    };
+
+    const A: Option<()> = Some(());
+    const B: Option<()> = Some(());
+    const C: Option<()> = Some(());
+    const D: Option<()> = Some(());
+
+    let _ = {
+        if let Some(num) = A {
+            Some(num)
+        } else if let Some(num) = B {
+            Some(num)
+        } else if let Some(num) = C {
+            Some(num)
+        } else if let Some(num) = D {
+            Some(num)
+        } else {
+            None
+        }
+    };
+
+    // Same const, should lint
+    let _ = {
+        A
+    };
+
+    None
+}
+
+fn issue14754(t: Result<i32, &'static str>) -> Result<i32, &'static str> {
+    let _ = match t {
+        Ok(v) => Ok::<_, &'static str>(v),
+        err @ Err(_) => return err,
+    };
+    println!("Still here");
+    let x = t;
+    //~^^^^ needless_match
+    println!("Still here");
+    x
 }
 
 fn main() {}

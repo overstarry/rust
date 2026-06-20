@@ -11,7 +11,7 @@
 //!
 //! This attribute allows configuring the choice of global allocator.
 //! You can use this to implement a completely custom global allocator
-//! to route all default allocation requests to a custom object.
+//! to route all[^system-alloc] default allocation requests to a custom object.
 //!
 //! ```rust
 //! use std::alloc::{GlobalAlloc, System, Layout};
@@ -20,11 +20,11 @@
 //!
 //! unsafe impl GlobalAlloc for MyAllocator {
 //!     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-//!         System.alloc(layout)
+//!         unsafe { System.alloc(layout) }
 //!     }
 //!
 //!     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-//!         System.dealloc(ptr, layout)
+//!         unsafe { System.dealloc(ptr, layout) }
 //!     }
 //! }
 //!
@@ -42,8 +42,6 @@
 //! [`GlobalAlloc`] trait. This type can be provided by an external library:
 //!
 //! ```rust,ignore (demonstrates crates.io usage)
-//! extern crate jemallocator;
-//!
 //! use jemallocator::Jemalloc;
 //!
 //! #[global_allocator]
@@ -54,14 +52,20 @@
 //!
 //! The `#[global_allocator]` can only be used once in a crate
 //! or its recursive dependencies.
+//!
+//! [^system-alloc]: Note that the Rust standard library internals may still
+//! directly call [`System`] when necessary (for example for the runtime
+//! support typically required to implement a global allocator, see [re-entrance] on [`GlobalAlloc`]
+//! for more details).
+//!
+//! [re-entrance]: trait.GlobalAlloc.html#re-entrance
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![stable(feature = "alloc_module", since = "1.28.0")]
 
-use core::intrinsics;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, Ordering};
-use core::{mem, ptr};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::{hint, mem, ptr};
 
 #[stable(feature = "alloc_module", since = "1.28.0")]
 #[doc(inline)]
@@ -70,9 +74,14 @@ pub use alloc_crate::alloc::*;
 /// The default memory allocator provided by the operating system.
 ///
 /// This is based on `malloc` on Unix platforms and `HeapAlloc` on Windows,
-/// plus related functions.
+/// plus related functions. However, it is not valid to mix use of the backing
+/// system allocator with `System`, as this implementation may include extra
+/// work, such as to serve alignment requests greater than the alignment
+/// provided directly by the backing system allocator.
 ///
-/// This type implements the `GlobalAlloc` trait and Rust programs by default
+/// This type implements the [`GlobalAlloc`] trait. Currently the default
+/// global allocator is unspecified. Libraries, however, like `cdylib`s and
+/// `staticlib`s are guaranteed to use the [`System`] by default and as such
 /// work as if they had this definition:
 ///
 /// ```rust
@@ -92,7 +101,7 @@ pub use alloc_crate::alloc::*;
 ///
 /// ```rust
 /// use std::alloc::{System, GlobalAlloc, Layout};
-/// use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+/// use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 ///
 /// struct Counter;
 ///
@@ -100,16 +109,16 @@ pub use alloc_crate::alloc::*;
 ///
 /// unsafe impl GlobalAlloc for Counter {
 ///     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-///         let ret = System.alloc(layout);
+///         let ret = unsafe { System.alloc(layout) };
 ///         if !ret.is_null() {
-///             ALLOCATED.fetch_add(layout.size(), SeqCst);
+///             ALLOCATED.fetch_add(layout.size(), Relaxed);
 ///         }
-///         return ret
+///         ret
 ///     }
 ///
 ///     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-///         System.dealloc(ptr, layout);
-///         ALLOCATED.fetch_sub(layout.size(), SeqCst);
+///         unsafe { System.dealloc(ptr, layout); }
+///         ALLOCATED.fetch_sub(layout.size(), Relaxed);
 ///     }
 /// }
 ///
@@ -117,7 +126,7 @@ pub use alloc_crate::alloc::*;
 /// static A: Counter = Counter;
 ///
 /// fn main() {
-///     println!("allocated bytes before main: {}", ALLOCATED.load(SeqCst));
+///     println!("allocated bytes before main: {}", ALLOCATED.load(Relaxed));
 /// }
 /// ```
 ///
@@ -133,7 +142,7 @@ impl System {
     #[inline]
     fn alloc_impl(&self, layout: Layout, zeroed: bool) -> Result<NonNull<[u8]>, AllocError> {
         match layout.size() {
-            0 => Ok(NonNull::slice_from_raw_parts(layout.dangling(), 0)),
+            0 => Ok(layout.dangling_ptr().cast_slice(0)),
             // SAFETY: `layout` is non-zero in size,
             size => unsafe {
                 let raw_ptr = if zeroed {
@@ -142,7 +151,7 @@ impl System {
                     GlobalAlloc::alloc(self, layout)
                 };
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
-                Ok(NonNull::slice_from_raw_parts(ptr, size))
+                Ok(ptr.cast_slice(size))
             },
         }
     }
@@ -171,14 +180,14 @@ impl System {
                 let new_size = new_layout.size();
 
                 // `realloc` probably checks for `new_size >= old_layout.size()` or something similar.
-                intrinsics::assume(new_size >= old_layout.size());
+                hint::assert_unchecked(new_size >= old_layout.size());
 
                 let raw_ptr = GlobalAlloc::realloc(self, ptr.as_ptr(), old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
                 if zeroed {
                     raw_ptr.add(old_size).write_bytes(0, new_size - old_size);
                 }
-                Ok(NonNull::slice_from_raw_parts(ptr, new_size))
+                Ok(ptr.cast_slice(new_size))
             },
 
             // SAFETY: because `new_layout.size()` must be greater than or equal to `old_size`,
@@ -189,7 +198,7 @@ impl System {
             old_size => unsafe {
                 let new_ptr = self.alloc_impl(new_layout, zeroed)?;
                 ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_mut_ptr(), old_size);
-                Allocator::deallocate(&self, ptr, old_layout);
+                Allocator::deallocate(self, ptr, old_layout);
                 Ok(new_ptr)
             },
         }
@@ -256,18 +265,18 @@ unsafe impl Allocator for System {
         match new_layout.size() {
             // SAFETY: conditions must be upheld by the caller
             0 => unsafe {
-                Allocator::deallocate(&self, ptr, old_layout);
-                Ok(NonNull::slice_from_raw_parts(new_layout.dangling(), 0))
+                Allocator::deallocate(self, ptr, old_layout);
+                Ok(new_layout.dangling_ptr().cast_slice(0))
             },
 
             // SAFETY: `new_size` is non-zero. Other conditions must be upheld by the caller
             new_size if old_layout.align() == new_layout.align() => unsafe {
                 // `realloc` probably checks for `new_size <= old_layout.size()` or something similar.
-                intrinsics::assume(new_size <= old_layout.size());
+                hint::assert_unchecked(new_size <= old_layout.size());
 
                 let raw_ptr = GlobalAlloc::realloc(self, ptr.as_ptr(), old_layout, new_size);
                 let ptr = NonNull::new(raw_ptr).ok_or(AllocError)?;
-                Ok(NonNull::slice_from_raw_parts(ptr, new_size))
+                Ok(ptr.cast_slice(new_size))
             },
 
             // SAFETY: because `new_size` must be smaller than or equal to `old_layout.size()`,
@@ -276,9 +285,9 @@ unsafe impl Allocator for System {
             // `new_ptr`. Thus, the call to `copy_nonoverlapping` is safe. The safety contract
             // for `dealloc` must be upheld by the caller.
             new_size => unsafe {
-                let new_ptr = Allocator::allocate(&self, new_layout)?;
+                let new_ptr = Allocator::allocate(self, new_layout)?;
                 ptr::copy_nonoverlapping(ptr.as_ptr(), new_ptr.as_mut_ptr(), new_size);
-                Allocator::deallocate(&self, ptr, old_layout);
+                Allocator::deallocate(self, ptr, old_layout);
                 Ok(new_ptr)
             },
         }
@@ -289,18 +298,46 @@ static HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
 /// Registers a custom allocation error hook, replacing any that was previously registered.
 ///
-/// The allocation error hook is invoked when an infallible memory allocation fails, before
-/// the runtime aborts. The default hook prints a message to standard error,
-/// but this behavior can be customized with the [`set_alloc_error_hook`] and
-/// [`take_alloc_error_hook`] functions.
+/// The allocation error hook is invoked when an infallible memory allocation fails — that is,
+/// as a consequence of calling [`handle_alloc_error`] — before the runtime aborts.
 ///
-/// The hook is provided with a `Layout` struct which contains information
+/// The allocation error hook is a global resource. [`take_alloc_error_hook`] may be used to
+/// retrieve a previously registered hook and wrap or discard it.
+///
+/// # What the provided `hook` function should expect
+///
+/// The hook function is provided with a [`Layout`] struct which contains information
 /// about the allocation that failed.
 ///
-/// The allocation error hook is a global resource.
+/// The hook function may choose to panic or abort; in the event that it returns normally, this
+/// will cause an immediate abort.
+///
+/// Since [`take_alloc_error_hook`] is a safe function that allows retrieving the hook, the hook
+/// function must be _sound_ to call even if no memory allocations were attempted.
+///
+/// # The default hook
+///
+/// The default hook, used if [`set_alloc_error_hook`] is never called, prints a message to
+/// standard error (and then returns, causing the runtime to abort the process).
+/// Compiler options may cause it to panic instead, and the default behavior may be changed
+/// to panicking in future versions of Rust.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(alloc_error_hook)]
+///
+/// use std::alloc::{Layout, set_alloc_error_hook};
+///
+/// fn custom_alloc_error_hook(layout: Layout) {
+///    panic!("memory allocation of {} bytes failed", layout.size());
+/// }
+///
+/// set_alloc_error_hook(custom_alloc_error_hook);
+/// ```
 #[unstable(feature = "alloc_error_hook", issue = "51245")]
 pub fn set_alloc_error_hook(hook: fn(Layout)) {
-    HOOK.store(hook as *mut (), Ordering::SeqCst);
+    HOOK.store(hook as *mut (), Ordering::Release);
 }
 
 /// Unregisters the current allocation error hook, returning it.
@@ -310,22 +347,72 @@ pub fn set_alloc_error_hook(hook: fn(Layout)) {
 /// If no custom hook is registered, the default hook will be returned.
 #[unstable(feature = "alloc_error_hook", issue = "51245")]
 pub fn take_alloc_error_hook() -> fn(Layout) {
-    let hook = HOOK.swap(ptr::null_mut(), Ordering::SeqCst);
+    let hook = HOOK.swap(ptr::null_mut(), Ordering::Acquire);
     if hook.is_null() { default_alloc_error_hook } else { unsafe { mem::transmute(hook) } }
 }
 
+#[optimize(size)]
 fn default_alloc_error_hook(layout: Layout) {
-    extern "Rust" {
-        // This symbol is emitted by rustc next to __rust_alloc_error_handler.
-        // Its value depends on the -Zoom={panic,abort} compiler option.
-        static __rust_alloc_error_handler_should_panic: u8;
+    if cfg!(panic = "immediate-abort") {
+        return;
     }
 
-    #[allow(unused_unsafe)]
-    if unsafe { __rust_alloc_error_handler_should_panic != 0 } {
-        panic!("memory allocation of {} bytes failed\n", layout.size());
+    // This is the default path taken on OOM, and the only path taken on stable with std.
+    // Crucially, it does *not* call any user-defined code, and therefore users do not have to
+    // worry about allocation failure causing reentrancy issues. That makes it different from
+    // the default `__rdl_alloc_error_handler` defined in alloc (i.e., the default alloc error
+    // handler that is  called when there is no `#[alloc_error_handler]`), which triggers a
+    // regular panic and thus can invoke a user-defined panic hook, executing arbitrary
+    // user-defined code.
+
+    static PREV_ALLOC_FAILURE: AtomicBool = AtomicBool::new(false);
+    if PREV_ALLOC_FAILURE.swap(true, Ordering::Relaxed) {
+        // Don't try to print a backtrace if a previous alloc error happened. This likely means
+        // there is not enough memory to print a backtrace, although it could also mean that two
+        // threads concurrently run out of memory.
+        rtprintpanic!(
+            "memory allocation of {} bytes failed\nskipping backtrace printing to avoid potential recursion\n",
+            layout.size()
+        );
+        return;
     } else {
         rtprintpanic!("memory allocation of {} bytes failed\n", layout.size());
+    }
+
+    let Some(mut out) = crate::sys::stdio::panic_output() else {
+        return;
+    };
+
+    // Use a lock to prevent mixed output in multithreading context.
+    // Some platforms also require it when printing a backtrace, like `SymFromAddr` on Windows.
+    // Make sure to not take this lock until after checking PREV_ALLOC_FAILURE to avoid deadlocks
+    // when there is too little memory to print a backtrace.
+    let mut lock = crate::sys::backtrace::lock();
+
+    match crate::panic::get_backtrace_style() {
+        Some(crate::panic::BacktraceStyle::Short) => {
+            drop(lock.print(&mut out, crate::backtrace_rs::PrintFmt::Short))
+        }
+        Some(crate::panic::BacktraceStyle::Full) => {
+            drop(lock.print(&mut out, crate::backtrace_rs::PrintFmt::Full))
+        }
+        Some(crate::panic::BacktraceStyle::Off) => {
+            use crate::io::Write;
+            let _ = writeln!(
+                out,
+                "note: run with `RUST_BACKTRACE=1` environment variable to display a \
+                             backtrace"
+            );
+            if cfg!(miri) {
+                let _ = writeln!(
+                    out,
+                    "note: in Miri, you may have to set `MIRIFLAGS=-Zmiri-env-forward=RUST_BACKTRACE` \
+                                for the environment variable to have an effect"
+                );
+            }
+        }
+        // If backtraces aren't supported or are forced-off, do nothing.
+        None => {}
     }
 }
 
@@ -334,11 +421,13 @@ fn default_alloc_error_hook(layout: Layout) {
 #[alloc_error_handler]
 #[unstable(feature = "alloc_internals", issue = "none")]
 pub fn rust_oom(layout: Layout) -> ! {
-    let hook = HOOK.load(Ordering::SeqCst);
-    let hook: fn(Layout) =
-        if hook.is_null() { default_alloc_error_hook } else { unsafe { mem::transmute(hook) } };
-    hook(layout);
-    crate::process::abort()
+    crate::sys::backtrace::__rust_end_short_backtrace(|| {
+        let hook = HOOK.load(Ordering::Acquire);
+        let hook: fn(Layout) =
+            if hook.is_null() { default_alloc_error_hook } else { unsafe { mem::transmute(hook) } };
+        hook(layout);
+        crate::process::abort()
+    })
 }
 
 #[cfg(not(test))]

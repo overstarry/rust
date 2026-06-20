@@ -38,6 +38,16 @@
             <?elseif $(env.CFG_CHANNEL)="dev" ?>
                 <?define UpgradeCode="231A9544-7E39-4A60-A069-0EB3CA4BAB2E" ?>
             <?endif ?>
+        <?elseif $(env.CFG_ABI)="LLVM" ?>
+            <?if $(env.CFG_CHANNEL)="stable" ?>
+                <?define UpgradeCode="BA2B2E96-F3E2-4DE9-8809-38C31382CC96" ?>
+            <?elseif $(env.CFG_CHANNEL)="beta" ?>
+                <?define UpgradeCode="44A2D96F-6CF2-4ED9-AE05-7CF0C3A7D0D9" ?>
+            <?elseif $(env.CFG_CHANNEL)="nightly" ?>
+                <?define UpgradeCode="FB0EEAE4-13FB-46BB-86E8-F9D00E6DA364" ?>
+            <?elseif $(env.CFG_CHANNEL)="dev" ?>
+                <?define UpgradeCode="73C94FB8-266F-48DC-A23B-B6E5DBDCF508" ?>
+            <?endif ?>
         <?endif ?>
         <?define PlatformProgramFilesFolder="ProgramFiles64Folder" ?>
     <?elseif $(sys.BUILDARCH)="x86" ?>
@@ -60,6 +70,16 @@
                 <?define UpgradeCode="FF193BBC-E73B-4FBD-ADE0-12F3CFC84145" ?>
             <?elseif $(env.CFG_CHANNEL)="dev" ?>
                 <?define UpgradeCode="87DFC303-6492-4E9B-911E-56EAD56C5E58" ?>
+            <?endif ?>
+        <?elseif $(env.CFG_ABI)="LLVM" ?>
+            <?if $(env.CFG_CHANNEL)="stable" ?>
+                <?define UpgradeCode="DB29CBDE-CDDF-4EC9-9C68-B6F00038EEDD" ?>
+            <?elseif $(env.CFG_CHANNEL)="beta" ?>
+                <?define UpgradeCode="AE1EF98B-1387-43BE-BE55-2310449D7E02" ?>
+            <?elseif $(env.CFG_CHANNEL)="nightly" ?>
+                <?define UpgradeCode="27B805BC-9C71-4198-A397-3082B1E708A7" ?>
+            <?elseif $(env.CFG_CHANNEL)="dev" ?>
+                <?define UpgradeCode="9DDD8D25-57C4-4410-AB35-A23A805AAD17" ?>
             <?endif ?>
         <?endif ?>
         <?define PlatformProgramFilesFolder="ProgramFilesFolder" ?>
@@ -119,7 +139,7 @@
         <SetProperty Sequence="ui" Before="CostFinalize"
             Id="WixAppFolder" Value="WixPerUserFolder">NOT ALLUSERS</SetProperty>
 
-        <!-- UI sets ALLUSERS per user selection; progagate this choice to MSIINSTALLPERUSER before executing installation actions -->
+        <!-- UI sets ALLUSERS per user selection; propagate this choice to MSIINSTALLPERUSER before executing installation actions -->
         <SetProperty Sequence="ui" Before="ExecuteAction"
             Id="MSIINSTALLPERUSER" Value="1">NOT ALLUSERS</SetProperty>
 
@@ -167,13 +187,24 @@
                     <?if $(env.CFG_MINGW)="1" ?>
                         <Directory Id="Gcc" Name="." />
                     <?endif?>
+                    <!-- tool-rust-docs-start -->
                     <Directory Id="Docs" Name="." />
+                    <!-- tool-rust-docs-end -->
                     <Directory Id="Cargo" Name="." />
                     <Directory Id="Std" Name="." />
-                    <!-- tool-rls-start -->
-                    <Directory Id="Rls" Name="." />
+                    <?if $(env.CFG_RUSTFMT)="1" ?>
+                        <Directory Id="RustFmt" Name="." />
+                    <?endif?>
+                    <?if $(env.CFG_RA)="1" ?>
+                        <Directory Id="RustAnalyzer" Name="." />
+                    <?endif?>
+                    <?if $(env.CFG_MIRI)="1" ?>
+                        <Directory Id="Miri" Name="." />
+                    <?endif?>
                     <Directory Id="Analysis" Name="." />
-                    <!-- tool-rls-end -->
+                    <?if $(env.CFG_CLIPPY)="1" ?>
+                        <Directory Id="Clippy" Name="." />
+                    <?endif?>
                 </Directory>
             </Directory>
 
@@ -213,6 +244,7 @@
                         <RegistryValue Root="HKMU" Key="$(var.BaseRegKey)" Name="RustShell" Type="integer" Value="1" KeyPath="yes" />
                         <RemoveFolder Id="ApplicationProgramsFolder1" On="uninstall" />
                     </Component>
+                    <!-- tool-rust-docs-start -->
                     <Component Id="DocIndexShortcut" Guid="*">
                         <Shortcut Id="RustDocs"
                                   Name="$(var.ProductName) Documentation"
@@ -221,6 +253,7 @@
                         <RegistryValue Root="HKMU" Key="$(var.BaseRegKey)" Name="RustDocs" Type="integer" Value="1" KeyPath="yes" />
                         <RemoveFolder Id="ApplicationProgramsFolder2" On="uninstall" />
                     </Component>
+                    <!-- tool-rust-docs-end -->
                 </Directory>
             </Directory>
 
@@ -260,6 +293,7 @@
                      <ComponentGroupRef Id="GccGroup" />
             </Feature>
         <?endif?>
+        <!-- tool-rust-docs-start -->
         <Feature Id="Docs"
                  Title="HTML documentation"
                  Display="5"
@@ -268,6 +302,7 @@
                  <ComponentGroupRef Id="DocsGroup" />
                  <ComponentRef Id="DocIndexShortcut" />
         </Feature>
+        <!-- tool-rust-docs-end -->
         <Feature Id="Path"
                  Title="Add to PATH"
                  Description="Add Rust to PATH environment variable"
@@ -277,17 +312,49 @@
                  <ComponentRef Id="PathEnvPerMachine" />
                  <ComponentRef Id="PathEnvPerUser" />
         </Feature>
-        <!-- tool-rls-start -->
-        <Feature Id="RLS"
-                 Title="RLS, the Rust Language Server"
-                 Display="7"
-                 Level="2"
+        <?if $(env.CFG_RUSTFMT)="1" ?>
+            <Feature Id="RustFmt"
+                     Title="Formatter for rust"
+                     Display="7"
+                     Level="1"
+                     AllowAdvertise="no">
+                     <ComponentGroupRef Id="RustFmtGroup" />
+            </Feature>
+        <?endif?>
+        <?if $(env.CFG_CLIPPY)="1" ?>
+            <Feature Id="Clippy"
+                     Title="Formatter and checker for rust"
+                     Display="8"
+                     Level="1"
+                     AllowAdvertise="no">
+                     <ComponentGroupRef Id="ClippyGroup" />
+            </Feature>
+        <?endif?>
+        <?if $(env.CFG_MIRI)="1" ?>
+            <Feature Id="Miri"
+                     Title="Soundness checker for rust"
+                     Display="9"
+                     Level="1"
+                     AllowAdvertise="no">
+                     <ComponentGroupRef Id="MiriGroup" />
+            </Feature>
+        <?endif?>
+        <?if $(env.CFG_RA)="1" ?>
+            <Feature Id="RustAnalyzer"
+                     Title="Analyzer for rust"
+                     Display="10"
+                     Level="1"
+                     AllowAdvertise="no">
+                     <ComponentGroupRef Id="RustAnalyzerGroup" />
+            </Feature>
+        <?endif?>
+        <Feature Id="Analysis"
+                 Title="Analysis for rust"
+                 Display="11"
+                 Level="1"
                  AllowAdvertise="no">
-                 <ComponentGroupRef Id="RlsGroup" />
                  <ComponentGroupRef Id="AnalysisGroup" />
         </Feature>
-        <!-- tool-rls-end -->
-
         <UIRef Id="RustUI" />
     </Product>
 </Wix>

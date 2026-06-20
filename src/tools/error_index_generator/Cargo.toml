@@ -2,12 +2,11 @@
 name = "error_index_generator"
 version = "0.0.0"
 edition = "2021"
+workspace = "../rustbook"
 
 [dependencies]
-rustdoc = { path = "../../librustdoc" }
-
-[build-dependencies]
-walkdir = "2"
+mdbook-driver = { version = "0.5.1", features = ["search"] }
+mdbook-summary = "0.5.1"
 
 [[bin]]
 name = "error_index_generator"

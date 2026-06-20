@@ -1,9 +1,9 @@
 //! Module converting command-line arguments into test configuration.
 
 use std::env;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
-use super::helpers::isatty;
 use super::options::{ColorConfig, Options, OutputFormat, RunIgnored};
 use super::time::TestTimeOptions;
 
@@ -26,13 +26,17 @@ pub struct TestOpts {
     pub test_threads: Option<usize>,
     pub skip: Vec<String>,
     pub time_options: Option<TestTimeOptions>,
+    /// Stop at first failing test.
+    /// May run a few more tests due to threading, but will
+    /// abort as soon as possible.
+    pub fail_fast: bool,
     pub options: Options,
 }
 
 impl TestOpts {
     pub fn use_color(&self) -> bool {
         match self.color {
-            ColorConfig::AutoColor => !self.nocapture && isatty::stdout_isatty(),
+            ColorConfig::AutoColor => !self.nocapture && io::stdout().is_terminal(),
             ColorConfig::AlwaysColor => true,
             ColorConfig::NeverColor => false,
         }
@@ -40,7 +44,7 @@ impl TestOpts {
 }
 
 /// Result of parsing the options.
-pub type OptRes = Result<TestOpts, String>;
+pub(crate) type OptRes = Result<TestOpts, String>;
 /// Result of parsing the option part.
 type OptPartRes<T> = Result<T, String>;
 
@@ -53,11 +57,12 @@ fn optgroups() -> getopts::Options {
         .optflag("", "test", "Run tests and not benchmarks")
         .optflag("", "bench", "Run benchmarks instead of tests")
         .optflag("", "list", "List all tests and benchmarks")
+        .optflag("", "fail-fast", "Don't start new tests after the first failure")
         .optflag("h", "help", "Display this message")
-        .optopt("", "logfile", "Write logs to the specified file", "PATH")
+        .optopt("", "logfile", "Write logs to the specified file (deprecated)", "PATH")
         .optflag(
             "",
-            "nocapture",
+            "no-capture",
             "don't capture stdout/stderr of each \
              task, allow printing directly",
         )
@@ -158,18 +163,17 @@ tests whose names contain the filter are run. Multiple filter strings may
 be passed, which will run all tests matching any of the filters.
 
 By default, all tests are run in parallel. This can be altered with the
---test-threads flag or the RUST_TEST_THREADS environment variable when running
-tests (set it to 1).
+--test-threads flag when running tests (set it to 1).
 
-By default, the tests are run in alphabetical order. Use --shuffle or set
-RUST_TEST_SHUFFLE to run the tests in random order. Pass the generated
-"shuffle seed" to --shuffle-seed (or set RUST_TEST_SHUFFLE_SEED) to run the
-tests in the same order again. Note that --shuffle and --shuffle-seed do not
-affect whether the tests are run in parallel.
+By default, the tests are run in alphabetical order. Use --shuffle to run
+the tests in random order. Pass the generated "shuffle seed" to
+--shuffle-seed to run the tests in the same order again. Note that
+--shuffle and --shuffle-seed do not affect whether the tests are run in
+parallel.
 
 All tests have their standard output and standard error captured by default.
-This can be overridden with the --nocapture flag or setting RUST_TEST_NOCAPTURE
-environment variable to a value other than "0". Logging is not captured by default.
+This can be overridden with the --no-capture flag to a value other than "0".
+Logging is not captured by default.
 
 Test Attributes:
 
@@ -195,7 +199,11 @@ Test Attributes:
 /// otherwise creates a `TestOpts` object and returns it.
 pub fn parse_opts(args: &[String]) -> Option<OptRes> {
     // Parse matches.
-    let opts = optgroups();
+    let mut opts = optgroups();
+    // Flags hidden from `usage`
+    opts.optflag("", "nocapture", "Deprecated, use `--no-capture`");
+
+    let binary = args.first().map(|c| &**c).unwrap_or("...");
     let args = args.get(1..).unwrap_or(args);
     let matches = match opts.parse(args) {
         Ok(m) => m,
@@ -205,7 +213,7 @@ pub fn parse_opts(args: &[String]) -> Option<OptRes> {
     // Check if help was requested.
     if matches.opt_present("h") {
         // Show help and do nothing more.
-        usage(&args[0], &opts);
+        usage(binary, &optgroups());
         return None;
     }
 
@@ -253,6 +261,7 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
     // Unstable flags
     let force_run_in_process = unstable_optflag!(matches, allow_unstable, "force-run-in-process");
     let exclude_should_panic = unstable_optflag!(matches, allow_unstable, "exclude-should-panic");
+    let fail_fast = unstable_optflag!(matches, allow_unstable, "fail-fast");
     let time_options = get_time_options(&matches, allow_unstable)?;
     let shuffle = get_shuffle(&matches, allow_unstable)?;
     let shuffle_seed = get_shuffle_seed(&matches, allow_unstable)?;
@@ -276,6 +285,10 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
 
     let options = Options::new().display_output(matches.opt_present("show-output"));
 
+    if logfile.is_some() {
+        let _ = write!(io::stderr(), "warning: `--logfile` is deprecated");
+    }
+
     let test_opts = TestOpts {
         list,
         filters,
@@ -295,19 +308,20 @@ fn parse_opts_impl(matches: getopts::Matches) -> OptRes {
         skip,
         time_options,
         options,
+        fail_fast,
     };
 
     Ok(test_opts)
 }
 
-// FIXME: Copied from librustc_ast until linkage errors are resolved. Issue #47566
 fn is_nightly() -> bool {
-    // Whether this is a feature-staged build, i.e., on the beta or stable channel
-    let disable_unstable_features = option_env!("CFG_DISABLE_UNSTABLE_FEATURES").is_some();
-    // Whether we should enable unstable features for bootstrapping
+    // Whether the current rustc version should allow unstable features
+    let enable_unstable_features = cfg!(enable_unstable_features);
+
+    // The runtime override for unstable features
     let bootstrap = env::var("RUSTC_BOOTSTRAP").is_ok();
 
-    bootstrap || !disable_unstable_features
+    bootstrap || enable_unstable_features
 }
 
 // Gets the CLI options associated with `report-time` feature.
@@ -348,8 +362,7 @@ fn get_shuffle_seed(matches: &getopts::Matches, allow_unstable: bool) -> OptPart
             Err(e) => {
                 return Err(format!(
                     "argument for --shuffle-seed must be a number \
-                     (error: {})",
-                    e
+                     (error: {e})"
                 ));
             }
         },
@@ -377,8 +390,7 @@ fn get_test_threads(matches: &getopts::Matches) -> OptPartRes<Option<usize>> {
             Err(e) => {
                 return Err(format!(
                     "argument for --test-threads must be a number > 0 \
-                     (error: {})",
-                    e
+                     (error: {e})"
                 ));
             }
         },
@@ -399,21 +411,20 @@ fn get_format(
         Some("terse") => OutputFormat::Terse,
         Some("json") => {
             if !allow_unstable {
-                return Err("The \"json\" format is only accepted on the nightly compiler".into());
+                return Err("The \"json\" format is only accepted on the nightly compiler with -Z unstable-options".into());
             }
             OutputFormat::Json
         }
         Some("junit") => {
             if !allow_unstable {
-                return Err("The \"junit\" format is only accepted on the nightly compiler".into());
+                return Err("The \"junit\" format is only accepted on the nightly compiler with -Z unstable-options".into());
             }
             OutputFormat::Junit
         }
         Some(v) => {
             return Err(format!(
                 "argument for --format must be pretty, terse, json or junit (was \
-                 {})",
-                v
+                 {v})"
             ));
         }
     };
@@ -430,8 +441,7 @@ fn get_color_config(matches: &getopts::Matches) -> OptPartRes<ColorConfig> {
         Some(v) => {
             return Err(format!(
                 "argument for --color must be auto, always, or never (was \
-                 {})",
-                v
+                 {v})"
             ));
         }
     };
@@ -440,7 +450,7 @@ fn get_color_config(matches: &getopts::Matches) -> OptPartRes<ColorConfig> {
 }
 
 fn get_nocapture(matches: &getopts::Matches) -> OptPartRes<bool> {
-    let mut nocapture = matches.opt_present("nocapture");
+    let mut nocapture = matches.opt_present("nocapture") || matches.opt_present("no-capture");
     if !nocapture {
         nocapture = match env::var("RUST_TEST_NOCAPTURE") {
             Ok(val) => &val != "0",

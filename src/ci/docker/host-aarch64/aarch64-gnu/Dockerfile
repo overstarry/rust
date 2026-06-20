@@ -1,6 +1,7 @@
-FROM ubuntu:20.04
+FROM ubuntu:25.10
 
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
   g++ \
   make \
   ninja-build \
@@ -14,14 +15,15 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
   gdb \
   libssl-dev \
   pkg-config \
-  xz-utils
+  xz-utils \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/sccache.sh /scripts/
 RUN sh /scripts/sccache.sh
 
-ENV RUST_CONFIGURE_ARGS \
- --build=aarch64-unknown-linux-gnu \
+ENV RUST_CONFIGURE_ARGS="--build=aarch64-unknown-linux-gnu \
  --enable-sanitizers \
  --enable-profiler \
- --enable-compiler-docs
-ENV SCRIPT python3 ../x.py --stage 2 test
+ --enable-compiler-docs"
+ENV SCRIPT="python3 ../x.py --stage 2 test && \
+  python3 ../x.py --stage 2 test src/tools/cargo"

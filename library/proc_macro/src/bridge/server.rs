@@ -1,355 +1,314 @@
 //! Server-side traits.
 
-use super::*;
+use std::cell::Cell;
+use std::hash::Hash;
+use std::ops::{Bound, Range};
+use std::sync::atomic::AtomicU32;
+use std::sync::mpsc;
+use std::{panic, thread};
 
-// FIXME(eddyb) generate the definition of `HandleStore` in `server.rs`.
-use super::client::HandleStore;
+use crate::bridge::{
+    ApiTags, BridgeConfig, Buffer, Decode, Diagnostic, Encode, ExpnGlobals, Literal, Mark, Marked,
+    PanicMessage, TokenTree, client, handle,
+};
 
-/// Declare an associated item of one of the traits below, optionally
-/// adjusting it (i.e., adding bounds to types and default bodies to methods).
-macro_rules! associated_item {
-    (type FreeFunctions) =>
-        (type FreeFunctions: 'static;);
-    (type TokenStream) =>
-        (type TokenStream: 'static + Clone;);
-    (type TokenStreamBuilder) =>
-        (type TokenStreamBuilder: 'static;);
-    (type TokenStreamIter) =>
-        (type TokenStreamIter: 'static + Clone;);
-    (type Group) =>
-        (type Group: 'static + Clone;);
-    (type Punct) =>
-        (type Punct: 'static + Copy + Eq + Hash;);
-    (type Ident) =>
-        (type Ident: 'static + Copy + Eq + Hash;);
-    (type Literal) =>
-        (type Literal: 'static + Clone;);
-    (type SourceFile) =>
-        (type SourceFile: 'static + Clone;);
-    (type MultiSpan) =>
-        (type MultiSpan: 'static;);
-    (type Diagnostic) =>
-        (type Diagnostic: 'static;);
-    (type Span) =>
-        (type Span: 'static + Copy + Eq + Hash;);
-    (fn drop(&mut self, $arg:ident: $arg_ty:ty)) =>
-        (fn drop(&mut self, $arg: $arg_ty) { mem::drop($arg) });
-    (fn clone(&mut self, $arg:ident: $arg_ty:ty) -> $ret_ty:ty) =>
-        (fn clone(&mut self, $arg: $arg_ty) -> $ret_ty { $arg.clone() });
-    ($($item:tt)*) => ($($item)*;)
+pub(super) struct HandleStore<S: Server> {
+    token_stream: handle::OwnedStore<MarkedTokenStream<S>>,
+    span: handle::InternedStore<MarkedSpan<S>>,
 }
 
-macro_rules! declare_server_traits {
-    ($($name:ident {
-        $(fn $method:ident($($arg:ident: $arg_ty:ty),* $(,)?) $(-> $ret_ty:ty)?;)*
-    }),* $(,)?) => {
-        pub trait Types {
-            $(associated_item!(type $name);)*
+impl<S: Server> HandleStore<S> {
+    fn new() -> Self {
+        static TOKEN_STREAM: AtomicU32 = AtomicU32::new(1);
+        static SPAN: AtomicU32 = AtomicU32::new(1);
+
+        HandleStore {
+            token_stream: handle::OwnedStore::new(&TOKEN_STREAM),
+            span: handle::InternedStore::new(&SPAN),
         }
-
-        $(pub trait $name: Types {
-            $(associated_item!(fn $method(&mut self, $($arg: $arg_ty),*) $(-> $ret_ty)?);)*
-        })*
-
-        pub trait Server: Types $(+ $name)* {}
-        impl<S: Types $(+ $name)*> Server for S {}
     }
 }
-with_api!(Self, self_, declare_server_traits);
 
-pub(super) struct MarkedTypes<S: Types>(S);
+pub(super) type MarkedTokenStream<S> = Marked<<S as Server>::TokenStream, client::TokenStream>;
+pub(super) type MarkedSpan<S> = Marked<<S as Server>::Span, client::Span>;
+pub(super) type MarkedSymbol<S> = Marked<<S as Server>::Symbol, client::Symbol>;
 
-macro_rules! define_mark_types_impls {
-    ($($name:ident {
-        $(fn $method:ident($($arg:ident: $arg_ty:ty),* $(,)?) $(-> $ret_ty:ty)?;)*
-    }),* $(,)?) => {
-        impl<S: Types> Types for MarkedTypes<S> {
-            $(type $name = Marked<S::$name, client::$name>;)*
-        }
-
-        $(impl<S: $name> $name for MarkedTypes<S> {
-            $(fn $method(&mut self, $($arg: $arg_ty),*) $(-> $ret_ty)? {
-                <_>::mark($name::$method(&mut self.0, $($arg.unmark()),*))
-            })*
-        })*
+impl<S: Server> Encode<HandleStore<S>> for MarkedTokenStream<S> {
+    fn encode(self, w: &mut Buffer, s: &mut HandleStore<S>) {
+        s.token_stream.alloc(self).encode(w, s);
     }
 }
-with_api!(Self, self_, define_mark_types_impls);
 
-struct Dispatcher<S: Types> {
+impl<S: Server> Decode<'_, '_, HandleStore<S>> for MarkedTokenStream<S> {
+    fn decode(r: &mut &[u8], s: &mut HandleStore<S>) -> Self {
+        s.token_stream.take(handle::Handle::decode(r, &mut ()))
+    }
+}
+
+impl<'s, S: Server> Decode<'_, 's, HandleStore<S>> for &'s MarkedTokenStream<S> {
+    fn decode(r: &mut &[u8], s: &'s mut HandleStore<S>) -> Self {
+        &s.token_stream[handle::Handle::decode(r, &mut ())]
+    }
+}
+
+impl<S: Server> Encode<HandleStore<S>> for MarkedSpan<S> {
+    fn encode(self, w: &mut Buffer, s: &mut HandleStore<S>) {
+        s.span.alloc(self).encode(w, s);
+    }
+}
+
+impl<S: Server> Decode<'_, '_, HandleStore<S>> for MarkedSpan<S> {
+    fn decode(r: &mut &[u8], s: &mut HandleStore<S>) -> Self {
+        s.span.copy(handle::Handle::decode(r, &mut ()))
+    }
+}
+
+macro_rules! define_server {
+    (
+        $(fn $method:ident($($arg:ident: $arg_ty:ty),* $(,)?) $(-> $ret_ty:ty)?;)*
+    ) => {
+        pub trait Server {
+            type TokenStream: 'static + Clone + Default;
+            type Span: 'static + Copy + Eq + Hash;
+            type Symbol: 'static;
+
+            fn globals(&mut self) -> ExpnGlobals<Self::Span>;
+
+            /// Intern a symbol received from RPC
+            fn intern_symbol(ident: &str) -> Self::Symbol;
+
+            /// Recover the string value of a symbol, and invoke a callback with it.
+            fn with_symbol_string(symbol: &Self::Symbol, f: impl FnOnce(&str));
+
+            $(fn $method(&mut self, $($arg: $arg_ty),*) $(-> $ret_ty)?;)*
+        }
+    }
+}
+with_api!(define_server, Self::TokenStream, Self::Span, Self::Symbol);
+
+// FIXME(eddyb) `pub` only for `ExecutionStrategy` below.
+pub struct Dispatcher<S: Server> {
     handle_store: HandleStore<S>,
     server: S,
 }
 
-macro_rules! define_dispatcher_impl {
-    ($($name:ident {
+macro_rules! define_dispatcher {
+    (
         $(fn $method:ident($($arg:ident: $arg_ty:ty),* $(,)?) $(-> $ret_ty:ty)?;)*
-    }),* $(,)?) => {
-        // FIXME(eddyb) `pub` only for `ExecutionStrategy` below.
-        pub trait DispatcherTrait {
-            // HACK(eddyb) these are here to allow `Self::$name` to work below.
-            $(type $name;)*
-            fn dispatch(&mut self, b: Buffer<u8>) -> Buffer<u8>;
-        }
-
-        impl<S: Server> DispatcherTrait for Dispatcher<MarkedTypes<S>> {
-            $(type $name = <MarkedTypes<S> as Types>::$name;)*
-            fn dispatch(&mut self, mut b: Buffer<u8>) -> Buffer<u8> {
+    ) => {
+        impl<S: Server> Dispatcher<S> {
+            fn dispatch(&mut self, mut buf: Buffer) -> Buffer {
                 let Dispatcher { handle_store, server } = self;
 
-                let mut reader = &b[..];
-                match api_tags::Method::decode(&mut reader, &mut ()) {
-                    $(api_tags::Method::$name(m) => match m {
-                        $(api_tags::$name::$method => {
-                            let mut call_method = || {
-                                reverse_decode!(reader, handle_store; $($arg: $arg_ty),*);
-                                $name::$method(server, $($arg),*)
-                            };
-                            // HACK(eddyb) don't use `panic::catch_unwind` in a panic.
-                            // If client and server happen to use the same `libstd`,
-                            // `catch_unwind` asserts that the panic counter was 0,
-                            // even when the closure passed to it didn't panic.
-                            let r = if thread::panicking() {
-                                Ok(call_method())
-                            } else {
-                                panic::catch_unwind(panic::AssertUnwindSafe(call_method))
-                                    .map_err(PanicMessage::from)
-                            };
+                let mut reader = &buf[..];
+                match ApiTags::decode(&mut reader, &mut ()) {
+                    $(ApiTags::$method => {
+                        let mut call_method = || {
+                            $(let $arg = <$arg_ty>::decode(&mut reader, handle_store).unmark();)*
+                            let r = server.$method($($arg),*);
+                            $(let r: $ret_ty = Mark::mark(r);)?
+                            r
+                        };
+                        // HACK(eddyb) don't use `panic::catch_unwind` in a panic.
+                        // If client and server happen to use the same `std`,
+                        // `catch_unwind` asserts that the panic counter was 0,
+                        // even when the closure passed to it didn't panic.
+                        let r = if thread::panicking() {
+                            Ok(call_method())
+                        } else {
+                            panic::catch_unwind(panic::AssertUnwindSafe(call_method))
+                                .map_err(PanicMessage::from)
+                        };
 
-                            b.clear();
-                            r.encode(&mut b, handle_store);
-                        })*
-                    }),*
+                        buf.clear();
+                        r.encode(&mut buf, handle_store);
+                    })*
                 }
-                b
+                buf
             }
         }
     }
 }
-with_api!(Self, self_, define_dispatcher_impl);
+with_api!(define_dispatcher, MarkedTokenStream<S>, MarkedSpan<S>, MarkedSymbol<S>);
 
+// This trait is currently only implemented and used once, inside of this crate.
+// We keep it public to allow implementing more complex execution strategies in
+// the future, such as wasm proc-macros.
 pub trait ExecutionStrategy {
-    fn run_bridge_and_client<D: Copy + Send + 'static>(
+    fn run_bridge_and_client(
         &self,
-        dispatcher: &mut impl DispatcherTrait,
-        input: Buffer<u8>,
-        run_client: extern "C" fn(Bridge<'_>, D) -> Buffer<u8>,
-        client_data: D,
+        dispatcher: &mut Dispatcher<impl Server>,
+        input: Buffer,
+        run_client: extern "C" fn(BridgeConfig<'_>) -> Buffer,
         force_show_panics: bool,
-    ) -> Buffer<u8>;
+    ) -> Buffer;
 }
 
-pub struct SameThread;
+thread_local! {
+    /// While running a proc-macro with the same-thread executor, this flag will
+    /// be set, forcing nested proc-macro invocations (e.g. due to
+    /// `TokenStream::expand_expr`) to be run using a cross-thread executor.
+    ///
+    /// This is required as the thread-local state in the proc_macro client does
+    /// not handle being re-entered, and will invalidate all `Symbol`s when
+    /// entering a nested macro.
+    static ALREADY_RUNNING_SAME_THREAD: Cell<bool> = const { Cell::new(false) };
+}
 
-impl ExecutionStrategy for SameThread {
-    fn run_bridge_and_client<D: Copy + Send + 'static>(
-        &self,
-        dispatcher: &mut impl DispatcherTrait,
-        input: Buffer<u8>,
-        run_client: extern "C" fn(Bridge<'_>, D) -> Buffer<u8>,
-        client_data: D,
-        force_show_panics: bool,
-    ) -> Buffer<u8> {
-        let mut dispatch = |b| dispatcher.dispatch(b);
+/// Keep `ALREADY_RUNNING_SAME_THREAD` (see also its documentation)
+/// set to `true`, preventing same-thread reentrance.
+struct RunningSameThreadGuard(());
 
-        run_client(
-            Bridge {
-                cached_buffer: input,
-                dispatch: (&mut dispatch).into(),
-                force_show_panics,
-                _marker: marker::PhantomData,
-            },
-            client_data,
-        )
+impl RunningSameThreadGuard {
+    fn new() -> Self {
+        let already_running = ALREADY_RUNNING_SAME_THREAD.replace(true);
+        assert!(
+            !already_running,
+            "same-thread nesting (\"reentrance\") of proc macro executions is not supported"
+        );
+        RunningSameThreadGuard(())
     }
 }
 
-// NOTE(eddyb) Two implementations are provided, the second one is a bit
-// faster but neither is anywhere near as fast as same-thread execution.
-
-pub struct CrossThread1;
-
-impl ExecutionStrategy for CrossThread1 {
-    fn run_bridge_and_client<D: Copy + Send + 'static>(
-        &self,
-        dispatcher: &mut impl DispatcherTrait,
-        input: Buffer<u8>,
-        run_client: extern "C" fn(Bridge<'_>, D) -> Buffer<u8>,
-        client_data: D,
-        force_show_panics: bool,
-    ) -> Buffer<u8> {
-        use std::sync::mpsc::channel;
-
-        let (req_tx, req_rx) = channel();
-        let (res_tx, res_rx) = channel();
-
-        let join_handle = thread::spawn(move || {
-            let mut dispatch = |b| {
-                req_tx.send(b).unwrap();
-                res_rx.recv().unwrap()
-            };
-
-            run_client(
-                Bridge {
-                    cached_buffer: input,
-                    dispatch: (&mut dispatch).into(),
-                    force_show_panics,
-                    _marker: marker::PhantomData,
-                },
-                client_data,
-            )
-        });
-
-        for b in req_rx {
-            res_tx.send(dispatcher.dispatch(b)).unwrap();
-        }
-
-        join_handle.join().unwrap()
+impl Drop for RunningSameThreadGuard {
+    fn drop(&mut self) {
+        ALREADY_RUNNING_SAME_THREAD.set(false);
     }
 }
 
-pub struct CrossThread2;
+pub struct MaybeCrossThread {
+    pub cross_thread: bool,
+}
 
-impl ExecutionStrategy for CrossThread2 {
-    fn run_bridge_and_client<D: Copy + Send + 'static>(
+pub const SAME_THREAD: MaybeCrossThread = MaybeCrossThread { cross_thread: false };
+pub const CROSS_THREAD: MaybeCrossThread = MaybeCrossThread { cross_thread: true };
+
+impl ExecutionStrategy for MaybeCrossThread {
+    fn run_bridge_and_client(
         &self,
-        dispatcher: &mut impl DispatcherTrait,
-        input: Buffer<u8>,
-        run_client: extern "C" fn(Bridge<'_>, D) -> Buffer<u8>,
-        client_data: D,
+        dispatcher: &mut Dispatcher<impl Server>,
+        input: Buffer,
+        run_client: extern "C" fn(BridgeConfig<'_>) -> Buffer,
         force_show_panics: bool,
-    ) -> Buffer<u8> {
-        use std::sync::{Arc, Mutex};
+    ) -> Buffer {
+        if self.cross_thread || ALREADY_RUNNING_SAME_THREAD.get() {
+            let (mut server, mut client) = MessagePipe::new();
 
-        enum State<T> {
-            Req(T),
-            Res(T),
-        }
+            let join_handle = thread::spawn(move || {
+                let mut dispatch = |b: Buffer| -> Buffer {
+                    client.send(b);
+                    client.recv().expect("server died while client waiting for reply")
+                };
 
-        let mut state = Arc::new(Mutex::new(State::Res(Buffer::new())));
-
-        let server_thread = thread::current();
-        let state2 = state.clone();
-        let join_handle = thread::spawn(move || {
-            let mut dispatch = |b| {
-                *state2.lock().unwrap() = State::Req(b);
-                server_thread.unpark();
-                loop {
-                    thread::park();
-                    if let State::Res(b) = &mut *state2.lock().unwrap() {
-                        break b.take();
-                    }
-                }
-            };
-
-            let r = run_client(
-                Bridge {
-                    cached_buffer: input,
+                run_client(BridgeConfig {
+                    input,
                     dispatch: (&mut dispatch).into(),
                     force_show_panics,
-                    _marker: marker::PhantomData,
-                },
-                client_data,
-            );
+                })
+            });
 
-            // Wake up the server so it can exit the dispatch loop.
-            drop(state2);
-            server_thread.unpark();
+            while let Some(b) = server.recv() {
+                server.send(dispatcher.dispatch(b));
+            }
 
-            r
-        });
+            join_handle.join().unwrap()
+        } else {
+            let _guard = RunningSameThreadGuard::new();
 
-        // Check whether `state2` was dropped, to know when to stop.
-        while Arc::get_mut(&mut state).is_none() {
-            thread::park();
-            let mut b = match &mut *state.lock().unwrap() {
-                State::Req(b) => b.take(),
-                _ => continue,
-            };
-            b = dispatcher.dispatch(b.take());
-            *state.lock().unwrap() = State::Res(b);
-            join_handle.thread().unpark();
+            let mut dispatch = |buf| dispatcher.dispatch(buf);
+
+            run_client(BridgeConfig { input, dispatch: (&mut dispatch).into(), force_show_panics })
         }
+    }
+}
 
-        join_handle.join().unwrap()
+/// A message pipe used for communicating between server and client threads.
+struct MessagePipe<T> {
+    tx: mpsc::SyncSender<T>,
+    rx: mpsc::Receiver<T>,
+}
+
+impl<T> MessagePipe<T> {
+    /// Creates a new pair of endpoints for the message pipe.
+    fn new() -> (Self, Self) {
+        let (tx1, rx1) = mpsc::sync_channel(1);
+        let (tx2, rx2) = mpsc::sync_channel(1);
+        (MessagePipe { tx: tx1, rx: rx2 }, MessagePipe { tx: tx2, rx: rx1 })
+    }
+
+    /// Send a message to the other endpoint of this pipe.
+    fn send(&mut self, value: T) {
+        self.tx.send(value).unwrap();
+    }
+
+    /// Receive a message from the other endpoint of this pipe.
+    ///
+    /// Returns `None` if the other end of the pipe has been destroyed, and no
+    /// message was received.
+    fn recv(&mut self) -> Option<T> {
+        self.rx.recv().ok()
     }
 }
 
 fn run_server<
     S: Server,
-    I: Encode<HandleStore<MarkedTypes<S>>>,
-    O: for<'a, 's> DecodeMut<'a, 's, HandleStore<MarkedTypes<S>>>,
-    D: Copy + Send + 'static,
+    I: Encode<HandleStore<S>>,
+    O: for<'a, 's> Decode<'a, 's, HandleStore<S>>,
 >(
     strategy: &impl ExecutionStrategy,
-    handle_counters: &'static client::HandleCounters,
     server: S,
     input: I,
-    run_client: extern "C" fn(Bridge<'_>, D) -> Buffer<u8>,
-    client_data: D,
+    run_client: extern "C" fn(BridgeConfig<'_>) -> Buffer,
     force_show_panics: bool,
 ) -> Result<O, PanicMessage> {
-    let mut dispatcher =
-        Dispatcher { handle_store: HandleStore::new(handle_counters), server: MarkedTypes(server) };
+    let mut dispatcher = Dispatcher { handle_store: HandleStore::new(), server };
 
-    let mut b = Buffer::new();
-    input.encode(&mut b, &mut dispatcher.handle_store);
+    let globals = dispatcher.server.globals();
 
-    b = strategy.run_bridge_and_client(
-        &mut dispatcher,
-        b,
-        run_client,
-        client_data,
-        force_show_panics,
-    );
+    let mut buf = Buffer::new();
+    (<ExpnGlobals<MarkedSpan<S>> as Mark>::mark(globals), input)
+        .encode(&mut buf, &mut dispatcher.handle_store);
 
-    Result::decode(&mut &b[..], &mut dispatcher.handle_store)
+    buf = strategy.run_bridge_and_client(&mut dispatcher, buf, run_client, force_show_panics);
+
+    Result::decode(&mut &buf[..], &mut dispatcher.handle_store)
 }
 
-impl client::Client<fn(crate::TokenStream) -> crate::TokenStream> {
-    pub fn run<S: Server>(
+impl client::Client {
+    pub fn run1<S>(
         &self,
         strategy: &impl ExecutionStrategy,
         server: S,
         input: S::TokenStream,
         force_show_panics: bool,
-    ) -> Result<S::TokenStream, PanicMessage> {
-        let client::Client { get_handle_counters, run, f } = *self;
-        run_server(
-            strategy,
-            get_handle_counters(),
-            server,
-            <MarkedTypes<S> as Types>::TokenStream::mark(input),
-            run,
-            f,
-            force_show_panics,
-        )
-        .map(<MarkedTypes<S> as Types>::TokenStream::unmark)
+    ) -> Result<S::TokenStream, PanicMessage>
+    where
+        S: Server,
+    {
+        let client::Client { run } = *self;
+        run_server(strategy, server, <MarkedTokenStream<S>>::mark(input), run, force_show_panics)
+            .map(|s| <Option<MarkedTokenStream<S>>>::unmark(s).unwrap_or_default())
     }
-}
 
-impl client::Client<fn(crate::TokenStream, crate::TokenStream) -> crate::TokenStream> {
-    pub fn run<S: Server>(
+    pub fn run2<S>(
         &self,
         strategy: &impl ExecutionStrategy,
         server: S,
         input: S::TokenStream,
         input2: S::TokenStream,
         force_show_panics: bool,
-    ) -> Result<S::TokenStream, PanicMessage> {
-        let client::Client { get_handle_counters, run, f } = *self;
+    ) -> Result<S::TokenStream, PanicMessage>
+    where
+        S: Server,
+    {
+        let client::Client { run } = *self;
         run_server(
             strategy,
-            get_handle_counters(),
             server,
-            (
-                <MarkedTypes<S> as Types>::TokenStream::mark(input),
-                <MarkedTypes<S> as Types>::TokenStream::mark(input2),
-            ),
+            (<MarkedTokenStream<S>>::mark(input), <MarkedTokenStream<S>>::mark(input2)),
             run,
-            f,
             force_show_panics,
         )
-        .map(<MarkedTypes<S> as Types>::TokenStream::unmark)
+        .map(|s| <Option<MarkedTokenStream<S>>>::unmark(s).unwrap_or_default())
     }
 }

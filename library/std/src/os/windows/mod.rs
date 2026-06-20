@@ -24,10 +24,13 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 #![doc(cfg(windows))]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod ffi;
 pub mod fs;
 pub mod io;
+#[unstable(feature = "windows_unix_domain_sockets", issue = "150487")]
+pub mod net;
 pub mod process;
 pub mod raw;
 pub mod thread;

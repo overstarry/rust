@@ -1,6 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 set -e
 
-rm -rf build_sysroot/{sysroot_src/,target/,compiler-builtins/,rustc_version}
-rm -rf target/ build/ perf.data{,.old} y.bin
-rm -rf rand/ regex/ simple-raytracer/ portable-simd/
+rm -rf target/ build_system/target download/ build/ dist/

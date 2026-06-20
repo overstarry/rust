@@ -1,5 +1,4 @@
-#![allow(clippy::assertions_on_constants, clippy::eq_op)]
-#![feature(inline_const)]
+#![allow(clippy::assertions_on_constants, clippy::eq_op, clippy::let_unit_value)]
 #![warn(clippy::unimplemented, clippy::unreachable, clippy::todo, clippy::panic)]
 
 extern crate core;
@@ -21,41 +20,86 @@ fn inline_const() {
 fn panic() {
     let a = 2;
     panic!();
+    //~^ panic
+
     panic!("message");
+    //~^ panic
+
     panic!("{} {}", "panic with", "multiple arguments");
+    //~^ panic
+
+    let b = a + 2;
+}
+
+const fn panic_const() {
+    let a = 2;
+    panic!();
+    //~^ panic
+
+    panic!("message");
+    //~^ panic
+
+    panic!("{} {}", "panic with", "multiple arguments");
+    //~^ panic
+
     let b = a + 2;
 }
 
 fn todo() {
     let a = 2;
     todo!();
+    //~^ todo
+
     todo!("message");
+    //~^ todo
+
     todo!("{} {}", "panic with", "multiple arguments");
+    //~^ todo
+
     let b = a + 2;
 }
 
 fn unimplemented() {
     let a = 2;
     unimplemented!();
+    //~^ unimplemented
+
     unimplemented!("message");
+    //~^ unimplemented
+
     unimplemented!("{} {}", "panic with", "multiple arguments");
+    //~^ unimplemented
+
     let b = a + 2;
 }
 
 fn unreachable() {
     let a = 2;
     unreachable!();
+    //~^ unreachable
+
     unreachable!("message");
+    //~^ unreachable
+
     unreachable!("{} {}", "panic with", "multiple arguments");
+    //~^ unreachable
+
     let b = a + 2;
 }
 
 fn core_versions() {
     use core::{panic, todo, unimplemented, unreachable};
     panic!();
+    //~^ panic
+
     todo!();
+    //~^ todo
+
     unimplemented!();
+    //~^ unimplemented
+
     unreachable!();
+    //~^ unreachable
 }
 
 fn assert() {
@@ -82,14 +126,4 @@ fn debug_assert_msg() {
     debug_assert_ne!(true, false, "test");
 }
 
-fn main() {
-    panic();
-    todo();
-    unimplemented();
-    unreachable();
-    core_versions();
-    assert();
-    assert_msg();
-    debug_assert();
-    debug_assert_msg();
-}
+fn main() {}

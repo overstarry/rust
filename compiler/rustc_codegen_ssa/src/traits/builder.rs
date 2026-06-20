@@ -1,28 +1,31 @@
+use std::assert_matches;
+use std::ops::Deref;
+
+use rustc_abi::{Align, Scalar, Size, WrappingRange};
+use rustc_hir::attrs::AttributeKind;
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
+use rustc_middle::mir;
+use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
+use rustc_middle::ty::{AtomicOrdering, Instance, Ty};
+use rustc_session::config::OptLevel;
+use rustc_span::Span;
+use rustc_target::callconv::FnAbi;
+
 use super::abi::AbiBuilderMethods;
 use super::asm::AsmBuilderMethods;
-use super::consts::ConstMethods;
+use super::consts::ConstCodegenMethods;
 use super::coverageinfo::CoverageInfoBuilderMethods;
 use super::debuginfo::DebugInfoBuilderMethods;
-use super::intrinsic::IntrinsicCallMethods;
-use super::misc::MiscMethods;
-use super::type_::{ArgAbiMethods, BaseTypeMethods};
-use super::{HasCodegen, StaticBuilderMethods};
-
-use crate::common::{
-    AtomicOrdering, AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope, TypeKind,
-};
-use crate::mir::operand::OperandRef;
-use crate::mir::place::PlaceRef;
+use super::intrinsic::IntrinsicCallBuilderMethods;
+use super::misc::MiscCodegenMethods;
+use super::type_::{ArgAbiBuilderMethods, BaseTypeCodegenMethods, LayoutTypeCodegenMethods};
+use super::{CodegenMethods, StaticBuilderMethods};
 use crate::MemFlags;
+use crate::common::{AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope, TypeKind};
+use crate::mir::operand::{OperandRef, OperandValue};
+use crate::mir::place::{PlaceRef, PlaceValue};
 
-use rustc_apfloat::{ieee, Float, Round, Status};
-use rustc_middle::ty::layout::{HasParamEnv, TyAndLayout};
-use rustc_middle::ty::Ty;
-use rustc_span::Span;
-use rustc_target::abi::{Abi, Align, Scalar, Size, WrappingRange};
-use rustc_target::spec::HasTargetSpec;
-
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum OverflowOp {
     Add,
     Sub,
@@ -30,17 +33,34 @@ pub enum OverflowOp {
 }
 
 pub trait BuilderMethods<'a, 'tcx>:
-    HasCodegen<'tcx>
+    Sized
+    + LayoutOf<'tcx, LayoutOfResult = TyAndLayout<'tcx>>
+    + FnAbiOf<'tcx, FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>>
+    + Deref<Target = Self::CodegenCx>
     + CoverageInfoBuilderMethods<'tcx>
-    + DebugInfoBuilderMethods
-    + ArgAbiMethods<'tcx>
-    + AbiBuilderMethods<'tcx>
-    + IntrinsicCallMethods<'tcx>
+    + DebugInfoBuilderMethods<'tcx>
+    + ArgAbiBuilderMethods<'tcx>
+    + AbiBuilderMethods
+    + IntrinsicCallBuilderMethods<'tcx>
     + AsmBuilderMethods<'tcx>
     + StaticBuilderMethods
-    + HasParamEnv<'tcx>
-    + HasTargetSpec
 {
+    // `BackendTypes` is a supertrait of both `CodegenMethods` and
+    // `BuilderMethods`. This bound ensures all impls agree on the associated
+    // types within.
+    type CodegenCx: CodegenMethods<
+            'tcx,
+            Value = Self::Value,
+            Function = Self::Function,
+            BasicBlock = Self::BasicBlock,
+            Type = Self::Type,
+            FunctionSignature = Self::FunctionSignature,
+            Funclet = Self::Funclet,
+            DIScope = Self::DIScope,
+            DILocation = Self::DILocation,
+            DIVariable = Self::DIVariable,
+        >;
+
     fn build(cx: &'a Self::CodegenCx, llbb: Self::BasicBlock) -> Self;
 
     fn cx(&self) -> &Self::CodegenCx;
@@ -58,59 +78,150 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn ret_void(&mut self);
     fn ret(&mut self, v: Self::Value);
     fn br(&mut self, dest: Self::BasicBlock);
+    fn br_with_attrs(&mut self, dest: Self::BasicBlock, _attributes: &[AttributeKind]) {
+        self.br(dest)
+    }
     fn cond_br(
         &mut self,
         cond: Self::Value,
         then_llbb: Self::BasicBlock,
         else_llbb: Self::BasicBlock,
     );
+
+    // Conditional with expectation.
+    //
+    // This function is opt-in for back ends.
+    //
+    // The default implementation calls `self.expect()` before emitting the branch
+    // by calling `self.cond_br()`
+    fn cond_br_with_expect(
+        &mut self,
+        mut cond: Self::Value,
+        then_llbb: Self::BasicBlock,
+        else_llbb: Self::BasicBlock,
+        expect: Option<bool>,
+    ) {
+        if let Some(expect) = expect {
+            cond = self.expect(cond, expect);
+        }
+        self.cond_br(cond, then_llbb, else_llbb)
+    }
+
     fn switch(
         &mut self,
         v: Self::Value,
         else_llbb: Self::BasicBlock,
         cases: impl ExactSizeIterator<Item = (u128, Self::BasicBlock)>,
     );
+
+    // This is like `switch()`, but every case has a bool flag indicating whether it's cold.
+    //
+    // Default implementation throws away the cold flags and calls `switch()`.
+    fn switch_with_weights(
+        &mut self,
+        v: Self::Value,
+        else_llbb: Self::BasicBlock,
+        _else_is_cold: bool,
+        cases: impl ExactSizeIterator<Item = (u128, Self::BasicBlock, bool)>,
+    ) {
+        self.switch(v, else_llbb, cases.map(|(val, bb, _)| (val, bb)))
+    }
+
     fn invoke(
         &mut self,
-        llty: Self::Type,
+        llty: Self::FunctionSignature,
+        fn_attrs: Option<&CodegenFnAttrs>,
+        fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
         llfn: Self::Value,
         args: &[Self::Value],
         then: Self::BasicBlock,
         catch: Self::BasicBlock,
         funclet: Option<&Self::Funclet>,
+        instance: Option<Instance<'tcx>>,
     ) -> Self::Value;
     fn unreachable(&mut self);
+
+    /// Like [`Self::unreachable`], but for use in the middle of a basic block.
+    fn unreachable_nonterminator(&mut self) {
+        // This is the preferred LLVM incantation for this per
+        // https://llvm.org/docs/Frontend/PerformanceTips.html#other-things-to-consider
+        // Other backends may override if they have a better way.
+        let const_true = self.cx().const_bool(true);
+        let poison_ptr = self.const_poison(self.cx().type_ptr());
+        self.store(const_true, poison_ptr, Align::ONE);
+    }
 
     fn add(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fadd_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn fadd_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn sub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fsub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fsub_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn fsub_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn mul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fmul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fmul_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn fmul_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn udiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn exactudiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn sdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn exactsdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fdiv(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fdiv_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn fdiv_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn urem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn srem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn frem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn frem_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn frem_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    /// Generate a left-shift. Both operands must have the same size. The right operand must be
+    /// interpreted as unsigned and can be assumed to be less than the size of the left operand.
     fn shl(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    /// Generate a logical right-shift. Both operands must have the same size. The right operand
+    /// must be interpreted as unsigned and can be assumed to be less than the size of the left
+    /// operand.
     fn lshr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    /// Generate an arithmetic right-shift. Both operands must have the same size. The right operand
+    /// must be interpreted as unsigned and can be assumed to be less than the size of the left
+    /// operand.
     fn ashr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
-    fn unchecked_sadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
-    fn unchecked_uadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
-    fn unchecked_ssub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
-    fn unchecked_usub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
-    fn unchecked_smul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
-    fn unchecked_umul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    fn unchecked_sadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.add(lhs, rhs)
+    }
+    fn unchecked_uadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.add(lhs, rhs)
+    }
+    fn unchecked_suadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.unchecked_sadd(lhs, rhs)
+    }
+    fn unchecked_ssub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.sub(lhs, rhs)
+    }
+    fn unchecked_usub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.sub(lhs, rhs)
+    }
+    fn unchecked_susub(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.unchecked_ssub(lhs, rhs)
+    }
+    fn unchecked_smul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.mul(lhs, rhs)
+    }
+    fn unchecked_umul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.mul(lhs, rhs)
+    }
+    fn unchecked_sumul(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        // Which to default to is a fairly arbitrary choice,
+        // but this is what slice layout was using before.
+        self.unchecked_smul(lhs, rhs)
+    }
     fn and(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn or(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    /// Defaults to [`Self::or`], but guarantees `(lhs & rhs) == 0` so some backends
+    /// can emit something more helpful for optimizations.
+    fn or_disjoint(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value {
+        self.or(lhs, rhs)
+    }
     fn xor(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn neg(&mut self, v: Self::Value) -> Self::Value;
     fn fneg(&mut self, v: Self::Value) -> Self::Value;
@@ -119,24 +230,16 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn checked_binop(
         &mut self,
         oop: OverflowOp,
-        ty: Ty<'_>,
+        ty: Ty<'tcx>,
         lhs: Self::Value,
         rhs: Self::Value,
     ) -> (Self::Value, Self::Value);
 
     fn from_immediate(&mut self, val: Self::Value) -> Self::Value;
-    fn to_immediate(&mut self, val: Self::Value, layout: TyAndLayout<'_>) -> Self::Value {
-        if let Abi::Scalar(scalar) = layout.abi {
-            self.to_immediate_scalar(val, scalar)
-        } else {
-            val
-        }
-    }
     fn to_immediate_scalar(&mut self, val: Self::Value, scalar: Scalar) -> Self::Value;
 
-    fn alloca(&mut self, ty: Self::Type, align: Align) -> Self::Value;
-    fn dynamic_alloca(&mut self, ty: Self::Type, align: Align) -> Self::Value;
-    fn array_alloca(&mut self, ty: Self::Type, len: Self::Value, align: Align) -> Self::Value;
+    fn alloca(&mut self, size: Size, align: Align) -> Self::Value;
+    fn alloca_with_ty(&mut self, layout: TyAndLayout<'tcx>) -> Self::Value;
 
     fn load(&mut self, ty: Self::Type, ptr: Self::Value, align: Align) -> Self::Value;
     fn volatile_load(&mut self, ty: Self::Type, ptr: Self::Value) -> Self::Value;
@@ -147,23 +250,63 @@ pub trait BuilderMethods<'a, 'tcx>:
         order: AtomicOrdering,
         size: Size,
     ) -> Self::Value;
+    fn load_from_place(&mut self, ty: Self::Type, place: PlaceValue<Self::Value>) -> Self::Value {
+        assert_eq!(place.llextra, None);
+        self.load(ty, place.llval, place.align)
+    }
     fn load_operand(&mut self, place: PlaceRef<'tcx, Self::Value>)
     -> OperandRef<'tcx, Self::Value>;
 
     /// Called for Rvalue::Repeat when the elem is neither a ZST nor optimizable using memset.
     fn write_operand_repeatedly(
-        self,
+        &mut self,
         elem: OperandRef<'tcx, Self::Value>,
         count: u64,
         dest: PlaceRef<'tcx, Self::Value>,
-    ) -> Self;
+    );
+
+    /// Emits an `assume` that the integer value `imm` of type `ty` is contained in `range`.
+    ///
+    /// This *always* emits the assumption, so you probably want to check the
+    /// optimization level and `Scalar::is_always_valid` before calling it.
+    fn assume_integer_range(&mut self, imm: Self::Value, ty: Self::Type, range: WrappingRange) {
+        let WrappingRange { start, end } = range;
+
+        // Perhaps one day we'll be able to use assume operand bundles for this,
+        // but for now this encoding with a single icmp+assume is best per
+        // <https://github.com/llvm/llvm-project/issues/123278#issuecomment-2597440158>
+        let shifted = if start == 0 {
+            imm
+        } else {
+            let low = self.const_uint_big(ty, start);
+            self.sub(imm, low)
+        };
+        let width = self.const_uint_big(ty, u128::wrapping_sub(end, start));
+        let cmp = self.icmp(IntPredicate::IntULE, shifted, width);
+        self.assume(cmp);
+    }
+
+    /// Emits an `assume` that the `val` of pointer type is non-null.
+    ///
+    /// You may want to check the optimization level before bothering calling this.
+    fn assume_nonnull(&mut self, val: Self::Value) {
+        // Arguably in LLVM it'd be better to emit an assume operand bundle instead
+        // <https://llvm.org/docs/LangRef.html#assume-operand-bundles>
+        // but this works fine for all backends.
+
+        let null = self.const_null(self.type_ptr());
+        let is_null = self.icmp(IntPredicate::IntNE, val, null);
+        self.assume(is_null);
+    }
 
     fn range_metadata(&mut self, load: Self::Value, range: WrappingRange);
     fn nonnull_metadata(&mut self, load: Self::Value);
-    fn type_metadata(&mut self, function: Self::Function, typeid: String);
-    fn typeid_metadata(&mut self, typeid: String) -> Self::Value;
 
     fn store(&mut self, val: Self::Value, ptr: Self::Value, align: Align) -> Self::Value;
+    fn store_to_place(&mut self, val: Self::Value, place: PlaceValue<Self::Value>) -> Self::Value {
+        assert_eq!(place.llextra, None);
+        self.store(val, place.llval, place.align)
+    }
     fn store_with_flags(
         &mut self,
         val: Self::Value,
@@ -171,6 +314,15 @@ pub trait BuilderMethods<'a, 'tcx>:
         align: Align,
         flags: MemFlags,
     ) -> Self::Value;
+    fn store_to_place_with_flags(
+        &mut self,
+        val: Self::Value,
+        place: PlaceValue<Self::Value>,
+        flags: MemFlags,
+    ) -> Self::Value {
+        assert_eq!(place.llextra, None);
+        self.store_with_flags(val, place.llval, place.align, flags)
+    }
     fn atomic_store(
         &mut self,
         val: Self::Value,
@@ -186,12 +338,36 @@ pub trait BuilderMethods<'a, 'tcx>:
         ptr: Self::Value,
         indices: &[Self::Value],
     ) -> Self::Value;
-    fn struct_gep(&mut self, ty: Self::Type, ptr: Self::Value, idx: u64) -> Self::Value;
+    fn inbounds_nuw_gep(
+        &mut self,
+        ty: Self::Type,
+        ptr: Self::Value,
+        indices: &[Self::Value],
+    ) -> Self::Value {
+        self.inbounds_gep(ty, ptr, indices)
+    }
+    fn ptradd(&mut self, ptr: Self::Value, offset: Self::Value) -> Self::Value {
+        self.gep(self.cx().type_i8(), ptr, &[offset])
+    }
+    fn inbounds_ptradd(&mut self, ptr: Self::Value, offset: Self::Value) -> Self::Value {
+        self.inbounds_gep(self.cx().type_i8(), ptr, &[offset])
+    }
 
     fn trunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
+    /// Produces the same value as [`Self::trunc`] (and defaults to that),
+    /// but is UB unless the *zero*-extending the result can reproduce `val`.
+    fn unchecked_utrunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
+        self.trunc(val, dest_ty)
+    }
+    /// Produces the same value as [`Self::trunc`] (and defaults to that),
+    /// but is UB unless the *sign*-extending the result can reproduce `val`.
+    fn unchecked_strunc(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value {
+        self.trunc(val, dest_ty)
+    }
+
     fn sext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
-    fn fptoui_sat(&mut self, val: Self::Value, dest_ty: Self::Type) -> Option<Self::Value>;
-    fn fptosi_sat(&mut self, val: Self::Value, dest_ty: Self::Type) -> Option<Self::Value>;
+    fn fptoui_sat(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
+    fn fptosi_sat(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
     fn fptoui(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
     fn fptosi(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
     fn uitofp(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
@@ -218,167 +394,59 @@ pub trait BuilderMethods<'a, 'tcx>:
         } else {
             (in_ty, dest_ty)
         };
-        assert!(matches!(self.cx().type_kind(float_ty), TypeKind::Float | TypeKind::Double));
+        assert_matches!(
+            self.cx().type_kind(float_ty),
+            TypeKind::Half | TypeKind::Float | TypeKind::Double | TypeKind::FP128
+        );
         assert_eq!(self.cx().type_kind(int_ty), TypeKind::Integer);
 
-        if let Some(false) = self.cx().sess().opts.debugging_opts.saturating_float_casts {
+        if let Some(false) = self.cx().sess().opts.unstable_opts.saturating_float_casts {
             return if signed { self.fptosi(x, dest_ty) } else { self.fptoui(x, dest_ty) };
         }
 
-        let try_sat_result =
-            if signed { self.fptosi_sat(x, dest_ty) } else { self.fptoui_sat(x, dest_ty) };
-        if let Some(try_sat_result) = try_sat_result {
-            return try_sat_result;
-        }
-
-        let int_width = self.cx().int_width(int_ty);
-        let float_width = self.cx().float_width(float_ty);
-        // LLVM's fpto[su]i returns undef when the input x is infinite, NaN, or does not fit into the
-        // destination integer type after rounding towards zero. This `undef` value can cause UB in
-        // safe code (see issue #10184), so we implement a saturating conversion on top of it:
-        // Semantically, the mathematical value of the input is rounded towards zero to the next
-        // mathematical integer, and then the result is clamped into the range of the destination
-        // integer type. Positive and negative infinity are mapped to the maximum and minimum value of
-        // the destination integer type. NaN is mapped to 0.
-        //
-        // Define f_min and f_max as the largest and smallest (finite) floats that are exactly equal to
-        // a value representable in int_ty.
-        // They are exactly equal to int_ty::{MIN,MAX} if float_ty has enough significand bits.
-        // Otherwise, int_ty::MAX must be rounded towards zero, as it is one less than a power of two.
-        // int_ty::MIN, however, is either zero or a negative power of two and is thus exactly
-        // representable. Note that this only works if float_ty's exponent range is sufficiently large.
-        // f16 or 256 bit integers would break this property. Right now the smallest float type is f32
-        // with exponents ranging up to 127, which is barely enough for i128::MIN = -2^127.
-        // On the other hand, f_max works even if int_ty::MAX is greater than float_ty::MAX. Because
-        // we're rounding towards zero, we just get float_ty::MAX (which is always an integer).
-        // This already happens today with u128::MAX = 2^128 - 1 > f32::MAX.
-        let int_max = |signed: bool, int_width: u64| -> u128 {
-            let shift_amount = 128 - int_width;
-            if signed { i128::MAX as u128 >> shift_amount } else { u128::MAX >> shift_amount }
-        };
-        let int_min = |signed: bool, int_width: u64| -> i128 {
-            if signed { i128::MIN >> (128 - int_width) } else { 0 }
-        };
-
-        let compute_clamp_bounds_single = |signed: bool, int_width: u64| -> (u128, u128) {
-            let rounded_min =
-                ieee::Single::from_i128_r(int_min(signed, int_width), Round::TowardZero);
-            assert_eq!(rounded_min.status, Status::OK);
-            let rounded_max =
-                ieee::Single::from_u128_r(int_max(signed, int_width), Round::TowardZero);
-            assert!(rounded_max.value.is_finite());
-            (rounded_min.value.to_bits(), rounded_max.value.to_bits())
-        };
-        let compute_clamp_bounds_double = |signed: bool, int_width: u64| -> (u128, u128) {
-            let rounded_min =
-                ieee::Double::from_i128_r(int_min(signed, int_width), Round::TowardZero);
-            assert_eq!(rounded_min.status, Status::OK);
-            let rounded_max =
-                ieee::Double::from_u128_r(int_max(signed, int_width), Round::TowardZero);
-            assert!(rounded_max.value.is_finite());
-            (rounded_min.value.to_bits(), rounded_max.value.to_bits())
-        };
-        // To implement saturation, we perform the following steps:
-        //
-        // 1. Cast x to an integer with fpto[su]i. This may result in undef.
-        // 2. Compare x to f_min and f_max, and use the comparison results to select:
-        //  a) int_ty::MIN if x < f_min or x is NaN
-        //  b) int_ty::MAX if x > f_max
-        //  c) the result of fpto[su]i otherwise
-        // 3. If x is NaN, return 0.0, otherwise return the result of step 2.
-        //
-        // This avoids resulting undef because values in range [f_min, f_max] by definition fit into the
-        // destination type. It creates an undef temporary, but *producing* undef is not UB. Our use of
-        // undef does not introduce any non-determinism either.
-        // More importantly, the above procedure correctly implements saturating conversion.
-        // Proof (sketch):
-        // If x is NaN, 0 is returned by definition.
-        // Otherwise, x is finite or infinite and thus can be compared with f_min and f_max.
-        // This yields three cases to consider:
-        // (1) if x in [f_min, f_max], the result of fpto[su]i is returned, which agrees with
-        //     saturating conversion for inputs in that range.
-        // (2) if x > f_max, then x is larger than int_ty::MAX. This holds even if f_max is rounded
-        //     (i.e., if f_max < int_ty::MAX) because in those cases, nextUp(f_max) is already larger
-        //     than int_ty::MAX. Because x is larger than int_ty::MAX, the return value of int_ty::MAX
-        //     is correct.
-        // (3) if x < f_min, then x is smaller than int_ty::MIN. As shown earlier, f_min exactly equals
-        //     int_ty::MIN and therefore the return value of int_ty::MIN is correct.
-        // QED.
-
-        let float_bits_to_llval = |bx: &mut Self, bits| {
-            let bits_llval = match float_width {
-                32 => bx.cx().const_u32(bits as u32),
-                64 => bx.cx().const_u64(bits as u64),
-                n => bug!("unsupported float width {}", n),
-            };
-            bx.bitcast(bits_llval, float_ty)
-        };
-        let (f_min, f_max) = match float_width {
-            32 => compute_clamp_bounds_single(signed, int_width),
-            64 => compute_clamp_bounds_double(signed, int_width),
-            n => bug!("unsupported float width {}", n),
-        };
-        let f_min = float_bits_to_llval(self, f_min);
-        let f_max = float_bits_to_llval(self, f_max);
-        let int_max = self.cx().const_uint_big(int_ty, int_max(signed, int_width));
-        let int_min = self.cx().const_uint_big(int_ty, int_min(signed, int_width) as u128);
-        let zero = self.cx().const_uint(int_ty, 0);
-
-        // If we're working with vectors, constants must be "splatted": the constant is duplicated
-        // into each lane of the vector.  The algorithm stays the same, we are just using the
-        // same constant across all lanes.
-        let maybe_splat = |bx: &mut Self, val| {
-            if bx.cx().type_kind(dest_ty) == TypeKind::Vector {
-                bx.vector_splat(bx.vector_length(dest_ty), val)
-            } else {
-                val
-            }
-        };
-        let f_min = maybe_splat(self, f_min);
-        let f_max = maybe_splat(self, f_max);
-        let int_max = maybe_splat(self, int_max);
-        let int_min = maybe_splat(self, int_min);
-        let zero = maybe_splat(self, zero);
-
-        // Step 1 ...
-        let fptosui_result = if signed { self.fptosi(x, dest_ty) } else { self.fptoui(x, dest_ty) };
-        let less_or_nan = self.fcmp(RealPredicate::RealULT, x, f_min);
-        let greater = self.fcmp(RealPredicate::RealOGT, x, f_max);
-
-        // Step 2: We use two comparisons and two selects, with %s1 being the
-        // result:
-        //     %less_or_nan = fcmp ult %x, %f_min
-        //     %greater = fcmp olt %x, %f_max
-        //     %s0 = select %less_or_nan, int_ty::MIN, %fptosi_result
-        //     %s1 = select %greater, int_ty::MAX, %s0
-        // Note that %less_or_nan uses an *unordered* comparison. This
-        // comparison is true if the operands are not comparable (i.e., if x is
-        // NaN). The unordered comparison ensures that s1 becomes int_ty::MIN if
-        // x is NaN.
-        //
-        // Performance note: Unordered comparison can be lowered to a "flipped"
-        // comparison and a negation, and the negation can be merged into the
-        // select. Therefore, it not necessarily any more expensive than an
-        // ordered ("normal") comparison. Whether these optimizations will be
-        // performed is ultimately up to the backend, but at least x86 does
-        // perform them.
-        let s0 = self.select(less_or_nan, int_min, fptosui_result);
-        let s1 = self.select(greater, int_max, s0);
-
-        // Step 3: NaN replacement.
-        // For unsigned types, the above step already yielded int_ty::MIN == 0 if x is NaN.
-        // Therefore we only need to execute this step for signed integer types.
-        if signed {
-            // LLVM has no isNaN predicate, so we use (x == x) instead
-            let cmp = self.fcmp(RealPredicate::RealOEQ, x, x);
-            self.select(cmp, s1, zero)
-        } else {
-            s1
-        }
+        if signed { self.fptosi_sat(x, dest_ty) } else { self.fptoui_sat(x, dest_ty) }
     }
 
     fn icmp(&mut self, op: IntPredicate, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn fcmp(&mut self, op: RealPredicate, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+
+    /// Returns `-1` if `lhs < rhs`, `0` if `lhs == rhs`, and `1` if `lhs > rhs`.
+    fn three_way_compare(
+        &mut self,
+        ty: Ty<'tcx>,
+        lhs: Self::Value,
+        rhs: Self::Value,
+    ) -> Self::Value {
+        // FIXME: This implementation was designed around LLVM's ability to optimize, but `cg_llvm`
+        // overrides this to just use `@llvm.scmp`/`ucmp` since LLVM 20. This default impl should be
+        // reevaluated with respect to the remaining backends like cg_gcc, whether they might use
+        // specialized implementations as well, or continue to use a generic implementation here.
+        use std::cmp::Ordering;
+        let pred = |op| crate::base::bin_op_to_icmp_predicate(op, ty.is_signed());
+        if self.cx().sess().opts.optimize == OptLevel::No {
+            // This actually generates tighter assembly, and is a classic trick:
+            // <https://graphics.stanford.edu/~seander/bithacks.html#CopyIntegerSign>.
+            // However, as of 2023-11 it optimized worse in LLVM in things like derived
+            // `PartialOrd`, so we were only using it in debug. Since LLVM now uses its own
+            // intrinsics, it may be be worth trying it in optimized builds for other backends.
+            let is_gt = self.icmp(pred(mir::BinOp::Gt), lhs, rhs);
+            let gtext = self.zext(is_gt, self.type_i8());
+            let is_lt = self.icmp(pred(mir::BinOp::Lt), lhs, rhs);
+            let ltext = self.zext(is_lt, self.type_i8());
+            self.unchecked_ssub(gtext, ltext)
+        } else {
+            // These operations were better optimized by LLVM, before `@llvm.scmp`/`ucmp` in 20.
+            // See <https://github.com/rust-lang/rust/pull/63767>.
+            let is_lt = self.icmp(pred(mir::BinOp::Lt), lhs, rhs);
+            let is_ne = self.icmp(pred(mir::BinOp::Ne), lhs, rhs);
+            let ge = self.select(
+                is_ne,
+                self.cx().const_i8(Ordering::Greater as i8),
+                self.cx().const_i8(Ordering::Equal as i8),
+            );
+            self.select(is_lt, self.cx().const_i8(Ordering::Less as i8), ge)
+        }
+    }
 
     fn memcpy(
         &mut self,
@@ -388,6 +456,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         src_align: Align,
         size: Self::Value,
         flags: MemFlags,
+        tt: Option<rustc_ast::expand::typetree::FncTree>,
     );
     fn memmove(
         &mut self,
@@ -407,6 +476,71 @@ pub trait BuilderMethods<'a, 'tcx>:
         flags: MemFlags,
     );
 
+    /// *Typed* copy for non-overlapping places.
+    ///
+    /// Has a default implementation in terms of `memcpy`, but specific backends
+    /// can override to do something smarter if possible.
+    ///
+    /// (For example, typed load-stores with alias metadata.)
+    fn typed_place_copy(
+        &mut self,
+        dst: PlaceValue<Self::Value>,
+        src: PlaceValue<Self::Value>,
+        layout: TyAndLayout<'tcx>,
+    ) {
+        self.typed_place_copy_with_flags(dst, src, layout, MemFlags::empty());
+    }
+
+    fn typed_place_copy_with_flags(
+        &mut self,
+        dst: PlaceValue<Self::Value>,
+        src: PlaceValue<Self::Value>,
+        layout: TyAndLayout<'tcx>,
+        flags: MemFlags,
+    ) {
+        assert!(layout.is_sized(), "cannot typed-copy an unsigned type");
+        assert!(src.llextra.is_none(), "cannot directly copy from unsized values");
+        assert!(dst.llextra.is_none(), "cannot directly copy into unsized values");
+        if flags.contains(MemFlags::NONTEMPORAL) {
+            // HACK(nox): This is inefficient but there is no nontemporal memcpy.
+            let ty = self.backend_type(layout);
+            let val = self.load_from_place(ty, src);
+            self.store_to_place_with_flags(val, dst, flags);
+        } else if self.sess().opts.optimize == OptLevel::No && self.is_backend_immediate(layout) {
+            // If we're not optimizing, the aliasing information from `memcpy`
+            // isn't useful, so just load-store the value for smaller code.
+            let temp = self.load_operand(src.with_type(layout));
+            temp.val.store_with_flags(self, dst.with_type(layout), flags);
+        } else if !layout.is_zst() {
+            let bytes = self.const_usize(layout.size.bytes());
+            self.memcpy(dst.llval, dst.align, src.llval, src.align, bytes, flags, None);
+        }
+    }
+
+    /// *Typed* swap for non-overlapping places.
+    ///
+    /// Avoids `alloca`s for Immediates and ScalarPairs.
+    ///
+    /// FIXME: Maybe do something smarter for Ref types too?
+    /// For now, the `typed_swap_nonoverlapping` intrinsic just doesn't call this for those
+    /// cases (in non-debug), preferring the fallback body instead.
+    fn typed_place_swap(
+        &mut self,
+        left: PlaceValue<Self::Value>,
+        right: PlaceValue<Self::Value>,
+        layout: TyAndLayout<'tcx>,
+    ) {
+        let mut temp = self.load_operand(left.with_type(layout));
+        if let OperandValue::Ref(..) = temp.val {
+            // The SSA value isn't stand-alone, so we need to copy it elsewhere
+            let alloca = PlaceRef::alloca(self, layout);
+            self.typed_place_copy(alloca.val, left, layout);
+            temp = self.load_operand(alloca);
+        }
+        self.typed_place_copy(left, right, layout);
+        temp.val.store(self, right.with_type(layout));
+    }
+
     fn select(
         &mut self,
         cond: Self::Value,
@@ -420,13 +554,14 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn extract_value(&mut self, agg_val: Self::Value, idx: u64) -> Self::Value;
     fn insert_value(&mut self, agg_val: Self::Value, elt: Self::Value, idx: u64) -> Self::Value;
 
-    fn set_personality_fn(&mut self, personality: Self::Value);
+    fn set_personality_fn(&mut self, personality: Self::Function);
 
-    // These are used by everyone except msvc
-    fn cleanup_landing_pad(&mut self, ty: Self::Type, pers_fn: Self::Value) -> Self::Value;
-    fn resume(&mut self, exn: Self::Value);
+    // These are used by everyone except msvc and wasm EH
+    fn cleanup_landing_pad(&mut self, pers_fn: Self::Function) -> (Self::Value, Self::Value);
+    fn filter_landing_pad(&mut self, pers_fn: Self::Function);
+    fn resume(&mut self, exn0: Self::Value, exn1: Self::Value);
 
-    // These are used only by msvc
+    // These are used by msvc and wasm EH
     fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet;
     fn cleanup_ret(&mut self, funclet: &Self::Funclet, unwind: Option<Self::BasicBlock>);
     fn catch_pad(&mut self, parent: Self::Value, args: &[Self::Value]) -> Self::Funclet;
@@ -436,6 +571,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         unwind: Option<Self::BasicBlock>,
         handlers: &[Self::BasicBlock],
     ) -> Self::Value;
+    fn get_funclet_cleanuppad(&self, funclet: &Self::Funclet) -> Self::Value;
 
     fn atomic_cmpxchg(
         &mut self,
@@ -445,13 +581,16 @@ pub trait BuilderMethods<'a, 'tcx>:
         order: AtomicOrdering,
         failure_order: AtomicOrdering,
         weak: bool,
-    ) -> Self::Value;
+    ) -> (Self::Value, Self::Value);
+    /// `ret_ptr` indicates whether the return type (which is also the type `dst` points to)
+    /// is a pointer or the same type as `src`.
     fn atomic_rmw(
         &mut self,
         op: AtomicRmwBinOp,
         dst: Self::Value,
         src: Self::Value,
         order: AtomicOrdering,
+        ret_ptr: bool,
     ) -> Self::Value;
     fn atomic_fence(&mut self, order: AtomicOrdering, scope: SynchronizationScope);
     fn set_invariant_load(&mut self, load: Self::Value);
@@ -462,22 +601,53 @@ pub trait BuilderMethods<'a, 'tcx>:
     /// Called for `StorageDead`
     fn lifetime_end(&mut self, ptr: Self::Value, size: Size);
 
-    fn instrprof_increment(
-        &mut self,
-        fn_name: Self::Value,
-        hash: Self::Value,
-        num_counters: Self::Value,
-        index: Self::Value,
-    );
-
+    /// "Finally codegen the call"
+    ///
+    /// ## Arguments
+    ///
+    /// `caller_attrs` are the attributes of the surrounding caller; they have nothing to do with
+    /// the callee.
+    ///
+    /// The `caller_attrs`, `fn_abi`, and `callee_instance` arguments are Options because they are
+    /// advisory. They relate to optional codegen enhancements like LLVM CFI, and do not affect ABI
+    /// per se. Any ABI-related transformations should be handled by different, earlier stages of
+    /// codegen. For instance, in the caller of `BuilderMethods::call`.
+    ///
+    /// This means that a codegen backend which disregards `fn_attrs`, `fn_abi`, and `instance`
+    /// should still do correct codegen, and code should not be miscompiled if they are omitted.
+    /// It is not a miscompilation in this sense if it fails to run under CFI, other sanitizers, or
+    /// in the context of other compiler-enhanced security features.
+    ///
+    /// The typical case that they are None is during the codegen of intrinsics and lang-items,
+    /// as those are "fake functions" with only a trivial ABI if any, et cetera.
+    ///
+    /// ## Return
+    ///
+    /// Must return the value the function will return so it can be written to the destination,
+    /// assuming the function does not explicitly pass the destination as a pointer in `args`.
     fn call(
         &mut self,
-        llty: Self::Type,
+        llty: Self::FunctionSignature,
+        caller_attrs: Option<&CodegenFnAttrs>,
+        fn_abi: Option<&FnAbi<'tcx, Ty<'tcx>>>,
+        fn_val: Self::Value,
+        args: &[Self::Value],
+        funclet: Option<&Self::Funclet>,
+        callee_instance: Option<Instance<'tcx>>,
+    ) -> Self::Value;
+
+    fn tail_call(
+        &mut self,
+        llty: Self::FunctionSignature,
+        caller_attrs: Option<&CodegenFnAttrs>,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
         llfn: Self::Value,
         args: &[Self::Value],
         funclet: Option<&Self::Funclet>,
-    ) -> Self::Value;
+        callee_instance: Option<Instance<'tcx>>,
+    );
+
     fn zext(&mut self, val: Self::Value, dest_ty: Self::Type) -> Self::Value;
 
-    fn do_not_inline(&mut self, llret: Self::Value);
+    fn apply_attrs_to_cleanup_callsite(&mut self, llret: Self::Value);
 }

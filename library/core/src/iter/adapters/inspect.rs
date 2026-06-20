@@ -1,5 +1,7 @@
 use crate::fmt;
-use crate::iter::{adapters::SourceIter, FusedIterator, InPlaceIterable};
+use crate::iter::adapters::SourceIter;
+use crate::iter::{FusedIterator, InPlaceIterable, TrustedFused};
+use crate::num::NonZero;
 use crate::ops::Try;
 
 /// An iterator that calls a function with a reference to each element before
@@ -18,7 +20,7 @@ pub struct Inspect<I, F> {
     f: F,
 }
 impl<I, F> Inspect<I, F> {
-    pub(in crate::iter) fn new(iter: I, f: F) -> Inspect<I, F> {
+    pub(in crate::iter) const fn new(iter: I, f: F) -> Inspect<I, F> {
         Inspect { iter, f }
     }
 }
@@ -148,6 +150,9 @@ where
 #[stable(feature = "fused", since = "1.26.0")]
 impl<I: FusedIterator, F> FusedIterator for Inspect<I, F> where F: FnMut(&I::Item) {}
 
+#[unstable(issue = "none", feature = "trusted_fused")]
+unsafe impl<I: TrustedFused, F> TrustedFused for Inspect<I, F> {}
+
 #[unstable(issue = "none", feature = "inplace_iteration")]
 unsafe impl<I, F> SourceIter for Inspect<I, F>
 where
@@ -163,4 +168,7 @@ where
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]
-unsafe impl<I: InPlaceIterable, F> InPlaceIterable for Inspect<I, F> where F: FnMut(&I::Item) {}
+unsafe impl<I: InPlaceIterable, F> InPlaceIterable for Inspect<I, F> {
+    const EXPAND_BY: Option<NonZero<usize>> = I::EXPAND_BY;
+    const MERGE_BY: Option<NonZero<usize>> = I::MERGE_BY;
+}

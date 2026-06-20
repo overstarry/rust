@@ -3,6 +3,7 @@
 ## Table of Contents
 
 * [General](#general)
+* [Adding a new target](#adding-a-new-target)
 * [Tier 3 target policy](#tier-3-target-policy)
 * [Tier 2 target policy](#tier-2-target-policy)
   * [Tier 2 with host tools](#tier-2-with-host-tools)
@@ -104,6 +105,41 @@ indicates something entirely optional, and does not indicate guidance or
 recommendations. This language is based on [IETF RFC
 2119](https://tools.ietf.org/html/rfc2119).
 
+## Adding a new target
+
+New targets typically start as Tier 3 and then can be promoted later.
+To propose addition of a new target, open a pull request on [`rust-lang/rust`]:
+
+- Copy the [Tier 3 target policy](#tier-3-target-policy) to the description
+  and fill it out, see [example][tier3example].
+- Add a new description for the target in `src/doc/rustc/src/platform-support`
+  using the [template][platform_template].
+- Add the target to the [SUMMARY.md][summary] (allows wildcards) and
+  [platform-support.md][platformsupport] (must name all targets verbatim).
+  Link to the created description page.
+- Ensure the pull request is assigned to a member of the [Rust compiler team][rust_compiler_team] by commenting:
+  ```text
+  r? compiler
+  ```
+
+See also the documentation in the `rustc-dev-guide` on [adding a new target to
+`rustc`][rustc_dev_guide_add_target].
+
+Note that adding a new target that wants to support `std` would transitively
+require `cc` and `libc` support. However, these would like to know about the
+target from `rustc` as well. To break this cycle, you are strongly encouraged
+to add a _minimal_ `#![no_core]` target spec first to teach `rustc` about the
+target's existence, and add `std` support as a follow-up once you've added
+support for the target in `cc` and `libc`.
+
+[tier3example]: https://github.com/rust-lang/rust/pull/94872
+[platform_template]: https://github.com/rust-lang/rust/blob/HEAD/src/doc/rustc/src/platform-support/TEMPLATE.md
+[summary]: https://github.com/rust-lang/rust/blob/HEAD/src/doc/rustc/src/SUMMARY.md
+[platformsupport]: https://github.com/rust-lang/rust/blob/HEAD/src/doc/rustc/src/platform-support.md
+[rust_compiler_team]: https://www.rust-lang.org/governance/teams/compiler
+[`rust-lang/rust`]: https://github.com/rust-lang/rust
+[rustc_dev_guide_add_target]: https://rustc-dev-guide.rust-lang.org/building/new-target.html
+
 ## Tier 3 target policy
 
 At this tier, the Rust project provides no official support for a target, so we
@@ -133,6 +169,8 @@ approved by the appropriate team for that shared code before acceptance.
     the name of the target makes people extremely likely to form incorrect
     beliefs about what it targets, the name should be changed or augmented to
     disambiguate it.
+  - If possible, use only letters, numbers, dashes and underscores for the name.
+    Periods (`.`) are known to cause issues in Cargo.
 - Tier 3 targets may have unusual requirements to build or use, but must not
   create legal issues or impose onerous legal terms for the Rust project or for
   Rust developers or users.
@@ -219,6 +257,9 @@ approved by the appropriate team for that shared code before acceptance.
     introducing unconditional uses of features that another variation of the
     target may not have; use conditional compilation or runtime detection, as
     appropriate, to let each target run code supported by that target.
+- Tier 3 targets must be able to produce assembly using at least one of
+  rustc's supported backends from any host target. (Having support in a fork
+  of the backend is not sufficient, it must be upstream.)
 
 If a tier 3 target stops meeting these requirements, or the target maintainers
 no longer have interest or time, or the target shows no signs of activity and
@@ -493,10 +534,10 @@ tests, and will reject patches that fail to build or pass the testsuite on a
 target. We hold tier 1 targets to our highest standard of requirements.
 
 A proposed new tier 1 target must be reviewed and approved by the compiler team
-based on these requirements. In addition, the release team must approve the
-viability and value of supporting the target. For a tier 1 target, this will
+based on these requirements. In addition, the infra team must approve the
+viability of supporting the target. For a tier 1 target, this will
 typically take place via a full RFC proposing the target, to be jointly
-reviewed and approved by the compiler team and release team.
+reviewed and approved by the compiler team and infra team.
 
 In addition, the infrastructure team must approve the integration of the target
 into Continuous Integration (CI), and the tier 1 CI-related requirements. This
@@ -576,7 +617,7 @@ including the infrastructure team in the RFC proposing the target.
 A tier 1 target may be demoted if it no longer meets these requirements but
 still meets the requirements for a lower tier. Any proposal for demotion of a
 tier 1 target requires a full RFC process, with approval by the compiler and
-release teams. Any such proposal will be communicated widely to the Rust
+infra teams. Any such proposal will be communicated widely to the Rust
 community, both when initially proposed and before being dropped from a stable
 release. A tier 1 target is highly unlikely to be directly removed without
 first being demoted to tier 2 or tier 3. (The amount of time between such
@@ -587,7 +628,7 @@ planned and scheduled action.)
 
 Raising the baseline expectations of a tier 1 target (such as the minimum CPU
 features or OS version required) requires the approval of the compiler and
-release teams, and should be widely communicated as well, but does not
+infra teams, and should be widely communicated as well, but does not
 necessarily require a full RFC.
 
 ### Tier 1 with host tools
@@ -597,11 +638,11 @@ host (such as `rustc` and `cargo`). This allows the target to be used as a
 development platform, not just a compilation target.
 
 A proposed new tier 1 target with host tools must be reviewed and approved by
-the compiler team based on these requirements. In addition, the release team
-must approve the viability and value of supporting host tools for the target.
+the compiler team based on these requirements. In addition, the infra team
+must approve the viability of supporting host tools for the target.
 For a tier 1 target, this will typically take place via a full RFC proposing
 the target, to be jointly reviewed and approved by the compiler team and
-release team.
+infra team.
 
 In addition, the infrastructure team must approve the integration of the
 target's host tools into Continuous Integration (CI), and the CI-related
@@ -656,8 +697,8 @@ target with host tools may be demoted (including having its host tools dropped,
 or being demoted to tier 2 with host tools) if it no longer meets these
 requirements but still meets the requirements for a lower tier. Any proposal
 for demotion of a tier 1 target (with or without host tools) requires a full
-RFC process, with approval by the compiler and release teams. Any such proposal
+RFC process, with approval by the compiler and infra teams. Any such proposal
 will be communicated widely to the Rust community, both when initially proposed
 and before being dropped from a stable release.
 
-[MCP]: https://forge.rust-lang.org/compiler/mcp.html
+[MCP]: https://forge.rust-lang.org/compiler/proposals-and-stabilization.html#how-do-i-submit-an-mcp
